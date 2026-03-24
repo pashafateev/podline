@@ -3,6 +3,7 @@ from typing import Optional
 
 import typer
 
+from sexdrunks_automation.auphonic import AuphonicError, process_session_with_auphonic
 from sexdrunks_automation.config import load_config
 from sexdrunks_automation.db import initialize_database
 from sexdrunks_automation.health import read_health_snapshot, write_health_snapshot
@@ -126,6 +127,9 @@ def status(
     typer.echo(f"recorded_at: {session.recorded_at or 'none'}")
     typer.echo(f"recorded_at_source: {session.recorded_at_source or 'none'}")
     typer.echo(f"fingerprint: {session.fingerprint}")
+    typer.echo(f"auphonic_production_id: {session.auphonic_production_id or 'none'}")
+    typer.echo(f"pre_edit_master_path: {session.pre_edit_master_path or 'none'}")
+    typer.echo(f"transcript_path: {session.transcript_path or 'none'}")
     typer.echo(f"created_at: {session.created_at}")
     typer.echo(f"updated_at: {session.updated_at}")
     typer.echo(f"failure_reason: {session.failure_reason or 'none'}")
@@ -171,3 +175,37 @@ def scan(
                 ]
             )
         )
+
+
+@app.command("auphonic")
+def auphonic_command(
+    session_uid: str,
+    config: Optional[Path] = typer.Option(
+        None, "--config", help="Path to config.yaml."
+    ),
+) -> None:
+    """Upload one queued session to Auphonic and download outputs."""
+    config_path = _resolve_config_path(config)
+    loaded_config, runtime_paths, logger = _bootstrap(config_path)
+    session = get_session(runtime_paths.db_file, session_uid)
+    if session is None:
+        typer.echo(f"Session not found: {session_uid}")
+        raise typer.Exit(code=1)
+
+    try:
+        updated = process_session_with_auphonic(
+            config=loaded_config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=session,
+        )
+    except AuphonicError as exc:
+        logger.error("Auphonic processing failed for %s: %s", session_uid, exc)
+        typer.echo(f"Auphonic error: {exc}")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"session_uid: {updated.session_uid}")
+    typer.echo(f"status: {updated.status}")
+    typer.echo(f"auphonic_production_id: {updated.auphonic_production_id or 'none'}")
+    typer.echo(f"pre_edit_master_path: {updated.pre_edit_master_path or 'none'}")
+    typer.echo(f"transcript_path: {updated.transcript_path or 'none'}")

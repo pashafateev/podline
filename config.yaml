@@ -8,6 +8,10 @@ notifications:
   enabled: true
 auphonic:
   enabled: false
+  api_key: ""
+  base_url: https://auphonic.com/api
+  poll_interval_seconds: 10
+  max_poll_attempts: 180
   preset_ids:
     speakers_2: ""
     speakers_3: ""

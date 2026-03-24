@@ -1,7 +1,12 @@
 from typing import List, Optional
 
 from sexdrunks_automation.db import connect
-from sexdrunks_automation.models import ScanCandidate, SessionRecord, SessionStatus
+from sexdrunks_automation.models import (
+    AssetRecord,
+    ScanCandidate,
+    SessionRecord,
+    SessionStatus,
+)
 
 
 def list_sessions(db_file: str) -> List[SessionRecord]:
@@ -9,6 +14,7 @@ def list_sessions(db_file: str) -> List[SessionRecord]:
     SELECT session_uid, source_basename, source_date_folder, source_path,
            recorded_at, recorded_at_source, fingerprint, status,
            failure_reason, failed_at_stage, auphonic_production_id,
+           pre_edit_master_path, transcript_path,
            created_at, updated_at
     FROM sessions
     ORDER BY created_at DESC
@@ -23,6 +29,7 @@ def get_session(db_file: str, session_uid: str) -> Optional[SessionRecord]:
     SELECT session_uid, source_basename, source_date_folder, source_path,
            recorded_at, recorded_at_source, fingerprint, status,
            failure_reason, failed_at_stage, auphonic_production_id,
+           pre_edit_master_path, transcript_path,
            created_at, updated_at
     FROM sessions
     WHERE session_uid = ?
@@ -54,6 +61,7 @@ def get_session_by_fingerprint(
     SELECT session_uid, source_basename, source_date_folder, source_path,
            recorded_at, recorded_at_source, fingerprint, status,
            failure_reason, failed_at_stage, auphonic_production_id,
+           pre_edit_master_path, transcript_path,
            created_at, updated_at
     FROM sessions
     WHERE fingerprint = ?
@@ -86,9 +94,11 @@ def create_session(
                 failure_reason,
                 failed_at_stage,
                 auphonic_production_id,
+                pre_edit_master_path,
+                transcript_path,
                 created_at,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_uid,
@@ -99,6 +109,8 @@ def create_session(
                 candidate.recorded_at_source,
                 fingerprint,
                 SessionStatus.QUEUED.value,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -143,6 +155,74 @@ def create_session(
     return created
 
 
+def list_assets_for_session(db_file: str, session_uid: str) -> List[AssetRecord]:
+    query = """
+    SELECT role, filename, file_size, local_path
+    FROM assets
+    WHERE session_uid = ?
+    ORDER BY role ASC, filename ASC
+    """
+    with connect(db_file) as connection:
+        rows = connection.execute(query, (session_uid,)).fetchall()
+    return [
+        AssetRecord(
+            role=row["role"],
+            filename=row["filename"],
+            file_size=row["file_size"],
+            local_path=row["local_path"],
+        )
+        for row in rows
+    ]
+
+
+def update_session_status(
+    db_file: str,
+    *,
+    session_uid: str,
+    from_state: Optional[str],
+    to_state: str,
+    timestamp: str,
+    detail: str,
+    auphonic_production_id: Optional[str] = None,
+    pre_edit_master_path: Optional[str] = None,
+    transcript_path: Optional[str] = None,
+    failure_reason: Optional[str] = None,
+    failed_at_stage: Optional[str] = None,
+) -> None:
+    with connect(db_file) as connection:
+        connection.execute(
+            """
+            UPDATE sessions
+            SET status = ?,
+                updated_at = ?,
+                auphonic_production_id = COALESCE(?, auphonic_production_id),
+                pre_edit_master_path = COALESCE(?, pre_edit_master_path),
+                transcript_path = COALESCE(?, transcript_path),
+                failure_reason = ?,
+                failed_at_stage = ?
+            WHERE session_uid = ?
+            """,
+            (
+                to_state,
+                timestamp,
+                auphonic_production_id,
+                pre_edit_master_path,
+                transcript_path,
+                failure_reason,
+                failed_at_stage,
+                session_uid,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO events (session_uid, from_state, to_state, timestamp, detail)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (session_uid, from_state, to_state, timestamp, detail),
+        )
+        connection.commit()
+
+
 def _row_to_session(row) -> SessionRecord:
     return SessionRecord(
         session_uid=row["session_uid"],
@@ -156,6 +236,8 @@ def _row_to_session(row) -> SessionRecord:
         failure_reason=row["failure_reason"],
         failed_at_stage=row["failed_at_stage"],
         auphonic_production_id=row["auphonic_production_id"],
+        pre_edit_master_path=row["pre_edit_master_path"],
+        transcript_path=row["transcript_path"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )

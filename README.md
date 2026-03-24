@@ -12,6 +12,7 @@ Current scope
 - Phase 1 scanning and ingest are implemented via `sd scan`.
 - `recorded_at` is best-effort metadata. The recorder date is not always reliable, so this value may reflect filesystem timing rather than a true recording timestamp.
 - Silent extra spoken tracks are ignored during scan, so sessions with empty `Tr3`/`Tr4` files can still classify correctly as 2-speaker sessions.
+- Phase 3 Auphonic processing is available via `sd auphonic <session_uid>`.
 
 Project layout
 - `src/sexdrunks_automation/`: application code
@@ -31,6 +32,6 @@ sd health
 ```
 
 Planned next steps
-- Phase 3 Auphonic integration
 - manual end-to-end processing flow
 - finalize and Podbean draft creation
+- live Auphonic validation with real credentials

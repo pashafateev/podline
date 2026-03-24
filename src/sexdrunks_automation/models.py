@@ -37,6 +37,8 @@ class SessionRecord:
     failure_reason: Optional[str]
     failed_at_stage: Optional[str]
     auphonic_production_id: Optional[str]
+    pre_edit_master_path: Optional[str]
+    transcript_path: Optional[str]
     created_at: str
     updated_at: str
 
@@ -59,6 +61,14 @@ class TrackFile:
     path: Path
     file_size: int
     has_audio: bool
+
+
+@dataclass(frozen=True)
+class AssetRecord:
+    role: str
+    filename: str
+    file_size: int
+    local_path: str
 
 
 @dataclass(frozen=True)

@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     failure_reason TEXT,
     failed_at_stage TEXT,
     auphonic_production_id TEXT,
+    pre_edit_master_path TEXT,
+    transcript_path TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -75,6 +77,8 @@ def _apply_migrations(connection: sqlite3.Connection) -> None:
         "source_date_folder": "ALTER TABLE sessions ADD COLUMN source_date_folder TEXT",
         "recorded_at": "ALTER TABLE sessions ADD COLUMN recorded_at TEXT",
         "recorded_at_source": "ALTER TABLE sessions ADD COLUMN recorded_at_source TEXT",
+        "pre_edit_master_path": "ALTER TABLE sessions ADD COLUMN pre_edit_master_path TEXT",
+        "transcript_path": "ALTER TABLE sessions ADD COLUMN transcript_path TEXT",
     }
 
     for column_name, statement in migrations.items():

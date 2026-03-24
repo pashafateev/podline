@@ -24,6 +24,10 @@ class NotificationsConfig:
 @dataclass(frozen=True)
 class AuphonicConfig:
     enabled: bool
+    api_key: str
+    base_url: str
+    poll_interval_seconds: int
+    max_poll_attempts: int
     preset_ids: Dict[str, str]
 
 
@@ -63,6 +67,14 @@ def load_config(config_path: Path) -> AppConfig:
         ),
         auphonic=AuphonicConfig(
             enabled=bool(_require_nested(data, "auphonic", "enabled")),
+            api_key=str(_require_nested(data, "auphonic", "api_key")),
+            base_url=str(_require_nested(data, "auphonic", "base_url")),
+            poll_interval_seconds=int(
+                _require_nested(data, "auphonic", "poll_interval_seconds")
+            ),
+            max_poll_attempts=int(
+                _require_nested(data, "auphonic", "max_poll_attempts")
+            ),
             preset_ids=dict(_require_nested(data, "auphonic", "preset_ids")),
         ),
         podbean=PodbeanConfig(

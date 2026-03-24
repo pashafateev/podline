@@ -17,6 +17,10 @@ notifications:
   enabled: true
 auphonic:
   enabled: false
+  api_key: ""
+  base_url: https://auphonic.example/api
+  poll_interval_seconds: 10
+  max_poll_attempts: 180
   preset_ids:
     speakers_2: ""
     speakers_3: ""
@@ -35,3 +39,5 @@ podbean:
     assert config.runtime_home == Path("/tmp/sexdrunks-automation")
     assert config.paths.raw_root == Path("/tmp/raw")
     assert config.polling.interval_seconds == 30
+    assert config.auphonic.base_url == "https://auphonic.example/api"
+    assert config.auphonic.max_poll_attempts == 180
