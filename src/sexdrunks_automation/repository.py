@@ -1,7 +1,7 @@
 from typing import List, Optional
 
 from sexdrunks_automation.db import connect
-from sexdrunks_automation.models import SessionRecord
+from sexdrunks_automation.models import ScanCandidate, SessionRecord, SessionStatus
 
 
 def list_sessions(db_file: str) -> List[SessionRecord]:
@@ -43,6 +43,95 @@ def count_sessions_by_status(db_file: str, status: str) -> int:
             (status,),
         ).fetchone()
     return int(row["count"])
+
+
+def get_session_by_fingerprint(
+    db_file: str, fingerprint: str
+) -> Optional[SessionRecord]:
+    query = """
+    SELECT session_uid, recorder_name, source_path, fingerprint, status,
+           failure_reason, failed_at_stage, auphonic_production_id,
+           created_at, updated_at
+    FROM sessions
+    WHERE fingerprint = ?
+    """
+    with connect(db_file) as connection:
+        row = connection.execute(query, (fingerprint,)).fetchone()
+    return _row_to_session(row) if row else None
+
+
+def create_session(
+    db_file: str,
+    *,
+    session_uid: str,
+    fingerprint: str,
+    candidate: ScanCandidate,
+    timestamp: str,
+) -> SessionRecord:
+    with connect(db_file) as connection:
+        connection.execute(
+            """
+            INSERT INTO sessions (
+                session_uid,
+                recorder_name,
+                source_path,
+                fingerprint,
+                status,
+                failure_reason,
+                failed_at_stage,
+                auphonic_production_id,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_uid,
+                candidate.recorder_name,
+                str(candidate.session_path),
+                fingerprint,
+                SessionStatus.QUEUED.value,
+                None,
+                None,
+                None,
+                timestamp,
+                timestamp,
+            ),
+        )
+
+        for track in candidate.spoken_tracks:
+            connection.execute(
+                """
+                INSERT INTO assets (session_uid, role, filename, file_size, local_path)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    session_uid,
+                    track.role,
+                    track.path.name,
+                    track.file_size,
+                    str(track.path),
+                ),
+            )
+
+        connection.execute(
+            """
+            INSERT INTO events (session_uid, from_state, to_state, timestamp, detail)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                session_uid,
+                None,
+                SessionStatus.QUEUED.value,
+                timestamp,
+                "session discovered by scan",
+            ),
+        )
+        connection.commit()
+
+    created = get_session(db_file, session_uid)
+    if created is None:
+        raise RuntimeError(f"Failed to load created session {session_uid}")
+    return created
 
 
 def _row_to_session(row) -> SessionRecord:

@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from pathlib import Path
+from typing import List, Optional
 
 
 class SessionStatus(str, Enum):
@@ -45,3 +46,43 @@ class HealthSnapshot:
     queue_depth: int
     session_count: int
     last_error: Optional[str]
+
+
+@dataclass(frozen=True)
+class TrackFile:
+    track_name: str
+    track_number: Optional[int]
+    role: Optional[str]
+    path: Path
+    file_size: int
+
+
+@dataclass(frozen=True)
+class ScanCandidate:
+    recorder_name: str
+    session_path: Path
+    session_folder_name: str
+    date_folder_name: str
+    spoken_tracks: List[TrackFile]
+    mix_track: Optional[TrackFile]
+
+
+@dataclass(frozen=True)
+class UnsupportedSession:
+    session_path: Path
+    reason: str
+    spoken_track_count: int
+
+
+@dataclass(frozen=True)
+class ScanResult:
+    candidates: List[ScanCandidate]
+    unsupported_sessions: List[UnsupportedSession]
+
+
+@dataclass(frozen=True)
+class ScanOutcome:
+    discovered: int
+    created: int
+    duplicates: int
+    unsupported: List[UnsupportedSession]

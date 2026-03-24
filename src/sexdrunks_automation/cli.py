@@ -6,6 +6,7 @@ import typer
 from sexdrunks_automation.config import load_config
 from sexdrunks_automation.db import initialize_database
 from sexdrunks_automation.health import read_health_snapshot, write_health_snapshot
+from sexdrunks_automation.ingest import scan_and_ingest
 from sexdrunks_automation.logging_setup import configure_logging
 from sexdrunks_automation.paths import build_runtime_paths, ensure_runtime_dirs
 from sexdrunks_automation.repository import get_session, list_sessions
@@ -123,3 +124,37 @@ def status(
     typer.echo(f"updated_at: {session.updated_at}")
     typer.echo(f"failure_reason: {session.failure_reason or 'none'}")
     typer.echo(f"failed_at_stage: {session.failed_at_stage or 'none'}")
+
+
+@app.command()
+def scan(
+    config: Optional[Path] = typer.Option(
+        None, "--config", help="Path to config.yaml."
+    ),
+) -> None:
+    """Scan raw recordings and ingest new sessions."""
+    config_path = _resolve_config_path(config)
+    loaded_config, runtime_paths, logger = _bootstrap(config_path)
+    outcome = scan_and_ingest(loaded_config.paths.raw_root, runtime_paths.db_file)
+    snapshot = write_health_snapshot(
+        runtime_paths, loaded_config, worker_status="stopped"
+    )
+
+    logger.info(
+        "scan finished discovered=%s created=%s duplicates=%s unsupported=%s",
+        outcome.discovered,
+        outcome.created,
+        outcome.duplicates,
+        len(outcome.unsupported),
+    )
+
+    typer.echo(f"discovered: {outcome.discovered}")
+    typer.echo(f"created: {outcome.created}")
+    typer.echo(f"duplicates: {outcome.duplicates}")
+    typer.echo(f"unsupported: {len(outcome.unsupported)}")
+    typer.echo(f"queue_depth: {snapshot.queue_depth}")
+
+    for unsupported in outcome.unsupported:
+        typer.echo(
+            f"unsupported_session: {unsupported.session_path} ({unsupported.reason}; spoken_tracks={unsupported.spoken_track_count})"
+        )

@@ -1,2 +1,0 @@
-[console_scripts]
-sd = sexdrunks_automation.cli:app
