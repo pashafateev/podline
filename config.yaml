@@ -1,0 +1,18 @@
+runtime_home: /Users/pasha/sexdrunks-automation
+paths:
+  raw_root: /Volumes/Music/Podcast/Sex Drunks/02_recordings/raw
+  deliverables_root: /Volumes/Music/Podcast/Sex Drunks/04_deliverables
+polling:
+  interval_seconds: 30
+notifications:
+  enabled: true
+auphonic:
+  enabled: false
+  preset_ids:
+    speakers_2: ""
+    speakers_3: ""
+    speakers_4: ""
+podbean:
+  enabled: false
+  client_id: ""
+  client_secret: ""

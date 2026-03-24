@@ -1,0 +1,5 @@
+PyYAML>=6.0
+typer<1.0,>=0.12
+
+[dev]
+pytest>=8.0
