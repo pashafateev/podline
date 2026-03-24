@@ -58,6 +58,7 @@ class TrackFile:
     role: Optional[str]
     path: Path
     file_size: int
+    has_audio: bool
 
 
 @dataclass(frozen=True)

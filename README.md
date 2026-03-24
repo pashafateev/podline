@@ -9,6 +9,8 @@ Current scope
 - Phase 0 scaffold is implemented.
 - The CLI can initialize runtime folders and database state.
 - Basic inspection commands are available: `sd init`, `sd health`, `sd list`, `sd status`.
+- Phase 1 scanning and ingest are implemented via `sd scan`.
+- `recorded_at` is best-effort metadata. The recorder date is not always reliable, so this value may reflect filesystem timing rather than a true recording timestamp.
 
 Project layout
 - `src/sexdrunks_automation/`: application code

@@ -162,5 +162,12 @@ def scan(
 
     for unsupported in outcome.unsupported:
         typer.echo(
-            f"unsupported_session: {unsupported.session_path} ({unsupported.reason}; spoken_tracks={unsupported.spoken_track_count})"
+            " | ".join(
+                [
+                    "unsupported_session",
+                    f"path={unsupported.session_path}",
+                    f"reason={unsupported.reason}",
+                    f"spoken_tracks={unsupported.spoken_track_count}",
+                ]
+            )
         )

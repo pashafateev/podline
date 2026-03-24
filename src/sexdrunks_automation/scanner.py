@@ -1,7 +1,9 @@
+import audioop
 import re
+import wave
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from sexdrunks_automation.models import (
     ScanCandidate,
@@ -17,6 +19,7 @@ ROLE_MAP = {
     3: "guest1",
     4: "guest2",
 }
+WAV_ANALYSIS_FRAMES = 16384
 
 
 def scan_raw_sessions(raw_root: Path) -> ScanResult:
@@ -41,22 +44,37 @@ def scan_raw_sessions(raw_root: Path) -> ScanResult:
 
 def _parse_session_dir(date_folder_name: str, session_dir: Path):
     track_files: List[TrackFile] = []
+    basenames = set()
     for entry in sorted(path for path in session_dir.iterdir() if path.is_file()):
         parsed_track = _parse_track_file(entry)
+        if isinstance(parsed_track, UnsupportedSession):
+            return UnsupportedSession(
+                session_path=session_dir,
+                reason=parsed_track.reason,
+                spoken_track_count=parsed_track.spoken_track_count,
+            )
         if parsed_track is not None:
             track_files.append(parsed_track)
+            basenames.add(entry.name.split("_Tr", 1)[0])
 
     if not track_files:
         return None
 
-    recorder_names = {
-        path.name.split("_Tr", 1)[0] for path in (track.path for track in track_files)
-    }
-    source_basename = sorted(recorder_names)[0]
-    spoken_tracks = sorted(
+    if len(basenames) != 1:
+        return UnsupportedSession(
+            session_path=session_dir,
+            reason="multiple recorder basenames found in one session folder",
+            spoken_track_count=len(
+                [track for track in track_files if track.track_number is not None]
+            ),
+        )
+
+    source_basename = next(iter(basenames))
+    all_spoken_tracks = sorted(
         (track for track in track_files if track.track_number is not None),
         key=lambda item: item.track_number,
     )
+    spoken_tracks = [track for track in all_spoken_tracks if track.has_audio]
     mix_track = next(
         (track for track in track_files if track.track_name == "TrLR"), None
     )
@@ -65,14 +83,28 @@ def _parse_session_dir(date_folder_name: str, session_dir: Path):
     if spoken_track_count < 2:
         return UnsupportedSession(
             session_path=session_dir,
-            reason="expected 2 to 4 spoken tracks, found fewer than 2",
+            reason="expected 2 to 4 non-silent spoken tracks, found fewer than 2",
             spoken_track_count=spoken_track_count,
         )
 
     if spoken_track_count > 4:
         return UnsupportedSession(
             session_path=session_dir,
-            reason="expected 2 to 4 spoken tracks, found more than 4",
+            reason="expected 2 to 4 non-silent spoken tracks, found more than 4",
+            spoken_track_count=spoken_track_count,
+        )
+
+    invalid_track_numbers = [
+        track.track_number
+        for track in spoken_tracks
+        if track.track_number is not None
+        and (track.track_number < 1 or track.track_number > 4)
+    ]
+    if invalid_track_numbers:
+        invalid = invalid_track_numbers[0]
+        return UnsupportedSession(
+            session_path=session_dir,
+            reason=f"unsupported spoken track number: Tr{invalid}",
             spoken_track_count=spoken_track_count,
         )
 
@@ -94,7 +126,7 @@ def _parse_session_dir(date_folder_name: str, session_dir: Path):
     )
 
 
-def _parse_track_file(path: Path) -> Optional[TrackFile]:
+def _parse_track_file(path: Path) -> Optional[Union[TrackFile, UnsupportedSession]]:
     match = TRACK_PATTERN.match(path.name)
     if match is None:
         return None
@@ -107,16 +139,39 @@ def _parse_track_file(path: Path) -> Optional[TrackFile]:
             role=None,
             path=path,
             file_size=path.stat().st_size,
+            has_audio=_track_has_audio(path),
         )
 
     track_number = int(track)
+    if track_number < 1:
+        return UnsupportedSession(
+            session_path=path.parent,
+            reason=f"unsupported spoken track number: Tr{track_number}",
+            spoken_track_count=0,
+        )
+
     return TrackFile(
         track_name=f"Tr{track_number}",
         track_number=track_number,
         role=ROLE_MAP.get(track_number, f"guest{track_number - 2}"),
         path=path,
         file_size=path.stat().st_size,
+        has_audio=_track_has_audio(path),
     )
+
+
+def _track_has_audio(path: Path) -> bool:
+    try:
+        with wave.open(str(path), "rb") as wav_file:
+            sample_width = wav_file.getsampwidth()
+            while True:
+                frames = wav_file.readframes(WAV_ANALYSIS_FRAMES)
+                if not frames:
+                    return False
+                if audioop.rms(frames, sample_width) > 0:
+                    return True
+    except (wave.Error, EOFError, OSError):
+        return path.stat().st_size > 0
 
 
 def _infer_recorded_at(
