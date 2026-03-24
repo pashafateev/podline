@@ -4,8 +4,11 @@ from pathlib import Path
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_uid TEXT PRIMARY KEY,
-    recorder_name TEXT,
+    source_basename TEXT,
+    source_date_folder TEXT,
     source_path TEXT NOT NULL,
+    recorded_at TEXT,
+    recorded_at_source TEXT,
     fingerprint TEXT NOT NULL UNIQUE,
     status TEXT NOT NULL,
     failure_reason TEXT,
@@ -58,4 +61,27 @@ def connect(db_file: str) -> sqlite3.Connection:
 def initialize_database(db_file: str) -> None:
     with connect(db_file) as connection:
         connection.executescript(SCHEMA)
+        _apply_migrations(connection)
         connection.commit()
+
+
+def _apply_migrations(connection: sqlite3.Connection) -> None:
+    existing_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
+    }
+    migrations = {
+        "source_basename": "ALTER TABLE sessions ADD COLUMN source_basename TEXT",
+        "source_date_folder": "ALTER TABLE sessions ADD COLUMN source_date_folder TEXT",
+        "recorded_at": "ALTER TABLE sessions ADD COLUMN recorded_at TEXT",
+        "recorded_at_source": "ALTER TABLE sessions ADD COLUMN recorded_at_source TEXT",
+    }
+
+    for column_name, statement in migrations.items():
+        if column_name not in existing_columns:
+            connection.execute(statement)
+
+    if "recorder_name" in existing_columns:
+        connection.execute(
+            "UPDATE sessions SET source_basename = recorder_name WHERE source_basename IS NULL"
+        )

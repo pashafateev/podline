@@ -93,6 +93,8 @@ def list_command(
                 [
                     session.session_uid,
                     session.status,
+                    session.recorded_at or "unknown-recorded-at",
+                    session.source_basename or "unknown-source",
                     session.source_path,
                     session.updated_at,
                 ]
@@ -118,7 +120,11 @@ def status(
 
     typer.echo(f"session_uid: {session.session_uid}")
     typer.echo(f"status: {session.status}")
+    typer.echo(f"source_basename: {session.source_basename or 'none'}")
+    typer.echo(f"source_date_folder: {session.source_date_folder or 'none'}")
     typer.echo(f"source_path: {session.source_path}")
+    typer.echo(f"recorded_at: {session.recorded_at or 'none'}")
+    typer.echo(f"recorded_at_source: {session.recorded_at_source or 'none'}")
     typer.echo(f"fingerprint: {session.fingerprint}")
     typer.echo(f"created_at: {session.created_at}")
     typer.echo(f"updated_at: {session.updated_at}")

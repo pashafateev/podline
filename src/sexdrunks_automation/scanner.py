@@ -1,4 +1,5 @@
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -51,7 +52,7 @@ def _parse_session_dir(date_folder_name: str, session_dir: Path):
     recorder_names = {
         path.name.split("_Tr", 1)[0] for path in (track.path for track in track_files)
     }
-    recorder_name = sorted(recorder_names)[0]
+    source_basename = sorted(recorder_names)[0]
     spoken_tracks = sorted(
         (track for track in track_files if track.track_number is not None),
         key=lambda item: item.track_number,
@@ -75,11 +76,19 @@ def _parse_session_dir(date_folder_name: str, session_dir: Path):
             spoken_track_count=spoken_track_count,
         )
 
+    recorded_at, recorded_at_source = _infer_recorded_at(
+        spoken_tracks=spoken_tracks,
+        mix_track=mix_track,
+        session_dir=session_dir,
+    )
+
     return ScanCandidate(
-        recorder_name=recorder_name,
+        source_basename=source_basename,
         session_path=session_dir,
         session_folder_name=session_dir.name,
         date_folder_name=date_folder_name,
+        recorded_at=recorded_at,
+        recorded_at_source=recorded_at_source,
         spoken_tracks=spoken_tracks,
         mix_track=mix_track,
     )
@@ -108,3 +117,44 @@ def _parse_track_file(path: Path) -> Optional[TrackFile]:
         path=path,
         file_size=path.stat().st_size,
     )
+
+
+def _infer_recorded_at(
+    spoken_tracks: List[TrackFile],
+    mix_track: Optional[TrackFile],
+    session_dir: Path,
+) -> tuple[Optional[str], Optional[str]]:
+    candidates = [track.path for track in spoken_tracks]
+    if mix_track is not None:
+        candidates.append(mix_track.path)
+
+    birth_times = [_get_birth_time(path) for path in candidates]
+    available_birth_times = [value for value in birth_times if value is not None]
+    if available_birth_times:
+        return min(available_birth_times).isoformat(), "file_birth_time"
+
+    directory_birth_time = _get_birth_time(session_dir)
+    if directory_birth_time is not None:
+        return directory_birth_time.isoformat(), "directory_birth_time"
+
+    parsed_basename = _parse_basename_timestamp(session_dir.name)
+    if parsed_basename is not None:
+        return parsed_basename.isoformat(), "basename"
+
+    return None, None
+
+
+def _get_birth_time(path: Path) -> Optional[datetime]:
+    stat_result = path.stat()
+    birth_time = getattr(stat_result, "st_birthtime", None)
+    if birth_time is None:
+        return None
+    return datetime.fromtimestamp(birth_time).astimezone()
+
+
+def _parse_basename_timestamp(value: str) -> Optional[datetime]:
+    try:
+        parsed = datetime.strptime(value, "%m%d%y_%H%M%S")
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)

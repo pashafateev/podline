@@ -6,7 +6,8 @@ from sexdrunks_automation.models import ScanCandidate, SessionRecord, SessionSta
 
 def list_sessions(db_file: str) -> List[SessionRecord]:
     query = """
-    SELECT session_uid, recorder_name, source_path, fingerprint, status,
+    SELECT session_uid, source_basename, source_date_folder, source_path,
+           recorded_at, recorded_at_source, fingerprint, status,
            failure_reason, failed_at_stage, auphonic_production_id,
            created_at, updated_at
     FROM sessions
@@ -19,7 +20,8 @@ def list_sessions(db_file: str) -> List[SessionRecord]:
 
 def get_session(db_file: str, session_uid: str) -> Optional[SessionRecord]:
     query = """
-    SELECT session_uid, recorder_name, source_path, fingerprint, status,
+    SELECT session_uid, source_basename, source_date_folder, source_path,
+           recorded_at, recorded_at_source, fingerprint, status,
            failure_reason, failed_at_stage, auphonic_production_id,
            created_at, updated_at
     FROM sessions
@@ -49,7 +51,8 @@ def get_session_by_fingerprint(
     db_file: str, fingerprint: str
 ) -> Optional[SessionRecord]:
     query = """
-    SELECT session_uid, recorder_name, source_path, fingerprint, status,
+    SELECT session_uid, source_basename, source_date_folder, source_path,
+           recorded_at, recorded_at_source, fingerprint, status,
            failure_reason, failed_at_stage, auphonic_production_id,
            created_at, updated_at
     FROM sessions
@@ -73,8 +76,11 @@ def create_session(
             """
             INSERT INTO sessions (
                 session_uid,
-                recorder_name,
+                source_basename,
+                source_date_folder,
                 source_path,
+                recorded_at,
+                recorded_at_source,
                 fingerprint,
                 status,
                 failure_reason,
@@ -82,12 +88,15 @@ def create_session(
                 auphonic_production_id,
                 created_at,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_uid,
-                candidate.recorder_name,
+                candidate.source_basename,
+                candidate.date_folder_name,
                 str(candidate.session_path),
+                candidate.recorded_at,
+                candidate.recorded_at_source,
                 fingerprint,
                 SessionStatus.QUEUED.value,
                 None,
@@ -137,8 +146,11 @@ def create_session(
 def _row_to_session(row) -> SessionRecord:
     return SessionRecord(
         session_uid=row["session_uid"],
-        recorder_name=row["recorder_name"],
+        source_basename=row["source_basename"],
+        source_date_folder=row["source_date_folder"],
         source_path=row["source_path"],
+        recorded_at=row["recorded_at"],
+        recorded_at_source=row["recorded_at_source"],
         fingerprint=row["fingerprint"],
         status=row["status"],
         failure_reason=row["failure_reason"],

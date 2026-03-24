@@ -27,8 +27,11 @@ class RuntimePaths:
 @dataclass(frozen=True)
 class SessionRecord:
     session_uid: str
-    recorder_name: Optional[str]
+    source_basename: Optional[str]
+    source_date_folder: Optional[str]
     source_path: str
+    recorded_at: Optional[str]
+    recorded_at_source: Optional[str]
     fingerprint: str
     status: str
     failure_reason: Optional[str]
@@ -59,10 +62,12 @@ class TrackFile:
 
 @dataclass(frozen=True)
 class ScanCandidate:
-    recorder_name: str
+    source_basename: str
     session_path: Path
     session_folder_name: str
     date_folder_name: str
+    recorded_at: Optional[str]
+    recorded_at_source: Optional[str]
     spoken_tracks: List[TrackFile]
     mix_track: Optional[TrackFile]
 
