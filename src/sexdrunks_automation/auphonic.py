@@ -37,9 +37,11 @@ class AuphonicProduction:
 
 
 class AuphonicClientProtocol(Protocol):
-    def create_production(
-        self, *, session: SessionRecord, assets: List[AssetRecord], preset_id: str
-    ) -> str: ...
+    def create_production(self, *, session: SessionRecord, preset_id: str) -> str: ...
+
+    def upload_assets(self, production_id: str, assets: List[AssetRecord]) -> None: ...
+
+    def start_production(self, production_id: str) -> None: ...
 
     def wait_for_production(self, production_id: str) -> AuphonicProduction: ...
 
@@ -59,30 +61,17 @@ class AuphonicClient:
         self,
         *,
         session: SessionRecord,
-        assets: List[AssetRecord],
         preset_id: str,
     ) -> str:
-        data = {
-            "preset": preset_id,
-            "metadata[title]": session.source_basename or session.session_uid,
-        }
-        files = []
-        open_handles = []
-        try:
-            for asset in assets:
-                handle = open(asset.local_path, "rb")
-                open_handles.append(handle)
-                files.append(("input_files[]", (asset.filename, handle, "audio/wav")))
-
-            response = self._request_with_retries(
-                "POST",
-                "/productions.json",
-                data=data,
-                files=files,
-            )
-        finally:
-            for handle in open_handles:
-                handle.close()
+        response = self._request_with_retries(
+            "POST",
+            "/productions.json",
+            json={
+                "preset": preset_id,
+                "metadata": {"title": session.source_basename or session.session_uid},
+            },
+            headers={"Content-Type": "application/json"},
+        )
 
         payload = response.json()
         data_node = payload.get("data", payload)
@@ -96,6 +85,30 @@ class AuphonicClient:
                 "Auphonic create response did not include a production id"
             )
         return str(production_id)
+
+    def upload_assets(self, production_id: str, assets: List[AssetRecord]) -> None:
+        open_handles = []
+        files = []
+        try:
+            for asset in assets:
+                handle = open(asset.local_path, "rb")
+                open_handles.append(handle)
+                files.append(("input_file", (asset.filename, handle, "audio/wav")))
+
+            self._request_with_retries(
+                "POST",
+                f"/production/{production_id}/upload.json",
+                files=files,
+            )
+        finally:
+            for handle in open_handles:
+                handle.close()
+
+    def start_production(self, production_id: str) -> None:
+        self._request_with_retries(
+            "POST",
+            f"/production/{production_id}/start.json",
+        )
 
     def wait_for_production(self, production_id: str) -> AuphonicProduction:
         for _attempt in range(self._config.auphonic.max_poll_attempts):
@@ -149,9 +162,31 @@ def process_session_with_auphonic(
     session: SessionRecord,
     client: Optional[AuphonicClientProtocol] = None,
 ) -> SessionRecord:
+    prepared = prepare_session_with_auphonic(
+        config=config,
+        db_file=db_file,
+        session=session,
+        client=client,
+    )
+    return start_prepared_session_with_auphonic(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=db_file,
+        session=prepared,
+        client=client,
+    )
+
+
+def prepare_session_with_auphonic(
+    *,
+    config: AppConfig,
+    db_file: str,
+    session: SessionRecord,
+    client: Optional[AuphonicClientProtocol] = None,
+) -> SessionRecord:
     if session.status != SessionStatus.QUEUED.value:
         raise AuphonicError(
-            f"Session {session.session_uid} must be queued before Auphonic processing"
+            f"Session {session.session_uid} must be queued before Auphonic prepare"
         )
 
     assets = list_assets_for_session(db_file, session.session_uid)
@@ -164,18 +199,68 @@ def process_session_with_auphonic(
     production_id = None
 
     try:
-        production_id = client.create_production(
-            session=session,
-            assets=assets,
-            preset_id=preset_id,
+        production_id = client.create_production(session=session, preset_id=preset_id)
+        client.upload_assets(production_id, assets)
+        update_session_status(
+            db_file,
+            session_uid=session.session_uid,
+            from_state=session.status,
+            to_state=SessionStatus.AUPHONIC_PREPARED.value,
+            timestamp=timestamp,
+            detail="created Auphonic production and uploaded assets",
+            auphonic_production_id=production_id,
         )
+    except Exception as exc:
+        update_session_status(
+            db_file,
+            session_uid=session.session_uid,
+            from_state=session.status,
+            to_state=SessionStatus.FAILED.value,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            detail=f"Auphonic processing failed: {exc}",
+            auphonic_production_id=production_id,
+            failure_reason=str(exc),
+            failed_at_stage="auphonic",
+        )
+        raise
+
+    from sexdrunks_automation.repository import get_session
+
+    updated = get_session(db_file, session.session_uid)
+    if updated is None:
+        raise AuphonicError(f"Processed session disappeared: {session.session_uid}")
+    return updated
+
+
+def start_prepared_session_with_auphonic(
+    *,
+    config: AppConfig,
+    runtime_paths: RuntimePaths,
+    db_file: str,
+    session: SessionRecord,
+    client: Optional[AuphonicClientProtocol] = None,
+) -> SessionRecord:
+    if session.status != SessionStatus.AUPHONIC_PREPARED.value:
+        raise AuphonicError(
+            f"Session {session.session_uid} must be auphonic_prepared before start"
+        )
+    if not session.auphonic_production_id:
+        raise AuphonicError(
+            f"Session {session.session_uid} has no stored Auphonic production id"
+        )
+
+    client = client or AuphonicClient(config)
+    production_id = session.auphonic_production_id
+
+    try:
+        client.start_production(production_id)
         update_session_status(
             db_file,
             session_uid=session.session_uid,
             from_state=session.status,
             to_state=SessionStatus.AUPHONIC_STARTED.value,
-            timestamp=timestamp,
-            detail="uploaded assets to Auphonic",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            detail="started Auphonic production",
             auphonic_production_id=production_id,
         )
 

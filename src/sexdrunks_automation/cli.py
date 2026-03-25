@@ -3,7 +3,12 @@ from typing import Optional
 
 import typer
 
-from sexdrunks_automation.auphonic import AuphonicError, process_session_with_auphonic
+from sexdrunks_automation.auphonic import (
+    AuphonicError,
+    prepare_session_with_auphonic,
+    process_session_with_auphonic,
+    start_prepared_session_with_auphonic,
+)
 from sexdrunks_automation.config import load_config
 from sexdrunks_automation.db import initialize_database
 from sexdrunks_automation.health import read_health_snapshot, write_health_snapshot
@@ -50,6 +55,37 @@ def init(
     typer.echo(
         f"Deliverables mounted: {'yes' if snapshot.external_drive_mounted else 'no'}"
     )
+
+
+@app.command("reset-db")
+def reset_db(
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Delete the current SQLite database without prompting.",
+    ),
+    config: Optional[Path] = typer.Option(
+        None, "--config", help="Path to config.yaml."
+    ),
+) -> None:
+    """Delete and recreate the SQLite database for the current runtime."""
+    if not yes:
+        typer.echo("Refusing to delete the database without --yes.")
+        raise typer.Exit(code=1)
+
+    config_path = _resolve_config_path(config)
+    loaded_config = load_config(config_path)
+    runtime_paths = build_runtime_paths(loaded_config)
+    ensure_runtime_dirs(runtime_paths)
+
+    db_path = Path(runtime_paths.db_file)
+    if db_path.exists():
+        db_path.unlink()
+
+    initialize_database(runtime_paths.db_file)
+    write_health_snapshot(runtime_paths, loaded_config, worker_status="stopped")
+
+    typer.echo(f"Reset database: {runtime_paths.db_file}")
 
 
 @app.command()
@@ -201,6 +237,72 @@ def auphonic_command(
         )
     except AuphonicError as exc:
         logger.error("Auphonic processing failed for %s: %s", session_uid, exc)
+        typer.echo(f"Auphonic error: {exc}")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"session_uid: {updated.session_uid}")
+    typer.echo(f"status: {updated.status}")
+    typer.echo(f"auphonic_production_id: {updated.auphonic_production_id or 'none'}")
+    typer.echo(f"pre_edit_master_path: {updated.pre_edit_master_path or 'none'}")
+    typer.echo(f"transcript_path: {updated.transcript_path or 'none'}")
+
+
+@app.command("auphonic-prepare")
+def auphonic_prepare_command(
+    session_uid: str,
+    config: Optional[Path] = typer.Option(
+        None, "--config", help="Path to config.yaml."
+    ),
+) -> None:
+    """Create an Auphonic production and upload files without starting it."""
+    config_path = _resolve_config_path(config)
+    loaded_config, runtime_paths, logger = _bootstrap(config_path)
+    session = get_session(runtime_paths.db_file, session_uid)
+    if session is None:
+        typer.echo(f"Session not found: {session_uid}")
+        raise typer.Exit(code=1)
+
+    try:
+        updated = prepare_session_with_auphonic(
+            config=loaded_config,
+            db_file=runtime_paths.db_file,
+            session=session,
+        )
+    except AuphonicError as exc:
+        logger.error("Auphonic prepare failed for %s: %s", session_uid, exc)
+        typer.echo(f"Auphonic error: {exc}")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"session_uid: {updated.session_uid}")
+    typer.echo(f"status: {updated.status}")
+    typer.echo(f"auphonic_production_id: {updated.auphonic_production_id or 'none'}")
+    typer.echo("auphonic_started: no")
+
+
+@app.command("auphonic-start")
+def auphonic_start_command(
+    session_uid: str,
+    config: Optional[Path] = typer.Option(
+        None, "--config", help="Path to config.yaml."
+    ),
+) -> None:
+    """Start an already-uploaded Auphonic production and fetch outputs."""
+    config_path = _resolve_config_path(config)
+    loaded_config, runtime_paths, logger = _bootstrap(config_path)
+    session = get_session(runtime_paths.db_file, session_uid)
+    if session is None:
+        typer.echo(f"Session not found: {session_uid}")
+        raise typer.Exit(code=1)
+
+    try:
+        updated = start_prepared_session_with_auphonic(
+            config=loaded_config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=session,
+        )
+    except AuphonicError as exc:
+        logger.error("Auphonic start failed for %s: %s", session_uid, exc)
         typer.echo(f"Auphonic error: {exc}")
         raise typer.Exit(code=1)
 

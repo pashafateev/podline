@@ -4,8 +4,10 @@ from sexdrunks_automation.auphonic import (
     AuphonicError,
     AuphonicOutputFile,
     AuphonicProduction,
+    prepare_session_with_auphonic,
     process_session_with_auphonic,
     resolve_preset_id,
+    start_prepared_session_with_auphonic,
 )
 from sexdrunks_automation.config import (
     AppConfig,
@@ -24,11 +26,19 @@ from sexdrunks_automation.repository import get_session, list_sessions
 class FakeAuphonicClient:
     def __init__(self) -> None:
         self.created = []
+        self.uploaded = []
+        self.started = []
         self.downloads = []
 
-    def create_production(self, *, session, assets, preset_id: str) -> str:
-        self.created.append((session.session_uid, len(assets), preset_id))
+    def create_production(self, *, session, preset_id: str) -> str:
+        self.created.append((session.session_uid, preset_id))
         return "prod-123"
+
+    def upload_assets(self, production_id: str, assets) -> None:
+        self.uploaded.append((production_id, len(assets)))
+
+    def start_production(self, production_id: str) -> None:
+        self.started.append(production_id)
 
     def wait_for_production(self, production_id: str) -> AuphonicProduction:
         assert production_id == "prod-123"
@@ -100,11 +110,56 @@ def test_process_session_with_auphonic_downloads_outputs(
     assert updated.transcript_path is not None
     assert Path(updated.pre_edit_master_path).exists()
     assert Path(updated.transcript_path).exists()
-    assert client.created[0][2] == "preset-2"
+    assert client.created[0][1] == "preset-2"
+    assert client.uploaded[0][1] == 2
+    assert client.started == ["prod-123"]
 
     reloaded = get_session(runtime_paths.db_file, session.session_uid)
     assert reloaded is not None
     assert reloaded.status == "waiting_for_finalize"
+
+
+def test_prepare_then_start_splits_the_auphonic_flow(
+    fixture_raw_root, tmp_path: Path
+) -> None:
+    config = _build_config(tmp_path)
+    runtime_paths = build_runtime_paths(config)
+    ensure_runtime_dirs(runtime_paths)
+    initialize_database(runtime_paths.db_file)
+
+    scan_and_ingest(fixture_raw_root, runtime_paths.db_file)
+    session = next(
+        item
+        for item in list_sessions(runtime_paths.db_file)
+        if item.source_basename == "010124_013143"
+    )
+    client = FakeAuphonicClient()
+
+    prepared = prepare_session_with_auphonic(
+        config=config,
+        db_file=runtime_paths.db_file,
+        session=session,
+        client=client,
+    )
+
+    assert prepared.status == "auphonic_prepared"
+    assert prepared.auphonic_production_id == "prod-123"
+    assert prepared.pre_edit_master_path is None
+    assert prepared.transcript_path is None
+    assert client.started == []
+    assert client.downloads == []
+
+    started = start_prepared_session_with_auphonic(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=prepared,
+        client=client,
+    )
+
+    assert started.status == "waiting_for_finalize"
+    assert client.started == ["prod-123"]
+    assert len(client.downloads) == 2
 
 
 def _build_config(tmp_path: Path, enabled: bool = True) -> AppConfig:
