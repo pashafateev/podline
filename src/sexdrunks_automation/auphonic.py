@@ -1,7 +1,9 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 import logging
 from pathlib import Path
+import subprocess
 from time import sleep
 from typing import Dict, Iterable, List, Optional, Protocol
 
@@ -124,44 +126,73 @@ class AuphonicClient:
     def upload_assets(
         self, production_id: str, assets: List[AssetRecord], upload_track_ids: List[str]
     ) -> None:
-        open_handles = []
-        files = []
-        try:
-            for asset, upload_track_id in zip(assets, upload_track_ids):
-                handle = open(asset.local_path, "rb")
-                open_handles.append(handle)
-                files.append(
-                    (
-                        upload_track_id,
-                        (asset.filename, handle, "audio/wav"),
-                    )
-                )
+        payload = self._upload_assets_with_curl(
+            production_id=production_id,
+            assets=assets,
+            upload_track_ids=upload_track_ids,
+        )
+        data_node = payload.get("data", payload)
+        logging.getLogger("sexdrunks_automation").debug(
+            "Auphonic upload details production_id=%s attached=%s start_allowed=%s multi_input_files=%s",
+            production_id,
+            _upload_attachment_summary(data_node),
+            data_node.get("start_allowed") if isinstance(data_node, dict) else None,
+            data_node.get("multi_input_files") if isinstance(data_node, dict) else None,
+        )
+        if isinstance(data_node, dict) and not _upload_looks_attached(
+            data_node, upload_track_ids
+        ):
+            raise AuphonicError(
+                f"Auphonic upload for production {production_id} did not attach all tracks"
+            )
 
-            response = self._request_with_retries(
-                "POST",
-                f"/production/{production_id}/upload.json",
-                files=files,
+    def _upload_assets_with_curl(
+        self,
+        *,
+        production_id: str,
+        assets: List[AssetRecord],
+        upload_track_ids: List[str],
+    ) -> Dict:
+        command = [
+            "curl",
+            "-sS",
+            "--http1.1",
+            "-X",
+            "POST",
+            f"{self._config.auphonic.base_url.rstrip('/')}/production/{production_id}/upload.json?bearer_token={self._config.auphonic.api_key}",
+            "--max-time",
+            str(self._config.auphonic.request_timeout_seconds),
+        ]
+        for asset, upload_track_id in zip(assets, upload_track_ids):
+            command.extend(
+                [
+                    "-F",
+                    f"{upload_track_id}=@{asset.local_path};type=audio/wav",
+                ]
             )
-            payload = response.json() if response.content else {}
-            data_node = payload.get("data", payload)
-            logging.getLogger("sexdrunks_automation").debug(
-                "Auphonic upload details production_id=%s attached=%s start_allowed=%s multi_input_files=%s",
-                production_id,
-                _upload_attachment_summary(data_node),
-                data_node.get("start_allowed") if isinstance(data_node, dict) else None,
-                data_node.get("multi_input_files")
-                if isinstance(data_node, dict)
-                else None,
+
+        logging.getLogger("sexdrunks_automation").debug(
+            "Auphonic curl upload command production_id=%s track_ids=%s",
+            production_id,
+            upload_track_ids,
+        )
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise AuphonicError(
+                f"Auphonic curl upload failed with exit code {result.returncode}: {result.stderr[:300]}"
             )
-            if isinstance(data_node, dict) and not _upload_looks_attached(
-                data_node, upload_track_ids
-            ):
-                raise AuphonicError(
-                    f"Auphonic upload for production {production_id} did not attach all tracks"
-                )
-        finally:
-            for handle in open_handles:
-                handle.close()
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise AuphonicError(
+                f"Auphonic curl upload returned non-JSON response: {result.stdout[:300]}"
+            ) from exc
+
+        if payload.get("status_code", 200) >= 400:
+            raise AuphonicError(
+                f"Auphonic upload failed with status {payload.get('status_code')}: {payload.get('error_message') or payload.get('form_errors') or payload}"
+            )
+        return payload
 
     def start_production(self, production_id: str) -> None:
         self._request_with_retries(
