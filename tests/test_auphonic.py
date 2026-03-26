@@ -5,6 +5,7 @@ from sexdrunks_automation.auphonic import (
     AuphonicOutputFile,
     AuphonicPreparedProduction,
     AuphonicProduction,
+    inspect_production,
     prepare_session_with_auphonic,
     process_session_with_auphonic,
     resolve_preset_id,
@@ -74,6 +75,26 @@ class FakeAuphonicClient:
             destination.write_text(
                 "WEBVTT\n\n00:00.000 --> 00:01.000\nHello\n", encoding="utf-8"
             )
+
+    def get_production(self, production_id: str):
+        return {
+            "status_code": 200,
+            "error_message": "",
+            "data": {
+                "uuid": production_id,
+                "status": 10,
+                "status_string": "Production Not Started Yet",
+                "start_allowed": True,
+                "change_allowed": True,
+                "edit_page": f"https://example.test/edit/{production_id}",
+                "status_page": f"https://example.test/status/{production_id}",
+                "warning_message": "",
+                "multi_input_files": [
+                    {"id": "Jonathan", "type": "multitrack", "input_file": "Tr1.WAV"},
+                    {"id": "Pasha", "type": "multitrack", "input_file": "Tr2.WAV"},
+                ],
+            },
+        }
 
 
 def test_resolve_preset_id_validates_config() -> None:
@@ -171,6 +192,17 @@ def test_prepare_then_start_splits_the_auphonic_flow(
     assert started.status == "waiting_for_finalize"
     assert client.started == ["prod-123"]
     assert len(client.downloads) == 2
+
+
+def test_inspect_production_returns_verification_details(tmp_path: Path) -> None:
+    config = _build_config(tmp_path)
+    client = FakeAuphonicClient()
+
+    details = inspect_production(config, "prod-123", client=client)
+
+    assert details["production_id"] == "prod-123"
+    assert details["start_allowed"] is True
+    assert details["multi_input_files"][0]["id"] == "Jonathan"
 
 
 def _build_config(tmp_path: Path, enabled: bool = True) -> AppConfig:

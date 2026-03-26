@@ -15,6 +15,7 @@ Current scope
 - Silent extra spoken tracks are ignored during scan, so sessions with empty `Tr3`/`Tr4` files can still classify correctly as 2-speaker sessions.
 - Phase 3 Auphonic processing is available via `sd auphonic <session_uid>`.
 - Safer Auphonic dry runs are available via `sd auphonic-prepare <session_uid>` followed by `sd auphonic-start <session_uid>`.
+- `sd auphonic-inspect <production_id>` lets you verify attached tracks and `start_allowed` before starting.
 - Add `--debug` to CLI commands when you want verbose request-level logging in `logs/automation.log`.
 - `auphonic.request_timeout_seconds` controls how long large uploads can run before the client gives up.
 - If direct local uploads keep failing, the fallback plan is to upload WAVs to an external service first and point Auphonic `multi_input_files` at those remote files instead of streaming them from this machine.

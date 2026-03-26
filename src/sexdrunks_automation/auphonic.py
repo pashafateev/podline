@@ -63,6 +63,8 @@ class AuphonicClientProtocol(Protocol):
 
     def download_file(self, url: str, destination: Path) -> None: ...
 
+    def get_production(self, production_id: str) -> Dict: ...
+
 
 class AuphonicClient:
     def __init__(self, config: AppConfig) -> None:
@@ -259,6 +261,13 @@ class AuphonicClient:
             with destination.open("wb") as handle:
                 for chunk in response.iter_bytes():
                     handle.write(chunk)
+
+    def get_production(self, production_id: str) -> Dict:
+        response = self._request_with_retries(
+            "GET",
+            f"/production/{production_id}.json",
+        )
+        return response.json()
 
     def _request_with_retries(self, method: str, url: str, **kwargs) -> httpx.Response:
         last_error: Optional[Exception] = None
@@ -681,6 +690,31 @@ def _resolve_curl_binary() -> str:
     if resolved is None:
         raise AuphonicError("curl is required for Auphonic uploads but was not found")
     return resolved
+
+
+def inspect_production(
+    config: AppConfig,
+    production_id: str,
+    client: Optional[AuphonicClientProtocol] = None,
+) -> Dict:
+    validate_auphonic_config(config)
+    client = client or AuphonicClient(config)
+    payload = client.get_production(production_id)
+    data_node = payload.get("data", payload)
+    return {
+        "production_id": data_node.get("uuid") or production_id,
+        "status": data_node.get("status"),
+        "status_string": data_node.get("status_string"),
+        "start_allowed": data_node.get("start_allowed"),
+        "change_allowed": data_node.get("change_allowed"),
+        "edit_page": data_node.get("edit_page"),
+        "status_page": data_node.get("status_page"),
+        "error_message": payload.get("error_message")
+        or data_node.get("error_message")
+        or "",
+        "warning_message": data_node.get("warning_message") or "",
+        "multi_input_files": data_node.get("multi_input_files") or [],
+    }
 
 
 def _upload_attachment_summary(data_node: Dict) -> Dict[str, object]:

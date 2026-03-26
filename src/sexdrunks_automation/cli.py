@@ -5,6 +5,7 @@ import typer
 
 from sexdrunks_automation.auphonic import (
     AuphonicError,
+    inspect_production,
     prepare_session_with_auphonic,
     process_session_with_auphonic,
     start_prepared_session_with_auphonic,
@@ -382,3 +383,61 @@ def auphonic_start_command(
     typer.echo(f"auphonic_production_id: {updated.auphonic_production_id or 'none'}")
     typer.echo(f"pre_edit_master_path: {updated.pre_edit_master_path or 'none'}")
     typer.echo(f"transcript_path: {updated.transcript_path or 'none'}")
+
+
+@app.command("auphonic-inspect")
+def auphonic_inspect_command(
+    production_id: Optional[str] = typer.Argument(None),
+    session_uid: Optional[str] = typer.Option(
+        None, "--session", help="Resolve production id from a tracked session."
+    ),
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
+    config: Optional[Path] = typer.Option(
+        None, "--config", help="Path to config.yaml."
+    ),
+) -> None:
+    """Inspect an Auphonic production without starting it."""
+    config_path = _resolve_config_path(config)
+    loaded_config, runtime_paths, _logger = _bootstrap(config_path, debug=debug)
+
+    resolved_production_id = production_id
+    if session_uid is not None:
+        session = get_session(runtime_paths.db_file, session_uid)
+        if session is None:
+            typer.echo(f"Session not found: {session_uid}")
+            raise typer.Exit(code=1)
+        if not session.auphonic_production_id:
+            typer.echo(f"Session has no Auphonic production id: {session_uid}")
+            raise typer.Exit(code=1)
+        resolved_production_id = session.auphonic_production_id
+
+    if not resolved_production_id:
+        typer.echo("Provide a production id or use --session <session_uid>.")
+        raise typer.Exit(code=1)
+
+    try:
+        details = inspect_production(loaded_config, resolved_production_id)
+    except AuphonicError as exc:
+        typer.echo(f"Auphonic error: {exc}")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"production_id: {details['production_id']}")
+    typer.echo(f"status: {details['status']}")
+    typer.echo(f"status_string: {details['status_string'] or 'none'}")
+    typer.echo(f"start_allowed: {details['start_allowed']}")
+    typer.echo(f"change_allowed: {details['change_allowed']}")
+    typer.echo(f"edit_page: {details['edit_page'] or 'none'}")
+    typer.echo(f"status_page: {details['status_page'] or 'none'}")
+    typer.echo(f"error_message: {details['error_message'] or 'none'}")
+    typer.echo(f"warning_message: {details['warning_message'] or 'none'}")
+    for track in details["multi_input_files"]:
+        typer.echo(
+            " | ".join(
+                [
+                    "track",
+                    f"id={track.get('id', '')}",
+                    f"type={track.get('type', '')}",
+                    f"input_file={track.get('input_file', '') or 'none'}",
+                ]
+            )
+        )
