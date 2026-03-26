@@ -178,6 +178,7 @@ def _build_config(tmp_path: Path, enabled: bool = True) -> AppConfig:
             enabled=enabled,
             api_key="secret-token" if enabled else "",
             base_url="https://auphonic.example/api",
+            request_timeout_seconds=600,
             poll_interval_seconds=0,
             max_poll_attempts=2,
             preset_ids={

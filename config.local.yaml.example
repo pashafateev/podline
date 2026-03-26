@@ -4,6 +4,7 @@ paths:
 auphonic:
   enabled: true
   api_key: "replace-me"
+  request_timeout_seconds: 600
   preset_ids:
     speakers_2: "replace-me"
     speakers_3: "replace-me"

@@ -57,7 +57,9 @@ class AuphonicClient:
         self._client = httpx.Client(
             base_url=config.auphonic.base_url.rstrip("/"),
             headers={"Authorization": f"Bearer {config.auphonic.api_key}"},
-            timeout=60.0,
+            timeout=httpx.Timeout(
+                config.auphonic.request_timeout_seconds, connect=60.0
+            ),
         )
 
     def create_production(
@@ -96,6 +98,14 @@ class AuphonicClient:
             raise AuphonicError(
                 "Auphonic create response did not include a production id"
             )
+        logging.getLogger("sexdrunks_automation").debug(
+            "Auphonic create details production_id=%s status_page=%s edit_page=%s start_allowed=%s change_allowed=%s",
+            production_id,
+            data_node.get("status_page"),
+            data_node.get("edit_page"),
+            data_node.get("start_allowed"),
+            data_node.get("change_allowed"),
+        )
         return str(production_id)
 
     def upload_assets(self, production_id: str, assets: List[AssetRecord]) -> None:
@@ -119,6 +129,15 @@ class AuphonicClient:
             )
             payload = response.json() if response.content else {}
             data_node = payload.get("data", payload)
+            logging.getLogger("sexdrunks_automation").debug(
+                "Auphonic upload details production_id=%s attached=%s start_allowed=%s multi_input_files=%s",
+                production_id,
+                _upload_attachment_summary(data_node),
+                data_node.get("start_allowed") if isinstance(data_node, dict) else None,
+                data_node.get("multi_input_files")
+                if isinstance(data_node, dict)
+                else None,
+            )
             if isinstance(data_node, dict) and not _upload_looks_attached(
                 data_node, assets
             ):
@@ -249,8 +268,9 @@ def prepare_session_with_auphonic(
         _log(logger, "Preparing Auphonic production for %s", session.session_uid)
         _debug_log(
             logger,
-            "Auphonic preset=%s track_ids=%s asset_paths=%s",
+            "Auphonic preset=%s timeout=%ss track_ids=%s asset_paths=%s",
             preset_id,
+            config.auphonic.request_timeout_seconds,
             [_asset_upload_key(asset) for asset in assets],
             [asset.local_path for asset in assets],
         )
@@ -524,6 +544,24 @@ def _upload_looks_attached(data_node: Dict, assets: List[AssetRecord]) -> bool:
 
     input_file = data_node.get("input_file")
     return len(assets) == 1 and bool(input_file)
+
+
+def _upload_attachment_summary(data_node: Dict) -> Dict[str, object]:
+    if not isinstance(data_node, dict):
+        return {}
+
+    multi_input_files = data_node.get("multi_input_files")
+    if isinstance(multi_input_files, list):
+        return {
+            "multi_input_ids": [item.get("id") for item in multi_input_files],
+            "attached_inputs": [
+                item.get("input_file")
+                for item in multi_input_files
+                if item.get("input_file")
+            ],
+        }
+
+    return {"input_file": data_node.get("input_file")}
 
 
 def _log(logger: Optional[logging.Logger], message: str, *args) -> None:

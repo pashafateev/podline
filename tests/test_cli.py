@@ -28,6 +28,7 @@ def _write_config(config_file: Path, runtime_home: Path, raw_root: Path) -> None
                     "  enabled: false",
                     '  api_key: ""',
                     '  base_url: "https://auphonic.example"',
+                    "  request_timeout_seconds: 600",
                     "  poll_interval_seconds: 15",
                     "  max_poll_attempts: 20",
                     "  preset_ids:",

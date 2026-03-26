@@ -26,6 +26,7 @@ class AuphonicConfig:
     enabled: bool
     api_key: str
     base_url: str
+    request_timeout_seconds: int
     poll_interval_seconds: int
     max_poll_attempts: int
     preset_ids: Dict[str, str]
@@ -75,6 +76,9 @@ def load_config(config_path: Path) -> AppConfig:
             enabled=bool(_require_nested(data, "auphonic", "enabled")),
             api_key=str(_require_nested(data, "auphonic", "api_key")),
             base_url=str(_require_nested(data, "auphonic", "base_url")),
+            request_timeout_seconds=int(
+                _require_nested(data, "auphonic", "request_timeout_seconds")
+            ),
             poll_interval_seconds=int(
                 _require_nested(data, "auphonic", "poll_interval_seconds")
             ),

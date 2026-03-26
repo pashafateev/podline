@@ -15,6 +15,7 @@ Current scope
 - Phase 3 Auphonic processing is available via `sd auphonic <session_uid>`.
 - Safer Auphonic dry runs are available via `sd auphonic-prepare <session_uid>` followed by `sd auphonic-start <session_uid>`.
 - Add `--debug` to CLI commands when you want verbose request-level logging in `logs/automation.log`.
+- `auphonic.request_timeout_seconds` controls how long large uploads can run before the client gives up.
 
 Project layout
 - `src/sexdrunks_automation/`: application code

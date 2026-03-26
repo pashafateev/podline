@@ -10,6 +10,7 @@ auphonic:
   enabled: false
   api_key: ""
   base_url: https://auphonic.com/api
+  request_timeout_seconds: 600
   poll_interval_seconds: 10
   max_poll_attempts: 180
   preset_ids:
