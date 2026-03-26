@@ -1,0 +1,10 @@
+paths:
+  raw_root: /Volumes/Music/Podcast/Sex Drunks/02_recordings
+
+auphonic:
+  enabled: true
+  api_key: "replace-me"
+  preset_ids:
+    speakers_2: "replace-me"
+    speakers_3: "replace-me"
+    speakers_4: "replace-me"

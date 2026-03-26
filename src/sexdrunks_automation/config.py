@@ -53,6 +53,12 @@ def load_config(config_path: Path) -> AppConfig:
     with config_path.open("r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle) or {}
 
+    local_config_path = config_path.with_name("config.local.yaml")
+    if local_config_path.exists():
+        with local_config_path.open("r", encoding="utf-8") as handle:
+            local_data = yaml.safe_load(handle) or {}
+        data = _deep_merge(data, local_data)
+
     return AppConfig(
         runtime_home=Path(_require(data, "runtime_home")),
         paths=PathsConfig(
@@ -99,3 +105,13 @@ def _require_nested(data: Dict[str, Any], section: str, key: str) -> Any:
     if key not in section_data:
         raise ValueError(f"Missing required config key: {section}.{key}")
     return section_data[key]
+
+
+def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged

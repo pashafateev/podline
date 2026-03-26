@@ -32,6 +32,11 @@ sd init
 sd health
 ```
 
+Local config
+- Keep committed defaults in `config.yaml`.
+- Put machine-specific paths and secrets in `config.local.yaml`, which is gitignored.
+- Start from `config.local.yaml.example` and copy it to `config.local.yaml`.
+
 Planned next steps
 - manual end-to-end processing flow
 - finalize and Podbean draft creation

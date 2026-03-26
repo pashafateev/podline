@@ -8,14 +8,14 @@ notifications:
   enabled: true
 auphonic:
   enabled: false
-  api_key: "qudbZ3OksiYJnbcMbPnoIW1X0NfcHa9L"
+  api_key: ""
   base_url: https://auphonic.com/api
   poll_interval_seconds: 10
   max_poll_attempts: 180
   preset_ids:
-    speakers_2: "pWdAghcowy8BWEdXWQKAsW"
-    speakers_3: "myr3pgLrh3Gu3AKDb7w26f"
-    speakers_4: "Pgwh5965Hvp6duS6ZxsA5D"
+    speakers_2: ""
+    speakers_3: ""
+    speakers_4: ""
 podbean:
   enabled: false
   client_id: ""
