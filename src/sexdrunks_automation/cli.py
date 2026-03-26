@@ -130,7 +130,9 @@ def refresh(
 
     typer.echo(f"Reset database: {runtime_paths.db_file}")
 
-    outcome = scan_and_ingest(loaded_config.paths.raw_root, runtime_paths.db_file)
+    outcome = scan_and_ingest(
+        loaded_config.paths.raw_root, runtime_paths.db_file, logger=logger
+    )
     snapshot = write_health_snapshot(
         runtime_paths, loaded_config, worker_status="stopped"
     )
@@ -242,7 +244,9 @@ def scan(
     """Scan raw recordings and ingest new sessions."""
     config_path = _resolve_config_path(config)
     loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
-    outcome = scan_and_ingest(loaded_config.paths.raw_root, runtime_paths.db_file)
+    outcome = scan_and_ingest(
+        loaded_config.paths.raw_root, runtime_paths.db_file, logger=logger
+    )
     snapshot = write_health_snapshot(
         runtime_paths, loaded_config, worker_status="stopped"
     )

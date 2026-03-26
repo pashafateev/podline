@@ -1,3 +1,4 @@
+import logging
 import re
 import subprocess
 import shutil
@@ -27,7 +28,9 @@ SESSION_MIN_LOUDEST_RMS_DB = -88.0
 SESSION_RELATIVE_ACTIVITY_WINDOW_DB = 18.0
 
 
-def scan_raw_sessions(raw_root: Path) -> ScanResult:
+def scan_raw_sessions(
+    raw_root: Path, logger: Optional[logging.Logger] = None
+) -> ScanResult:
     candidates: List[ScanCandidate] = []
     unsupported_sessions: List[UnsupportedSession] = []
 
@@ -39,7 +42,8 @@ def scan_raw_sessions(raw_root: Path) -> ScanResult:
     for session_dir in sorted(path for path in raw_root.iterdir() if path.is_dir()):
         if not _looks_like_session_dir(session_dir):
             continue
-        parsed = _parse_session_dir(session_dir)
+        _debug_log(logger, "Scanning session directory %s", session_dir)
+        parsed = _parse_session_dir(session_dir, logger=logger)
         if isinstance(parsed, UnsupportedSession):
             unsupported_sessions.append(parsed)
         elif parsed is not None:
@@ -55,11 +59,11 @@ def _looks_like_session_dir(path: Path) -> bool:
     return False
 
 
-def _parse_session_dir(session_dir: Path):
+def _parse_session_dir(session_dir: Path, logger: Optional[logging.Logger] = None):
     track_files: List[TrackFile] = []
     basenames = set()
     for entry in sorted(path for path in session_dir.iterdir() if path.is_file()):
-        parsed_track = _parse_track_file(entry)
+        parsed_track = _parse_track_file(entry, logger=logger)
         if isinstance(parsed_track, UnsupportedSession):
             return UnsupportedSession(
                 session_path=session_dir,
@@ -87,7 +91,7 @@ def _parse_session_dir(session_dir: Path):
         (track for track in track_files if track.track_number is not None),
         key=lambda item: item.track_number,
     )
-    spoken_tracks = _filter_active_spoken_tracks(all_spoken_tracks)
+    spoken_tracks = _filter_active_spoken_tracks(all_spoken_tracks, logger=logger)
     mix_track = next(
         (track for track in track_files if track.track_name == "TrLR"), None
     )
@@ -139,14 +143,16 @@ def _parse_session_dir(session_dir: Path):
     )
 
 
-def _parse_track_file(path: Path) -> Optional[Union[TrackFile, UnsupportedSession]]:
+def _parse_track_file(
+    path: Path, logger: Optional[logging.Logger] = None
+) -> Optional[Union[TrackFile, UnsupportedSession]]:
     match = TRACK_PATTERN.match(path.name)
     if match is None:
         return None
 
     track = match.group("track")
     if track == "LR":
-        has_audio, activity_rms_db = _track_has_audio(path)
+        has_audio, activity_rms_db = _track_has_audio(path, logger=logger)
         return TrackFile(
             track_name="TrLR",
             track_number=None,
@@ -165,7 +171,7 @@ def _parse_track_file(path: Path) -> Optional[Union[TrackFile, UnsupportedSessio
             spoken_track_count=0,
         )
 
-    has_audio, activity_rms_db = _track_has_audio(path)
+    has_audio, activity_rms_db = _track_has_audio(path, logger=logger)
     return TrackFile(
         track_name=f"Tr{track_number}",
         track_number=track_number,
@@ -177,9 +183,18 @@ def _parse_track_file(path: Path) -> Optional[Union[TrackFile, UnsupportedSessio
     )
 
 
-def _track_has_audio(path: Path) -> Tuple[bool, Optional[float]]:
-    ffmpeg_rms_db = _ffmpeg_rms_db(path)
+def _track_has_audio(
+    path: Path, logger: Optional[logging.Logger] = None
+) -> Tuple[bool, Optional[float]]:
+    ffmpeg_rms_db = _ffmpeg_rms_db(path, logger=logger)
     if ffmpeg_rms_db is not None:
+        _debug_log(
+            logger,
+            "Track analysis path=%s rms_db=%s active=%s via=ffmpeg",
+            path,
+            ffmpeg_rms_db,
+            ffmpeg_rms_db >= SESSION_SILENCE_FLOOR_DB,
+        )
         return ffmpeg_rms_db >= SESSION_SILENCE_FLOOR_DB, ffmpeg_rms_db
 
     try:
@@ -190,12 +205,26 @@ def _track_has_audio(path: Path) -> Tuple[bool, Optional[float]]:
                 if not frames:
                     return False, None
                 if _pcm_rms(frames, sample_width) >= SILENCE_RMS_THRESHOLD:
+                    _debug_log(
+                        logger, "Track analysis path=%s active=True via=pcm", path
+                    )
                     return True, None
     except (wave.Error, EOFError, OSError):
-        return path.stat().st_size > 0, None
+        fallback_active = path.stat().st_size > 0
+        _debug_log(
+            logger,
+            "Track analysis path=%s active=%s via=size-fallback",
+            path,
+            fallback_active,
+        )
+        return fallback_active, None
+    _debug_log(logger, "Track analysis path=%s active=False via=pcm", path)
+    return False, None
 
 
-def _filter_active_spoken_tracks(spoken_tracks: List[TrackFile]) -> List[TrackFile]:
+def _filter_active_spoken_tracks(
+    spoken_tracks: List[TrackFile], logger: Optional[logging.Logger] = None
+) -> List[TrackFile]:
     audio_tracks = [track for track in spoken_tracks if track.has_audio]
     rms_tracks = [track for track in audio_tracks if track.activity_rms_db is not None]
     if not rms_tracks:
@@ -206,22 +235,43 @@ def _filter_active_spoken_tracks(spoken_tracks: List[TrackFile]) -> List[TrackFi
         for track in rms_tracks
         if track.activity_rms_db is not None
     )
+    _debug_log(
+        logger,
+        "Track activity loudest_rms_db=%s candidate_tracks=%s",
+        loudest_rms_db,
+        [f"{track.track_name}:{track.activity_rms_db}" for track in rms_tracks],
+    )
     if loudest_rms_db < SESSION_MIN_LOUDEST_RMS_DB:
+        _debug_log(
+            logger,
+            "Rejecting session as all-noise loudest_rms_db=%s threshold=%s",
+            loudest_rms_db,
+            SESSION_MIN_LOUDEST_RMS_DB,
+        )
         return []
 
     activity_threshold_db = max(
         loudest_rms_db - SESSION_RELATIVE_ACTIVITY_WINDOW_DB,
         SESSION_SILENCE_FLOOR_DB,
     )
-    return [
+    filtered = [
         track
         for track in audio_tracks
         if track.activity_rms_db is None
         or track.activity_rms_db >= activity_threshold_db
     ]
+    _debug_log(
+        logger,
+        "Track activity threshold_db=%s kept_tracks=%s",
+        activity_threshold_db,
+        [f"{track.track_name}:{track.activity_rms_db}" for track in filtered],
+    )
+    return filtered
 
 
-def _ffmpeg_rms_db(path: Path) -> Optional[float]:
+def _ffmpeg_rms_db(
+    path: Path, logger: Optional[logging.Logger] = None
+) -> Optional[float]:
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path is None:
         return None
@@ -238,8 +288,15 @@ def _ffmpeg_rms_db(path: Path) -> Optional[float]:
         "null",
         "-",
     ]
+    _debug_log(logger, "Running ffmpeg level analysis for %s", path)
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
+        _debug_log(
+            logger,
+            "ffmpeg level analysis failed for %s returncode=%s",
+            path,
+            result.returncode,
+        )
         return None
 
     match = re.findall(r"RMS level dB:\s*([-0-9.inf]+)", result.stderr)
@@ -254,6 +311,11 @@ def _ffmpeg_rms_db(path: Path) -> Optional[float]:
         return float(value)
     except ValueError:
         return None
+
+
+def _debug_log(logger: Optional[logging.Logger], message: str, *args) -> None:
+    if logger is not None:
+        logger.debug(message, *args)
 
 
 def _pcm_rms(frames: bytes, sample_width: int) -> int:

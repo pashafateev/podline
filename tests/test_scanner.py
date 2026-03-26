@@ -173,7 +173,7 @@ def test_scanner_uses_relative_ffmpeg_levels_to_drop_quiet_tracks(
     monkeypatch.setattr(
         scanner,
         "_ffmpeg_rms_db",
-        lambda path: rms_by_name.get(path.name),
+        lambda path, logger=None: rms_by_name.get(path.name),
     )
 
     scan_result = scan_raw_sessions(raw_root)
@@ -207,7 +207,7 @@ def test_scanner_rejects_all_noise_session_with_ffmpeg_levels(
     monkeypatch.setattr(
         scanner,
         "_ffmpeg_rms_db",
-        lambda path: rms_by_name.get(path.name),
+        lambda path, logger=None: rms_by_name.get(path.name),
     )
 
     scan_result = scan_raw_sessions(raw_root)

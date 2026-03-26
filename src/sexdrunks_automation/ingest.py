@@ -1,4 +1,6 @@
+import logging
 from datetime import datetime, timezone
+from typing import Optional
 
 from sexdrunks_automation.fingerprint import build_fingerprint, build_session_uid
 from sexdrunks_automation.models import ScanOutcome
@@ -6,8 +8,10 @@ from sexdrunks_automation.repository import create_session, get_session_by_finge
 from sexdrunks_automation.scanner import scan_raw_sessions
 
 
-def scan_and_ingest(raw_root, db_file: str) -> ScanOutcome:
-    scan_result = scan_raw_sessions(raw_root)
+def scan_and_ingest(
+    raw_root, db_file: str, logger: Optional[logging.Logger] = None
+) -> ScanOutcome:
+    scan_result = scan_raw_sessions(raw_root, logger=logger)
     created = 0
     duplicates = 0
 
