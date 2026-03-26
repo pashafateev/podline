@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import logging
 from pathlib import Path
 from time import sleep
 from typing import Dict, Iterable, List, Optional, Protocol
@@ -161,12 +162,14 @@ def process_session_with_auphonic(
     db_file: str,
     session: SessionRecord,
     client: Optional[AuphonicClientProtocol] = None,
+    logger: Optional[logging.Logger] = None,
 ) -> SessionRecord:
     prepared = prepare_session_with_auphonic(
         config=config,
         db_file=db_file,
         session=session,
         client=client,
+        logger=logger,
     )
     return start_prepared_session_with_auphonic(
         config=config,
@@ -174,6 +177,7 @@ def process_session_with_auphonic(
         db_file=db_file,
         session=prepared,
         client=client,
+        logger=logger,
     )
 
 
@@ -183,6 +187,7 @@ def prepare_session_with_auphonic(
     db_file: str,
     session: SessionRecord,
     client: Optional[AuphonicClientProtocol] = None,
+    logger: Optional[logging.Logger] = None,
 ) -> SessionRecord:
     if session.status != SessionStatus.QUEUED.value:
         raise AuphonicError(
@@ -199,8 +204,21 @@ def prepare_session_with_auphonic(
     production_id = None
 
     try:
+        _log(logger, "Preparing Auphonic production for %s", session.session_uid)
         production_id = client.create_production(session=session, preset_id=preset_id)
+        _log(
+            logger,
+            "Created Auphonic production %s for %s",
+            production_id,
+            session.session_uid,
+        )
         client.upload_assets(production_id, assets)
+        _log(
+            logger,
+            "Uploaded %s assets to Auphonic production %s",
+            len(assets),
+            production_id,
+        )
         update_session_status(
             db_file,
             session_uid=session.session_uid,
@@ -211,6 +229,7 @@ def prepare_session_with_auphonic(
             auphonic_production_id=production_id,
         )
     except Exception as exc:
+        _log(logger, "Auphonic prepare failed for %s: %s", session.session_uid, exc)
         update_session_status(
             db_file,
             session_uid=session.session_uid,
@@ -239,6 +258,7 @@ def start_prepared_session_with_auphonic(
     db_file: str,
     session: SessionRecord,
     client: Optional[AuphonicClientProtocol] = None,
+    logger: Optional[logging.Logger] = None,
 ) -> SessionRecord:
     if session.status != SessionStatus.AUPHONIC_PREPARED.value:
         raise AuphonicError(
@@ -253,6 +273,12 @@ def start_prepared_session_with_auphonic(
     production_id = session.auphonic_production_id
 
     try:
+        _log(
+            logger,
+            "Starting Auphonic production %s for %s",
+            production_id,
+            session.session_uid,
+        )
         client.start_production(production_id)
         update_session_status(
             db_file,
@@ -265,6 +291,11 @@ def start_prepared_session_with_auphonic(
         )
 
         production = client.wait_for_production(production_id)
+        _log(
+            logger,
+            "Auphonic production %s finished; downloading outputs",
+            production_id,
+        )
         paths = _download_and_copy_outputs(
             client=client,
             runtime_paths=runtime_paths,
@@ -284,7 +315,15 @@ def start_prepared_session_with_auphonic(
             pre_edit_master_path=str(paths["master"]),
             transcript_path=str(paths["transcript"]),
         )
+        _log(
+            logger,
+            "Stored Auphonic outputs for %s master=%s transcript=%s",
+            session.session_uid,
+            paths["master"],
+            paths["transcript"],
+        )
     except Exception as exc:
+        _log(logger, "Auphonic start failed for %s: %s", session.session_uid, exc)
         update_session_status(
             db_file,
             session_uid=session.session_uid,
@@ -409,3 +448,8 @@ def _suffix_from_url(url: Optional[str]) -> str:
     if not url:
         return ""
     return Path(url.split("?", 1)[0]).suffix
+
+
+def _log(logger: Optional[logging.Logger], message: str, *args) -> None:
+    if logger is not None:
+        logger.info(message, *args)

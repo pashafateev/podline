@@ -234,6 +234,7 @@ def auphonic_command(
             runtime_paths=runtime_paths,
             db_file=runtime_paths.db_file,
             session=session,
+            logger=logger,
         )
     except AuphonicError as exc:
         logger.error("Auphonic processing failed for %s: %s", session_uid, exc)
@@ -267,6 +268,7 @@ def auphonic_prepare_command(
             config=loaded_config,
             db_file=runtime_paths.db_file,
             session=session,
+            logger=logger,
         )
     except AuphonicError as exc:
         logger.error("Auphonic prepare failed for %s: %s", session_uid, exc)
@@ -300,6 +302,7 @@ def auphonic_start_command(
             runtime_paths=runtime_paths,
             db_file=runtime_paths.db_file,
             session=session,
+            logger=logger,
         )
     except AuphonicError as exc:
         logger.error("Auphonic start failed for %s: %s", session_uid, exc)
