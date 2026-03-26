@@ -20,6 +20,7 @@ ROLE_MAP = {
     4: "guest2",
 }
 WAV_ANALYSIS_FRAMES = 16384
+SILENCE_RMS_THRESHOLD = 100
 
 
 def scan_raw_sessions(raw_root: Path) -> ScanResult:
@@ -176,7 +177,7 @@ def _track_has_audio(path: Path) -> bool:
                 frames = wav_file.readframes(WAV_ANALYSIS_FRAMES)
                 if not frames:
                     return False
-                if audioop.rms(frames, sample_width) > 0:
+                if audioop.rms(frames, sample_width) >= SILENCE_RMS_THRESHOLD:
                     return True
     except (wave.Error, EOFError, OSError):
         return path.stat().st_size > 0

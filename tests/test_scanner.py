@@ -109,6 +109,22 @@ def test_scanner_rejects_when_only_one_track_has_audio(
     assert "non-silent spoken tracks" in scan_result.unsupported_sessions[0].reason
 
 
+def test_scanner_treats_low_level_noise_as_silent(tmp_path: Path, wav_writer) -> None:
+    raw_root = tmp_path / "raw"
+    session_dir = raw_root / "010124_012430"
+
+    wav_writer(session_dir / "010124_012430_Tr1.WAV", [0, 1200, -1200, 600] * 500)
+    wav_writer(session_dir / "010124_012430_Tr2.WAV", [0, -900, 900, -450] * 500)
+    wav_writer(session_dir / "010124_012430_Tr3.WAV", [6, -6, 8, -8] * 1000)
+    wav_writer(session_dir / "010124_012430_Tr4.WAV", [4, -4, 5, -5] * 1000)
+
+    scan_result = scan_raw_sessions(raw_root)
+
+    assert len(scan_result.candidates) == 1
+    candidate = scan_result.candidates[0]
+    assert [track.track_name for track in candidate.spoken_tracks] == ["Tr1", "Tr2"]
+
+
 def test_scanner_supports_flat_recording_root_layout(
     tmp_path: Path, wav_writer
 ) -> None:
