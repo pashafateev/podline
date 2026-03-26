@@ -23,6 +23,7 @@ ROLE_MAP = {
 WAV_ANALYSIS_FRAMES = 16384
 SILENCE_RMS_THRESHOLD = 100
 SESSION_SILENCE_FLOOR_DB = -90.0
+SESSION_MIN_LOUDEST_RMS_DB = -88.0
 SESSION_RELATIVE_ACTIVITY_WINDOW_DB = 18.0
 
 
@@ -205,6 +206,9 @@ def _filter_active_spoken_tracks(spoken_tracks: List[TrackFile]) -> List[TrackFi
         for track in rms_tracks
         if track.activity_rms_db is not None
     )
+    if loudest_rms_db < SESSION_MIN_LOUDEST_RMS_DB:
+        return []
+
     activity_threshold_db = max(
         loudest_rms_db - SESSION_RELATIVE_ACTIVITY_WINDOW_DB,
         SESSION_SILENCE_FLOOR_DB,

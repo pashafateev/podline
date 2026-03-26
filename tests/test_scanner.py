@@ -181,3 +181,37 @@ def test_scanner_uses_relative_ffmpeg_levels_to_drop_quiet_tracks(
     assert len(scan_result.candidates) == 1
     candidate = scan_result.candidates[0]
     assert [track.track_name for track in candidate.spoken_tracks] == ["Tr1", "Tr2"]
+
+
+def test_scanner_rejects_all_noise_session_with_ffmpeg_levels(
+    tmp_path: Path, monkeypatch
+) -> None:
+    raw_root = tmp_path / "raw"
+    session_dir = raw_root / "010124_012430"
+    session_dir.mkdir(parents=True)
+
+    for name in [
+        "010124_012430_Tr1.WAV",
+        "010124_012430_Tr2.WAV",
+        "010124_012430_Tr3.WAV",
+        "010124_012430_Tr4.WAV",
+    ]:
+        (session_dir / name).write_bytes(b"non-empty")
+
+    rms_by_name = {
+        "010124_012430_Tr1.WAV": -89.0,
+        "010124_012430_Tr2.WAV": -90.0,
+        "010124_012430_Tr3.WAV": -91.0,
+        "010124_012430_Tr4.WAV": -92.0,
+    }
+    monkeypatch.setattr(
+        scanner,
+        "_ffmpeg_rms_db",
+        lambda path: rms_by_name.get(path.name),
+    )
+
+    scan_result = scan_raw_sessions(raw_root)
+
+    assert len(scan_result.candidates) == 0
+    assert len(scan_result.unsupported_sessions) == 1
+    assert "non-silent spoken tracks" in scan_result.unsupported_sessions[0].reason
