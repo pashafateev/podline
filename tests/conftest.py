@@ -1,4 +1,5 @@
 import struct
+import shutil
 import wave
 from pathlib import Path
 
@@ -6,8 +7,19 @@ import pytest
 
 
 @pytest.fixture()
-def fixture_raw_root() -> Path:
-    return Path(__file__).parent / "fixtures" / "raw"
+def fixture_raw_root(tmp_path: Path) -> Path:
+    source_root = Path(__file__).parent / "fixtures" / "raw"
+    flat_root = tmp_path / "raw"
+    flat_root.mkdir()
+
+    for date_dir in source_root.iterdir():
+        if not date_dir.is_dir():
+            continue
+        for session_dir in date_dir.iterdir():
+            if session_dir.is_dir():
+                shutil.copytree(session_dir, flat_root / session_dir.name)
+
+    return flat_root
 
 
 @pytest.fixture()

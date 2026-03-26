@@ -31,27 +31,16 @@ def scan_raw_sessions(raw_root: Path) -> ScanResult:
             candidates=candidates, unsupported_sessions=unsupported_sessions
         )
 
-    for date_folder_name, session_dir in _iter_session_dirs(raw_root):
-        parsed = _parse_session_dir(date_folder_name, session_dir)
+    for session_dir in sorted(path for path in raw_root.iterdir() if path.is_dir()):
+        if not _looks_like_session_dir(session_dir):
+            continue
+        parsed = _parse_session_dir(session_dir)
         if isinstance(parsed, UnsupportedSession):
             unsupported_sessions.append(parsed)
         elif parsed is not None:
             candidates.append(parsed)
 
     return ScanResult(candidates=candidates, unsupported_sessions=unsupported_sessions)
-
-
-def _iter_session_dirs(raw_root: Path):
-    for child_dir in sorted(path for path in raw_root.iterdir() if path.is_dir()):
-        if _looks_like_session_dir(child_dir):
-            yield "", child_dir
-            continue
-
-        for session_dir in sorted(
-            path for path in child_dir.iterdir() if path.is_dir()
-        ):
-            if _looks_like_session_dir(session_dir):
-                yield child_dir.name, session_dir
 
 
 def _looks_like_session_dir(path: Path) -> bool:
@@ -61,7 +50,7 @@ def _looks_like_session_dir(path: Path) -> bool:
     return False
 
 
-def _parse_session_dir(date_folder_name: str, session_dir: Path):
+def _parse_session_dir(session_dir: Path):
     track_files: List[TrackFile] = []
     basenames = set()
     for entry in sorted(path for path in session_dir.iterdir() if path.is_file()):
@@ -137,7 +126,7 @@ def _parse_session_dir(date_folder_name: str, session_dir: Path):
         source_basename=source_basename,
         session_path=session_dir,
         session_folder_name=session_dir.name,
-        date_folder_name=date_folder_name,
+        date_folder_name="",
         recorded_at=recorded_at,
         recorded_at_source=recorded_at_source,
         spoken_tracks=spoken_tracks,

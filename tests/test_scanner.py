@@ -39,33 +39,9 @@ def test_scanner_detects_supported_and_unsupported_sessions(fixture_raw_root) ->
     assert "more than 4" in reasons["012124_021500"]
 
 
-def test_scanner_allows_duplicate_basenames_across_dates(tmp_path: Path) -> None:
-    raw_root = tmp_path / "raw"
-    session_one = raw_root / "2024-01-01" / "010124_013143"
-    session_two = raw_root / "2024-02-01" / "010124_013143"
-    session_one.mkdir(parents=True)
-    session_two.mkdir(parents=True)
-
-    (session_one / "010124_013143_Tr1.WAV").write_bytes(b"one-a")
-    (session_one / "010124_013143_Tr2.WAV").write_bytes(b"one-b")
-    (session_two / "010124_013143_Tr1.WAV").write_bytes(b"two-a-different")
-    (session_two / "010124_013143_Tr2.WAV").write_bytes(b"two-b-different")
-
-    scan_result = scan_raw_sessions(raw_root)
-
-    assert len(scan_result.candidates) == 2
-    assert all(
-        candidate.source_basename == "010124_013143"
-        for candidate in scan_result.candidates
-    )
-    assert all(
-        candidate.recorded_at is not None for candidate in scan_result.candidates
-    )
-
-
 def test_scanner_rejects_mixed_basenames_within_one_session(tmp_path: Path) -> None:
     raw_root = tmp_path / "raw"
-    session_dir = raw_root / "2024-01-01" / "010124_013143"
+    session_dir = raw_root / "010124_013143"
     session_dir.mkdir(parents=True)
 
     (session_dir / "010124_013143_Tr1.WAV").write_bytes(b"one-a")
@@ -82,7 +58,7 @@ def test_scanner_rejects_mixed_basenames_within_one_session(tmp_path: Path) -> N
 
 def test_scanner_rejects_invalid_track_numbers(tmp_path: Path) -> None:
     raw_root = tmp_path / "raw"
-    session_dir = raw_root / "2024-01-01" / "010124_013143"
+    session_dir = raw_root / "010124_013143"
     session_dir.mkdir(parents=True)
 
     (session_dir / "010124_013143_Tr0.WAV").write_bytes(b"bad-zero")
@@ -99,7 +75,7 @@ def test_scanner_rejects_invalid_track_numbers(tmp_path: Path) -> None:
 
 def test_scanner_ignores_silent_extra_tracks(tmp_path: Path, wav_writer) -> None:
     raw_root = tmp_path / "raw"
-    session_dir = raw_root / "2024-01-01" / "010124_013143"
+    session_dir = raw_root / "010124_013143"
 
     wav_writer(session_dir / "010124_013143_Tr1.WAV", [0, 1200, -1200, 600] * 500)
     wav_writer(session_dir / "010124_013143_Tr2.WAV", [0, -900, 900, -450] * 500)
@@ -119,7 +95,7 @@ def test_scanner_rejects_when_only_one_track_has_audio(
     tmp_path: Path, wav_writer
 ) -> None:
     raw_root = tmp_path / "raw"
-    session_dir = raw_root / "2024-01-01" / "010124_013143"
+    session_dir = raw_root / "010124_013143"
 
     wav_writer(session_dir / "010124_013143_Tr1.WAV", [0, 1200, -1200, 600] * 500)
     wav_writer(session_dir / "010124_013143_Tr2.WAV", [0] * 4000)
