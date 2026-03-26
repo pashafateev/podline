@@ -1,9 +1,11 @@
 from pathlib import Path
+import logging
 
 from typer.testing import CliRunner
 
 from sexdrunks_automation.cli import app
 from sexdrunks_automation.db import connect, initialize_database
+from sexdrunks_automation.logging_setup import configure_logging
 
 
 runner = CliRunner()
@@ -78,3 +80,11 @@ def test_reset_db_requires_yes_flag(tmp_path: Path) -> None:
 
     assert result.exit_code == 1
     assert "without --yes" in result.stdout
+
+
+def test_configure_logging_switches_debug_level(tmp_path: Path) -> None:
+    logger = configure_logging(str(tmp_path / "logs"), debug=False)
+    assert logger.level == logging.INFO
+
+    logger = configure_logging(str(tmp_path / "logs"), debug=True)
+    assert logger.level == logging.DEBUG

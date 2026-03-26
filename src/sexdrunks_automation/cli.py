@@ -26,24 +26,25 @@ def _resolve_config_path(config: Optional[Path]) -> Path:
     return (Path.home() / "sexdrunks-automation" / "config.yaml").resolve()
 
 
-def _bootstrap(config_path: Path):
+def _bootstrap(config_path: Path, debug: bool = False):
     loaded_config = load_config(config_path)
     runtime_paths = build_runtime_paths(loaded_config)
     ensure_runtime_dirs(runtime_paths)
     initialize_database(runtime_paths.db_file)
-    logger = configure_logging(runtime_paths.logs_dir)
+    logger = configure_logging(runtime_paths.logs_dir, debug=debug)
     return loaded_config, runtime_paths, logger
 
 
 @app.command()
 def init(
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
         None, "--config", help="Path to config.yaml."
     ),
 ) -> None:
     """Initialize runtime directories, logging, health file, and SQLite schema."""
     config_path = _resolve_config_path(config)
-    loaded_config, runtime_paths, logger = _bootstrap(config_path)
+    loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
     snapshot = write_health_snapshot(
         runtime_paths, loaded_config, worker_status="stopped"
     )
@@ -90,13 +91,14 @@ def reset_db(
 
 @app.command()
 def health(
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
         None, "--config", help="Path to config.yaml."
     ),
 ) -> None:
     """Show current local health snapshot."""
     config_path = _resolve_config_path(config)
-    loaded_config, runtime_paths, _logger = _bootstrap(config_path)
+    loaded_config, runtime_paths, _logger = _bootstrap(config_path, debug=debug)
     snapshot = read_health_snapshot(runtime_paths, loaded_config)
 
     typer.echo(f"worker_status: {snapshot.worker_status}")
@@ -111,13 +113,14 @@ def health(
 
 @app.command("list")
 def list_command(
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
         None, "--config", help="Path to config.yaml."
     ),
 ) -> None:
     """List known sessions."""
     config_path = _resolve_config_path(config)
-    _loaded_config, runtime_paths, _logger = _bootstrap(config_path)
+    _loaded_config, runtime_paths, _logger = _bootstrap(config_path, debug=debug)
     sessions = list_sessions(runtime_paths.db_file)
 
     if not sessions:
@@ -142,13 +145,14 @@ def list_command(
 @app.command()
 def status(
     session_uid: str,
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
         None, "--config", help="Path to config.yaml."
     ),
 ) -> None:
     """Show one tracked session."""
     config_path = _resolve_config_path(config)
-    _loaded_config, runtime_paths, _logger = _bootstrap(config_path)
+    _loaded_config, runtime_paths, _logger = _bootstrap(config_path, debug=debug)
     session = get_session(runtime_paths.db_file, session_uid)
 
     if session is None:
@@ -174,13 +178,14 @@ def status(
 
 @app.command()
 def scan(
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
         None, "--config", help="Path to config.yaml."
     ),
 ) -> None:
     """Scan raw recordings and ingest new sessions."""
     config_path = _resolve_config_path(config)
-    loaded_config, runtime_paths, logger = _bootstrap(config_path)
+    loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
     outcome = scan_and_ingest(loaded_config.paths.raw_root, runtime_paths.db_file)
     snapshot = write_health_snapshot(
         runtime_paths, loaded_config, worker_status="stopped"
@@ -216,13 +221,14 @@ def scan(
 @app.command("auphonic")
 def auphonic_command(
     session_uid: str,
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
         None, "--config", help="Path to config.yaml."
     ),
 ) -> None:
     """Upload one queued session to Auphonic and download outputs."""
     config_path = _resolve_config_path(config)
-    loaded_config, runtime_paths, logger = _bootstrap(config_path)
+    loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
     session = get_session(runtime_paths.db_file, session_uid)
     if session is None:
         typer.echo(f"Session not found: {session_uid}")
@@ -251,13 +257,14 @@ def auphonic_command(
 @app.command("auphonic-prepare")
 def auphonic_prepare_command(
     session_uid: str,
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
         None, "--config", help="Path to config.yaml."
     ),
 ) -> None:
     """Create an Auphonic production and upload files without starting it."""
     config_path = _resolve_config_path(config)
-    loaded_config, runtime_paths, logger = _bootstrap(config_path)
+    loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
     session = get_session(runtime_paths.db_file, session_uid)
     if session is None:
         typer.echo(f"Session not found: {session_uid}")
@@ -284,13 +291,14 @@ def auphonic_prepare_command(
 @app.command("auphonic-start")
 def auphonic_start_command(
     session_uid: str,
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
         None, "--config", help="Path to config.yaml."
     ),
 ) -> None:
     """Start an already-uploaded Auphonic production and fetch outputs."""
     config_path = _resolve_config_path(config)
-    loaded_config, runtime_paths, logger = _bootstrap(config_path)
+    loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
     session = get_session(runtime_paths.db_file, session_uid)
     if session is None:
         typer.echo(f"Session not found: {session_uid}")

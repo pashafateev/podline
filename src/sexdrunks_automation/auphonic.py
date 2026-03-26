@@ -170,11 +170,29 @@ class AuphonicClient:
         last_error: Optional[Exception] = None
         for _attempt in range(3):
             try:
+                logging.getLogger("sexdrunks_automation").debug(
+                    "Auphonic request method=%s url=%s attempt=%s",
+                    method,
+                    url,
+                    _attempt + 1,
+                )
                 response = self._client.request(method, url, **kwargs)
+                logging.getLogger("sexdrunks_automation").debug(
+                    "Auphonic response method=%s url=%s status=%s",
+                    method,
+                    url,
+                    response.status_code,
+                )
                 response.raise_for_status()
                 return response
             except (httpx.HTTPError, httpx.TransportError) as exc:
                 last_error = exc
+                logging.getLogger("sexdrunks_automation").debug(
+                    "Auphonic retry method=%s url=%s error=%s",
+                    method,
+                    url,
+                    exc,
+                )
                 sleep(1)
         raise AuphonicError(f"Auphonic request failed: {last_error}") from last_error
 
@@ -229,6 +247,13 @@ def prepare_session_with_auphonic(
 
     try:
         _log(logger, "Preparing Auphonic production for %s", session.session_uid)
+        _debug_log(
+            logger,
+            "Auphonic preset=%s track_ids=%s asset_paths=%s",
+            preset_id,
+            [_asset_upload_key(asset) for asset in assets],
+            [asset.local_path for asset in assets],
+        )
         production_id = client.create_production(
             session=session,
             assets=assets,
@@ -245,6 +270,12 @@ def prepare_session_with_auphonic(
             logger,
             "Uploaded %s assets to Auphonic production %s",
             len(assets),
+            production_id,
+        )
+        _debug_log(
+            logger,
+            "Uploaded track ids=%s to production %s",
+            [_asset_upload_key(asset) for asset in assets],
             production_id,
         )
         update_session_status(
@@ -498,3 +529,8 @@ def _upload_looks_attached(data_node: Dict, assets: List[AssetRecord]) -> bool:
 def _log(logger: Optional[logging.Logger], message: str, *args) -> None:
     if logger is not None:
         logger.info(message, *args)
+
+
+def _debug_log(logger: Optional[logging.Logger], message: str, *args) -> None:
+    if logger is not None:
+        logger.debug(message, *args)

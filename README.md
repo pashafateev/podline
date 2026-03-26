@@ -14,6 +14,7 @@ Current scope
 - Silent extra spoken tracks are ignored during scan, so sessions with empty `Tr3`/`Tr4` files can still classify correctly as 2-speaker sessions.
 - Phase 3 Auphonic processing is available via `sd auphonic <session_uid>`.
 - Safer Auphonic dry runs are available via `sd auphonic-prepare <session_uid>` followed by `sd auphonic-start <session_uid>`.
+- Add `--debug` to CLI commands when you want verbose request-level logging in `logs/automation.log`.
 
 Project layout
 - `src/sexdrunks_automation/`: application code
