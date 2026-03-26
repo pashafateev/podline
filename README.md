@@ -36,6 +36,7 @@ Local config
 - Keep committed defaults in `config.yaml`.
 - Put machine-specific paths and secrets in `config.local.yaml`, which is gitignored.
 - Start from `config.local.yaml.example` and copy it to `config.local.yaml`.
+- The default recording root is now `02_recordings/`; both flat session folders and older nested date/session layouts are supported.
 
 Planned next steps
 - manual end-to-end processing flow

@@ -1,6 +1,6 @@
 runtime_home: /Users/pasha/sexdrunks-automation
 paths:
-  raw_root: /Volumes/Music/Podcast/Sex Drunks/02_recordings/raw
+  raw_root: /Volumes/Music/Podcast/Sex Drunks/02_recordings
   deliverables_root: /Volumes/Music/Podcast/Sex Drunks/04_deliverables
 polling:
   interval_seconds: 30

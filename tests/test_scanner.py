@@ -131,3 +131,26 @@ def test_scanner_rejects_when_only_one_track_has_audio(
     assert len(scan_result.candidates) == 0
     assert len(scan_result.unsupported_sessions) == 1
     assert "non-silent spoken tracks" in scan_result.unsupported_sessions[0].reason
+
+
+def test_scanner_supports_flat_recording_root_layout(
+    tmp_path: Path, wav_writer
+) -> None:
+    raw_root = tmp_path / "02_recordings"
+    session_dir = raw_root / "010124_012430"
+
+    wav_writer(session_dir / "010124_012430_Tr1.WAV", [0, 1000, -1000, 500] * 500)
+    wav_writer(session_dir / "010124_012430_Tr2.WAV", [0, -800, 800, -400] * 500)
+    wav_writer(session_dir / "010124_012430_Tr3.WAV", [0] * 4000)
+    wav_writer(session_dir / "010124_012430_Tr4.WAV", [0] * 4000)
+    wav_writer(session_dir / "010124_012430_TrLR.WAV", [0, 600, -600, 300] * 500)
+
+    scan_result = scan_raw_sessions(raw_root)
+
+    assert len(scan_result.candidates) == 1
+    candidate = scan_result.candidates[0]
+    assert candidate.session_folder_name == "010124_012430"
+    assert candidate.source_basename == "010124_012430"
+    assert candidate.date_folder_name == ""
+    assert [track.track_name for track in candidate.spoken_tracks] == ["Tr1", "Tr2"]
+    assert candidate.mix_track is not None
