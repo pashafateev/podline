@@ -37,12 +37,22 @@ class AuphonicProduction:
     output_files: List[AuphonicOutputFile]
 
 
+@dataclass(frozen=True)
+class AuphonicPreparedProduction:
+    production_id: str
+    upload_track_ids: List[str]
+    status_page: Optional[str]
+    edit_page: Optional[str]
+
+
 class AuphonicClientProtocol(Protocol):
     def create_production(
         self, *, session: SessionRecord, assets: List[AssetRecord], preset_id: str
-    ) -> str: ...
+    ) -> AuphonicPreparedProduction: ...
 
-    def upload_assets(self, production_id: str, assets: List[AssetRecord]) -> None: ...
+    def upload_assets(
+        self, production_id: str, assets: List[AssetRecord], upload_track_ids: List[str]
+    ) -> None: ...
 
     def start_production(self, production_id: str) -> None: ...
 
@@ -68,17 +78,13 @@ class AuphonicClient:
         session: SessionRecord,
         assets: List[AssetRecord],
         preset_id: str,
-    ) -> str:
+    ) -> AuphonicPreparedProduction:
         payload = {
             "preset": preset_id,
             "metadata": {"title": session.source_basename or session.session_uid},
         }
         if len(assets) > 1:
             payload["is_multitrack"] = True
-            payload["multi_input_files"] = [
-                {"type": "multitrack", "id": _asset_upload_key(asset)}
-                for asset in assets
-            ]
 
         response = self._request_with_retries(
             "POST",
@@ -98,26 +104,35 @@ class AuphonicClient:
             raise AuphonicError(
                 "Auphonic create response did not include a production id"
             )
+        upload_track_ids = _resolve_upload_track_ids(data_node, assets)
         logging.getLogger("sexdrunks_automation").debug(
-            "Auphonic create details production_id=%s status_page=%s edit_page=%s start_allowed=%s change_allowed=%s",
+            "Auphonic create details production_id=%s status_page=%s edit_page=%s start_allowed=%s change_allowed=%s upload_track_ids=%s",
             production_id,
             data_node.get("status_page"),
             data_node.get("edit_page"),
             data_node.get("start_allowed"),
             data_node.get("change_allowed"),
+            upload_track_ids,
         )
-        return str(production_id)
+        return AuphonicPreparedProduction(
+            production_id=str(production_id),
+            upload_track_ids=upload_track_ids,
+            status_page=data_node.get("status_page"),
+            edit_page=data_node.get("edit_page"),
+        )
 
-    def upload_assets(self, production_id: str, assets: List[AssetRecord]) -> None:
+    def upload_assets(
+        self, production_id: str, assets: List[AssetRecord], upload_track_ids: List[str]
+    ) -> None:
         open_handles = []
         files = []
         try:
-            for asset in assets:
+            for asset, upload_track_id in zip(assets, upload_track_ids):
                 handle = open(asset.local_path, "rb")
                 open_handles.append(handle)
                 files.append(
                     (
-                        _asset_upload_key(asset),
+                        upload_track_id,
                         (asset.filename, handle, "audio/wav"),
                     )
                 )
@@ -139,7 +154,7 @@ class AuphonicClient:
                 else None,
             )
             if isinstance(data_node, dict) and not _upload_looks_attached(
-                data_node, assets
+                data_node, upload_track_ids
             ):
                 raise AuphonicError(
                     f"Auphonic upload for production {production_id} did not attach all tracks"
@@ -202,8 +217,30 @@ class AuphonicClient:
                     url,
                     response.status_code,
                 )
+                if response.status_code >= 400:
+                    body_preview = response.text[:1000]
+                    logging.getLogger("sexdrunks_automation").debug(
+                        "Auphonic error body method=%s url=%s body=%s",
+                        method,
+                        url,
+                        body_preview,
+                    )
                 response.raise_for_status()
                 return response
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                status_code = exc.response.status_code
+                if 400 <= status_code < 500 and status_code != 429:
+                    raise AuphonicError(
+                        f"Auphonic request failed with status {status_code}: {exc.response.text[:300]}"
+                    ) from exc
+                logging.getLogger("sexdrunks_automation").debug(
+                    "Auphonic retry method=%s url=%s error=%s",
+                    method,
+                    url,
+                    exc,
+                )
+                sleep(1)
             except (httpx.HTTPError, httpx.TransportError) as exc:
                 last_error = exc
                 logging.getLogger("sexdrunks_automation").debug(
@@ -274,18 +311,26 @@ def prepare_session_with_auphonic(
             [_asset_upload_key(asset) for asset in assets],
             [asset.local_path for asset in assets],
         )
-        production_id = client.create_production(
+        prepared_production = client.create_production(
             session=session,
             assets=assets,
             preset_id=preset_id,
         )
+        production_id = prepared_production.production_id
         _log(
             logger,
             "Created Auphonic production %s for %s",
             production_id,
             session.session_uid,
         )
-        client.upload_assets(production_id, assets)
+        _debug_log(
+            logger,
+            "Using Auphonic upload track ids=%s",
+            prepared_production.upload_track_ids,
+        )
+        client.upload_assets(
+            production_id, assets, prepared_production.upload_track_ids
+        )
         _log(
             logger,
             "Uploaded %s assets to Auphonic production %s",
@@ -295,7 +340,7 @@ def prepare_session_with_auphonic(
         _debug_log(
             logger,
             "Uploaded track ids=%s to production %s",
-            [_asset_upload_key(asset) for asset in assets],
+            prepared_production.upload_track_ids,
             production_id,
         )
         update_session_status(
@@ -533,17 +578,35 @@ def _asset_upload_key(asset: AssetRecord) -> str:
     return asset.role or Path(asset.filename).stem
 
 
-def _upload_looks_attached(data_node: Dict, assets: List[AssetRecord]) -> bool:
+def _upload_looks_attached(data_node: Dict, upload_track_ids: List[str]) -> bool:
     multi_input_files = data_node.get("multi_input_files")
     if isinstance(multi_input_files, list) and multi_input_files:
         attached_ids = {
             str(item.get("id")) for item in multi_input_files if item.get("input_file")
         }
-        expected_ids = {_asset_upload_key(asset) for asset in assets}
+        expected_ids = set(upload_track_ids)
         return expected_ids.issubset(attached_ids)
 
     input_file = data_node.get("input_file")
-    return len(assets) == 1 and bool(input_file)
+    return len(upload_track_ids) == 1 and bool(input_file)
+
+
+def _resolve_upload_track_ids(data_node: Dict, assets: List[AssetRecord]) -> List[str]:
+    multi_input_files = (
+        data_node.get("multi_input_files") if isinstance(data_node, dict) else None
+    )
+    if isinstance(multi_input_files, list) and multi_input_files:
+        preset_track_ids = [
+            str(item.get("id")) for item in multi_input_files if item.get("id")
+        ]
+        if len(preset_track_ids) == len(assets):
+            return preset_track_ids
+        if len(preset_track_ids) > len(assets):
+            raise AuphonicError(
+                "Auphonic preset track count does not match the scanned speaker count"
+            )
+
+    return [_asset_upload_key(asset) for asset in assets]
 
 
 def _upload_attachment_summary(data_node: Dict) -> Dict[str, object]:

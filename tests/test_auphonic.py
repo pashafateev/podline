@@ -3,6 +3,7 @@ from pathlib import Path
 from sexdrunks_automation.auphonic import (
     AuphonicError,
     AuphonicOutputFile,
+    AuphonicPreparedProduction,
     AuphonicProduction,
     prepare_session_with_auphonic,
     process_session_with_auphonic,
@@ -30,12 +31,19 @@ class FakeAuphonicClient:
         self.started = []
         self.downloads = []
 
-    def create_production(self, *, session, assets, preset_id: str) -> str:
+    def create_production(
+        self, *, session, assets, preset_id: str
+    ) -> AuphonicPreparedProduction:
         self.created.append((session.session_uid, len(assets), preset_id))
-        return "prod-123"
+        return AuphonicPreparedProduction(
+            production_id="prod-123",
+            upload_track_ids=["Jonathan", "Pasha"][: len(assets)],
+            status_page="https://example.test/status/prod-123",
+            edit_page="https://example.test/edit/prod-123",
+        )
 
-    def upload_assets(self, production_id: str, assets) -> None:
-        self.uploaded.append((production_id, len(assets)))
+    def upload_assets(self, production_id: str, assets, upload_track_ids) -> None:
+        self.uploaded.append((production_id, len(assets), list(upload_track_ids)))
 
     def start_production(self, production_id: str) -> None:
         self.started.append(production_id)
@@ -113,6 +121,7 @@ def test_process_session_with_auphonic_downloads_outputs(
     assert client.created[0][1] == 2
     assert client.created[0][2] == "preset-2"
     assert client.uploaded[0][1] == 2
+    assert client.uploaded[0][2] == ["Jonathan", "Pasha"]
     assert client.started == ["prod-123"]
 
     reloaded = get_session(runtime_paths.db_file, session.session_uid)
@@ -149,6 +158,7 @@ def test_prepare_then_start_splits_the_auphonic_flow(
     assert prepared.transcript_path is None
     assert client.started == []
     assert client.downloads == []
+    assert client.uploaded[0][2] == ["Jonathan", "Pasha"]
 
     started = start_prepared_session_with_auphonic(
         config=config,
