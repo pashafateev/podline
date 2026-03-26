@@ -35,6 +35,42 @@ def _bootstrap(config_path: Path, debug: bool = False):
     return loaded_config, runtime_paths, logger
 
 
+def _reset_database_for_runtime(config_path: Path) -> tuple:
+    loaded_config = load_config(config_path)
+    runtime_paths = build_runtime_paths(loaded_config)
+    ensure_runtime_dirs(runtime_paths)
+
+    db_path = Path(runtime_paths.db_file)
+    if db_path.exists():
+        db_path.unlink()
+
+    initialize_database(runtime_paths.db_file)
+    write_health_snapshot(runtime_paths, loaded_config, worker_status="stopped")
+    return loaded_config, runtime_paths
+
+
+def _print_sessions(runtime_paths) -> None:
+    sessions = list_sessions(runtime_paths.db_file)
+
+    if not sessions:
+        typer.echo("No sessions tracked yet.")
+        return
+
+    for session in sessions:
+        typer.echo(
+            " | ".join(
+                [
+                    session.session_uid,
+                    session.status,
+                    session.recorded_at or "unknown-recorded-at",
+                    session.source_basename or "unknown-source",
+                    session.source_path,
+                    session.updated_at,
+                ]
+            )
+        )
+
+
 @app.command()
 def init(
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
@@ -75,18 +111,56 @@ def reset_db(
         raise typer.Exit(code=1)
 
     config_path = _resolve_config_path(config)
-    loaded_config = load_config(config_path)
-    runtime_paths = build_runtime_paths(loaded_config)
-    ensure_runtime_dirs(runtime_paths)
-
-    db_path = Path(runtime_paths.db_file)
-    if db_path.exists():
-        db_path.unlink()
-
-    initialize_database(runtime_paths.db_file)
-    write_health_snapshot(runtime_paths, loaded_config, worker_status="stopped")
+    _loaded_config, runtime_paths = _reset_database_for_runtime(config_path)
 
     typer.echo(f"Reset database: {runtime_paths.db_file}")
+
+
+@app.command("refresh")
+def refresh(
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
+    config: Optional[Path] = typer.Option(
+        None, "--config", help="Path to config.yaml."
+    ),
+) -> None:
+    """Reset DB, rescan recordings, and list sessions."""
+    config_path = _resolve_config_path(config)
+    loaded_config, runtime_paths = _reset_database_for_runtime(config_path)
+    logger = configure_logging(runtime_paths.logs_dir, debug=debug)
+
+    typer.echo(f"Reset database: {runtime_paths.db_file}")
+
+    outcome = scan_and_ingest(loaded_config.paths.raw_root, runtime_paths.db_file)
+    snapshot = write_health_snapshot(
+        runtime_paths, loaded_config, worker_status="stopped"
+    )
+    logger.info(
+        "refresh finished discovered=%s created=%s duplicates=%s unsupported=%s",
+        outcome.discovered,
+        outcome.created,
+        outcome.duplicates,
+        len(outcome.unsupported),
+    )
+
+    typer.echo(f"discovered: {outcome.discovered}")
+    typer.echo(f"created: {outcome.created}")
+    typer.echo(f"duplicates: {outcome.duplicates}")
+    typer.echo(f"unsupported: {len(outcome.unsupported)}")
+    typer.echo(f"queue_depth: {snapshot.queue_depth}")
+
+    for unsupported in outcome.unsupported:
+        typer.echo(
+            " | ".join(
+                [
+                    "unsupported_session",
+                    f"path={unsupported.session_path}",
+                    f"reason={unsupported.reason}",
+                    f"spoken_tracks={unsupported.spoken_track_count}",
+                ]
+            )
+        )
+
+    _print_sessions(runtime_paths)
 
 
 @app.command()
@@ -121,25 +195,7 @@ def list_command(
     """List known sessions."""
     config_path = _resolve_config_path(config)
     _loaded_config, runtime_paths, _logger = _bootstrap(config_path, debug=debug)
-    sessions = list_sessions(runtime_paths.db_file)
-
-    if not sessions:
-        typer.echo("No sessions tracked yet.")
-        return
-
-    for session in sessions:
-        typer.echo(
-            " | ".join(
-                [
-                    session.session_uid,
-                    session.status,
-                    session.recorded_at or "unknown-recorded-at",
-                    session.source_basename or "unknown-source",
-                    session.source_path,
-                    session.updated_at,
-                ]
-            )
-        )
+    _print_sessions(runtime_paths)
 
 
 @app.command()

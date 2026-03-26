@@ -89,3 +89,23 @@ def test_configure_logging_switches_debug_level(tmp_path: Path) -> None:
 
     logger = configure_logging(str(tmp_path / "logs"), debug=True)
     assert logger.level == logging.DEBUG
+
+
+def test_refresh_resets_scans_and_lists_sessions(tmp_path: Path) -> None:
+    runtime_home = tmp_path / "runtime"
+    raw_root = tmp_path / "raw"
+    config_file = tmp_path / "config.yaml"
+    _write_config(config_file, runtime_home, raw_root)
+
+    session_dir = raw_root / "010124_012430"
+    session_dir.mkdir(parents=True)
+    (session_dir / "010124_012430_Tr1.WAV").write_bytes(b"track-one")
+    (session_dir / "010124_012430_Tr2.WAV").write_bytes(b"track-two")
+
+    result = runner.invoke(app, ["refresh", "--config", str(config_file)])
+
+    assert result.exit_code == 0
+    assert "Reset database:" in result.stdout
+    assert "discovered: 1" in result.stdout
+    assert "created: 1" in result.stdout
+    assert "010124_012430" in result.stdout
