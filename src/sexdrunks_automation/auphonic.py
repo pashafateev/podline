@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import json
 import logging
 from pathlib import Path
+import shutil
 import subprocess
 from time import sleep
 from typing import Dict, Iterable, List, Optional, Protocol
@@ -153,10 +154,17 @@ class AuphonicClient:
         assets: List[AssetRecord],
         upload_track_ids: List[str],
     ) -> Dict:
+        curl_binary = _resolve_curl_binary()
         command = [
-            "curl",
+            curl_binary,
             "-sS",
             "--http1.1",
+            "--tlsv1.2",
+            "--no-alpn",
+            "--limit-rate",
+            "8M",
+            "--connect-timeout",
+            "30",
             "-X",
             "POST",
             f"{self._config.auphonic.base_url.rstrip('/')}/production/{production_id}/upload.json?bearer_token={self._config.auphonic.api_key}",
@@ -172,14 +180,35 @@ class AuphonicClient:
             )
 
         logging.getLogger("sexdrunks_automation").debug(
-            "Auphonic curl upload command production_id=%s track_ids=%s",
+            "Auphonic curl upload command production_id=%s curl=%s track_ids=%s",
             production_id,
+            curl_binary,
             upload_track_ids,
         )
-        result = subprocess.run(command, capture_output=True, text=True)
-        if result.returncode != 0:
+        result = None
+        for attempt in range(3):
+            result = subprocess.run(command, capture_output=True, text=True)
+            if result.returncode == 0:
+                break
+
+            stderr_preview = result.stderr[:300]
+            logging.getLogger("sexdrunks_automation").debug(
+                "Auphonic curl upload retry production_id=%s attempt=%s exit_code=%s stderr=%s",
+                production_id,
+                attempt + 1,
+                result.returncode,
+                stderr_preview,
+            )
+            if result.returncode not in {55, 56}:
+                raise AuphonicError(
+                    f"Auphonic curl upload failed with exit code {result.returncode}: {stderr_preview}"
+                )
+            if attempt < 2:
+                sleep(5)
+
+        if result is None or result.returncode != 0:
             raise AuphonicError(
-                f"Auphonic curl upload failed with exit code {result.returncode}: {result.stderr[:300]}"
+                f"Auphonic curl upload failed with exit code {result.returncode if result else 'unknown'}: {(result.stderr[:300] if result else 'no stderr')}"
             )
         try:
             payload = json.loads(result.stdout)
@@ -638,6 +667,20 @@ def _resolve_upload_track_ids(data_node: Dict, assets: List[AssetRecord]) -> Lis
             )
 
     return [_asset_upload_key(asset) for asset in assets]
+
+
+def _resolve_curl_binary() -> str:
+    for candidate in (
+        "/opt/homebrew/opt/curl/bin/curl",
+        "/usr/local/opt/curl/bin/curl",
+    ):
+        if Path(candidate).exists():
+            return candidate
+
+    resolved = shutil.which("curl")
+    if resolved is None:
+        raise AuphonicError("curl is required for Auphonic uploads but was not found")
+    return resolved
 
 
 def _upload_attachment_summary(data_node: Dict) -> Dict[str, object]:
