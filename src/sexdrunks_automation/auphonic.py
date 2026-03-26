@@ -38,7 +38,9 @@ class AuphonicProduction:
 
 
 class AuphonicClientProtocol(Protocol):
-    def create_production(self, *, session: SessionRecord, preset_id: str) -> str: ...
+    def create_production(
+        self, *, session: SessionRecord, assets: List[AssetRecord], preset_id: str
+    ) -> str: ...
 
     def upload_assets(self, production_id: str, assets: List[AssetRecord]) -> None: ...
 
@@ -62,15 +64,24 @@ class AuphonicClient:
         self,
         *,
         session: SessionRecord,
+        assets: List[AssetRecord],
         preset_id: str,
     ) -> str:
+        payload = {
+            "preset": preset_id,
+            "metadata": {"title": session.source_basename or session.session_uid},
+        }
+        if len(assets) > 1:
+            payload["is_multitrack"] = True
+            payload["multi_input_files"] = [
+                {"type": "multitrack", "id": _asset_upload_key(asset)}
+                for asset in assets
+            ]
+
         response = self._request_with_retries(
             "POST",
             "/productions.json",
-            json={
-                "preset": preset_id,
-                "metadata": {"title": session.source_basename or session.session_uid},
-            },
+            json=payload,
             headers={"Content-Type": "application/json"},
         )
 
@@ -94,13 +105,26 @@ class AuphonicClient:
             for asset in assets:
                 handle = open(asset.local_path, "rb")
                 open_handles.append(handle)
-                files.append(("input_file", (asset.filename, handle, "audio/wav")))
+                files.append(
+                    (
+                        _asset_upload_key(asset),
+                        (asset.filename, handle, "audio/wav"),
+                    )
+                )
 
-            self._request_with_retries(
+            response = self._request_with_retries(
                 "POST",
                 f"/production/{production_id}/upload.json",
                 files=files,
             )
+            payload = response.json() if response.content else {}
+            data_node = payload.get("data", payload)
+            if isinstance(data_node, dict) and not _upload_looks_attached(
+                data_node, assets
+            ):
+                raise AuphonicError(
+                    f"Auphonic upload for production {production_id} did not attach all tracks"
+                )
         finally:
             for handle in open_handles:
                 handle.close()
@@ -205,7 +229,11 @@ def prepare_session_with_auphonic(
 
     try:
         _log(logger, "Preparing Auphonic production for %s", session.session_uid)
-        production_id = client.create_production(session=session, preset_id=preset_id)
+        production_id = client.create_production(
+            session=session,
+            assets=assets,
+            preset_id=preset_id,
+        )
         _log(
             logger,
             "Created Auphonic production %s for %s",
@@ -448,6 +476,23 @@ def _suffix_from_url(url: Optional[str]) -> str:
     if not url:
         return ""
     return Path(url.split("?", 1)[0]).suffix
+
+
+def _asset_upload_key(asset: AssetRecord) -> str:
+    return asset.role or Path(asset.filename).stem
+
+
+def _upload_looks_attached(data_node: Dict, assets: List[AssetRecord]) -> bool:
+    multi_input_files = data_node.get("multi_input_files")
+    if isinstance(multi_input_files, list) and multi_input_files:
+        attached_ids = {
+            str(item.get("id")) for item in multi_input_files if item.get("input_file")
+        }
+        expected_ids = {_asset_upload_key(asset) for asset in assets}
+        return expected_ids.issubset(attached_ids)
+
+    input_file = data_node.get("input_file")
+    return len(assets) == 1 and bool(input_file)
 
 
 def _log(logger: Optional[logging.Logger], message: str, *args) -> None:

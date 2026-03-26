@@ -30,8 +30,8 @@ class FakeAuphonicClient:
         self.started = []
         self.downloads = []
 
-    def create_production(self, *, session, preset_id: str) -> str:
-        self.created.append((session.session_uid, preset_id))
+    def create_production(self, *, session, assets, preset_id: str) -> str:
+        self.created.append((session.session_uid, len(assets), preset_id))
         return "prod-123"
 
     def upload_assets(self, production_id: str, assets) -> None:
@@ -110,7 +110,8 @@ def test_process_session_with_auphonic_downloads_outputs(
     assert updated.transcript_path is not None
     assert Path(updated.pre_edit_master_path).exists()
     assert Path(updated.transcript_path).exists()
-    assert client.created[0][1] == "preset-2"
+    assert client.created[0][1] == 2
+    assert client.created[0][2] == "preset-2"
     assert client.uploaded[0][1] == 2
     assert client.started == ["prod-123"]
 
