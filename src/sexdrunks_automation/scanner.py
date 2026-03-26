@@ -1,9 +1,10 @@
-import audioop
 import re
+import subprocess
+import shutil
 import wave
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 from sexdrunks_automation.models import (
     ScanCandidate,
@@ -21,6 +22,8 @@ ROLE_MAP = {
 }
 WAV_ANALYSIS_FRAMES = 16384
 SILENCE_RMS_THRESHOLD = 100
+SESSION_SILENCE_FLOOR_DB = -90.0
+SESSION_RELATIVE_ACTIVITY_WINDOW_DB = 18.0
 
 
 def scan_raw_sessions(raw_root: Path) -> ScanResult:
@@ -83,7 +86,7 @@ def _parse_session_dir(session_dir: Path):
         (track for track in track_files if track.track_number is not None),
         key=lambda item: item.track_number,
     )
-    spoken_tracks = [track for track in all_spoken_tracks if track.has_audio]
+    spoken_tracks = _filter_active_spoken_tracks(all_spoken_tracks)
     mix_track = next(
         (track for track in track_files if track.track_name == "TrLR"), None
     )
@@ -142,13 +145,15 @@ def _parse_track_file(path: Path) -> Optional[Union[TrackFile, UnsupportedSessio
 
     track = match.group("track")
     if track == "LR":
+        has_audio, activity_rms_db = _track_has_audio(path)
         return TrackFile(
             track_name="TrLR",
             track_number=None,
             role=None,
             path=path,
             file_size=path.stat().st_size,
-            has_audio=_track_has_audio(path),
+            has_audio=has_audio,
+            activity_rms_db=activity_rms_db,
         )
 
     track_number = int(track)
@@ -159,28 +164,110 @@ def _parse_track_file(path: Path) -> Optional[Union[TrackFile, UnsupportedSessio
             spoken_track_count=0,
         )
 
+    has_audio, activity_rms_db = _track_has_audio(path)
     return TrackFile(
         track_name=f"Tr{track_number}",
         track_number=track_number,
         role=ROLE_MAP.get(track_number, f"guest{track_number - 2}"),
         path=path,
         file_size=path.stat().st_size,
-        has_audio=_track_has_audio(path),
+        has_audio=has_audio,
+        activity_rms_db=activity_rms_db,
     )
 
 
-def _track_has_audio(path: Path) -> bool:
+def _track_has_audio(path: Path) -> Tuple[bool, Optional[float]]:
+    ffmpeg_rms_db = _ffmpeg_rms_db(path)
+    if ffmpeg_rms_db is not None:
+        return ffmpeg_rms_db >= SESSION_SILENCE_FLOOR_DB, ffmpeg_rms_db
+
     try:
         with wave.open(str(path), "rb") as wav_file:
             sample_width = wav_file.getsampwidth()
             while True:
                 frames = wav_file.readframes(WAV_ANALYSIS_FRAMES)
                 if not frames:
-                    return False
-                if audioop.rms(frames, sample_width) >= SILENCE_RMS_THRESHOLD:
-                    return True
+                    return False, None
+                if _pcm_rms(frames, sample_width) >= SILENCE_RMS_THRESHOLD:
+                    return True, None
     except (wave.Error, EOFError, OSError):
-        return path.stat().st_size > 0
+        return path.stat().st_size > 0, None
+
+
+def _filter_active_spoken_tracks(spoken_tracks: List[TrackFile]) -> List[TrackFile]:
+    audio_tracks = [track for track in spoken_tracks if track.has_audio]
+    rms_tracks = [track for track in audio_tracks if track.activity_rms_db is not None]
+    if not rms_tracks:
+        return audio_tracks
+
+    loudest_rms_db = max(
+        track.activity_rms_db
+        for track in rms_tracks
+        if track.activity_rms_db is not None
+    )
+    activity_threshold_db = max(
+        loudest_rms_db - SESSION_RELATIVE_ACTIVITY_WINDOW_DB,
+        SESSION_SILENCE_FLOOR_DB,
+    )
+    return [
+        track
+        for track in audio_tracks
+        if track.activity_rms_db is None
+        or track.activity_rms_db >= activity_threshold_db
+    ]
+
+
+def _ffmpeg_rms_db(path: Path) -> Optional[float]:
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        return None
+
+    command = [
+        ffmpeg_path,
+        "-v",
+        "info",
+        "-i",
+        str(path),
+        "-af",
+        "astats=metadata=0:reset=0",
+        "-f",
+        "null",
+        "-",
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+
+    match = re.findall(r"RMS level dB:\s*([-0-9.inf]+)", result.stderr)
+    if not match:
+        return None
+
+    value = match[-1].lower()
+    if value in {"inf", "-inf", "nan"}:
+        return None
+
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def _pcm_rms(frames: bytes, sample_width: int) -> int:
+    if sample_width <= 0:
+        return 0
+    if sample_width == 1:
+        values = [byte - 128 for byte in frames]
+    else:
+        values = []
+        for index in range(0, len(frames), sample_width):
+            chunk = frames[index : index + sample_width]
+            if len(chunk) != sample_width:
+                continue
+            values.append(int.from_bytes(chunk, byteorder="little", signed=True))
+    if not values:
+        return 0
+    squared_mean = sum(value * value for value in values) / len(values)
+    return int(squared_mean**0.5)
 
 
 def _infer_recorded_at(

@@ -62,6 +62,7 @@ class TrackFile:
     path: Path
     file_size: int
     has_audio: bool
+    activity_rms_db: Optional[float]
 
 
 @dataclass(frozen=True)
