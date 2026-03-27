@@ -22,6 +22,66 @@ from sexdrunks_automation.repository import get_session, list_sessions
 app = typer.Typer(help="Sex Drunks automation CLI.")
 
 
+def _print_header(title: str) -> None:
+    typer.echo(title)
+    typer.echo("-" * len(title))
+
+
+def _print_key_values(items) -> None:
+    width = max(len(label) for label, _value in items)
+    for label, value in items:
+        typer.echo(f"{label.ljust(width)}  {value}")
+
+
+def _truncate(value: str, width: int) -> str:
+    if len(value) <= width:
+        return value
+    if width <= 3:
+        return value[:width]
+    return value[: width - 3] + "..."
+
+
+def _print_session_summary(session) -> None:
+    typer.echo(
+        "  ".join(
+            [
+                _truncate(session.session_uid, 16).ljust(16),
+                session.status.ljust(20),
+                _truncate(session.recorded_at or "unknown", 25).ljust(25),
+                _truncate(session.source_basename or "unknown", 18).ljust(18),
+                _truncate(session.source_path, 60),
+            ]
+        )
+    )
+
+
+def _print_session_table(sessions) -> None:
+    typer.echo(
+        "  ".join(
+            [
+                "session".ljust(16),
+                "status".ljust(20),
+                "recorded_at".ljust(25),
+                "source".ljust(18),
+                "path",
+            ]
+        )
+    )
+    typer.echo(
+        "  ".join(
+            [
+                "-" * 16,
+                "-" * 20,
+                "-" * 25,
+                "-" * 18,
+                "-" * 40,
+            ]
+        )
+    )
+    for session in sessions:
+        _print_session_summary(session)
+
+
 def _resolve_config_path(config: Optional[Path]) -> Path:
     if config is not None:
         return config.expanduser().resolve()
@@ -58,19 +118,7 @@ def _print_sessions(runtime_paths) -> None:
         typer.echo("No sessions tracked yet.")
         return
 
-    for session in sessions:
-        typer.echo(
-            " | ".join(
-                [
-                    session.session_uid,
-                    session.status,
-                    session.recorded_at or "unknown-recorded-at",
-                    session.source_basename or "unknown-source",
-                    session.source_path,
-                    session.updated_at,
-                ]
-            )
-        )
+    _print_session_table(sessions)
 
 
 @app.command()
@@ -88,11 +136,17 @@ def init(
     )
     logger.info("runtime initialized")
 
-    typer.echo(f"Initialized runtime home: {runtime_paths.home}")
-    typer.echo(f"Database: {runtime_paths.db_file}")
-    typer.echo(f"Health file: {runtime_paths.health_file}")
-    typer.echo(
-        f"Deliverables mounted: {'yes' if snapshot.external_drive_mounted else 'no'}"
+    _print_header("Runtime Initialized")
+    _print_key_values(
+        [
+            ("home", runtime_paths.home),
+            ("database", runtime_paths.db_file),
+            ("health_file", runtime_paths.health_file),
+            (
+                "deliverables_mounted",
+                "yes" if snapshot.external_drive_mounted else "no",
+            ),
+        ]
     )
 
 
@@ -115,7 +169,8 @@ def reset_db(
     config_path = _resolve_config_path(config)
     _loaded_config, runtime_paths = _reset_database_for_runtime(config_path)
 
-    typer.echo(f"Reset database: {runtime_paths.db_file}")
+    _print_header("Database Reset")
+    _print_key_values([("database", runtime_paths.db_file)])
 
 
 @app.command("refresh")
@@ -129,8 +184,6 @@ def refresh(
     config_path = _resolve_config_path(config)
     loaded_config, runtime_paths = _reset_database_for_runtime(config_path)
     logger = configure_logging(runtime_paths.logs_dir, debug=debug)
-
-    typer.echo(f"Reset database: {runtime_paths.db_file}")
 
     outcome = scan_and_ingest(
         loaded_config.paths.raw_root, runtime_paths.db_file, logger=logger
@@ -146,17 +199,24 @@ def refresh(
         len(outcome.unsupported),
     )
 
-    typer.echo(f"discovered: {outcome.discovered}")
-    typer.echo(f"created: {outcome.created}")
-    typer.echo(f"duplicates: {outcome.duplicates}")
-    typer.echo(f"unsupported: {len(outcome.unsupported)}")
-    typer.echo(f"queue_depth: {snapshot.queue_depth}")
+    _print_header("Refresh Complete")
+    _print_key_values(
+        [
+            ("database", runtime_paths.db_file),
+            ("discovered", str(outcome.discovered)),
+            ("created", str(outcome.created)),
+            ("duplicates", str(outcome.duplicates)),
+            ("unsupported", str(len(outcome.unsupported))),
+            ("queue_depth", str(snapshot.queue_depth)),
+        ]
+    )
 
     for unsupported in outcome.unsupported:
+        typer.echo()
+        _print_header("Unsupported Session")
         typer.echo(
             " | ".join(
                 [
-                    "unsupported_session",
                     f"path={unsupported.session_path}",
                     f"reason={unsupported.reason}",
                     f"spoken_tracks={unsupported.spoken_track_count}",
@@ -179,14 +239,20 @@ def health(
     loaded_config, runtime_paths, _logger = _bootstrap(config_path, debug=debug)
     snapshot = read_health_snapshot(runtime_paths, loaded_config)
 
-    typer.echo(f"worker_status: {snapshot.worker_status}")
-    typer.echo(f"last_heartbeat: {snapshot.last_heartbeat or 'n/a'}")
-    typer.echo(
-        f"external_drive_mounted: {'yes' if snapshot.external_drive_mounted else 'no'}"
+    _print_header("Health")
+    _print_key_values(
+        [
+            ("worker_status", snapshot.worker_status),
+            ("last_heartbeat", snapshot.last_heartbeat or "n/a"),
+            (
+                "external_drive_mounted",
+                "yes" if snapshot.external_drive_mounted else "no",
+            ),
+            ("queue_depth", str(snapshot.queue_depth)),
+            ("session_count", str(snapshot.session_count)),
+            ("last_error", snapshot.last_error or "none"),
+        ]
     )
-    typer.echo(f"queue_depth: {snapshot.queue_depth}")
-    typer.echo(f"session_count: {snapshot.session_count}")
-    typer.echo(f"last_error: {snapshot.last_error or 'none'}")
 
 
 @app.command("list")
@@ -219,21 +285,26 @@ def status(
         typer.echo(f"Session not found: {session_uid}")
         raise typer.Exit(code=1)
 
-    typer.echo(f"session_uid: {session.session_uid}")
-    typer.echo(f"status: {session.status}")
-    typer.echo(f"source_basename: {session.source_basename or 'none'}")
-    typer.echo(f"source_date_folder: {session.source_date_folder or 'none'}")
-    typer.echo(f"source_path: {session.source_path}")
-    typer.echo(f"recorded_at: {session.recorded_at or 'none'}")
-    typer.echo(f"recorded_at_source: {session.recorded_at_source or 'none'}")
-    typer.echo(f"fingerprint: {session.fingerprint}")
-    typer.echo(f"auphonic_production_id: {session.auphonic_production_id or 'none'}")
-    typer.echo(f"pre_edit_master_path: {session.pre_edit_master_path or 'none'}")
-    typer.echo(f"transcript_path: {session.transcript_path or 'none'}")
-    typer.echo(f"created_at: {session.created_at}")
-    typer.echo(f"updated_at: {session.updated_at}")
-    typer.echo(f"failure_reason: {session.failure_reason or 'none'}")
-    typer.echo(f"failed_at_stage: {session.failed_at_stage or 'none'}")
+    _print_header("Session")
+    _print_key_values(
+        [
+            ("session_uid", session.session_uid),
+            ("status", session.status),
+            ("source_basename", session.source_basename or "none"),
+            ("source_date_folder", session.source_date_folder or "none"),
+            ("source_path", session.source_path),
+            ("recorded_at", session.recorded_at or "none"),
+            ("recorded_at_source", session.recorded_at_source or "none"),
+            ("fingerprint", session.fingerprint),
+            ("auphonic_production_id", session.auphonic_production_id or "none"),
+            ("pre_edit_master_path", session.pre_edit_master_path or "none"),
+            ("transcript_path", session.transcript_path or "none"),
+            ("created_at", session.created_at),
+            ("updated_at", session.updated_at),
+            ("failure_reason", session.failure_reason or "none"),
+            ("failed_at_stage", session.failed_at_stage or "none"),
+        ]
+    )
 
 
 @app.command()
@@ -261,17 +332,23 @@ def scan(
         len(outcome.unsupported),
     )
 
-    typer.echo(f"discovered: {outcome.discovered}")
-    typer.echo(f"created: {outcome.created}")
-    typer.echo(f"duplicates: {outcome.duplicates}")
-    typer.echo(f"unsupported: {len(outcome.unsupported)}")
-    typer.echo(f"queue_depth: {snapshot.queue_depth}")
+    _print_header("Scan Complete")
+    _print_key_values(
+        [
+            ("discovered", str(outcome.discovered)),
+            ("created", str(outcome.created)),
+            ("duplicates", str(outcome.duplicates)),
+            ("unsupported", str(len(outcome.unsupported))),
+            ("queue_depth", str(snapshot.queue_depth)),
+        ]
+    )
 
     for unsupported in outcome.unsupported:
+        typer.echo()
+        _print_header("Unsupported Session")
         typer.echo(
             " | ".join(
                 [
-                    "unsupported_session",
                     f"path={unsupported.session_path}",
                     f"reason={unsupported.reason}",
                     f"spoken_tracks={unsupported.spoken_track_count}",
@@ -309,11 +386,16 @@ def auphonic_command(
         typer.echo(f"Auphonic error: {exc}")
         raise typer.Exit(code=1)
 
-    typer.echo(f"session_uid: {updated.session_uid}")
-    typer.echo(f"status: {updated.status}")
-    typer.echo(f"auphonic_production_id: {updated.auphonic_production_id or 'none'}")
-    typer.echo(f"pre_edit_master_path: {updated.pre_edit_master_path or 'none'}")
-    typer.echo(f"transcript_path: {updated.transcript_path or 'none'}")
+    _print_header("Auphonic Complete")
+    _print_key_values(
+        [
+            ("session_uid", updated.session_uid),
+            ("status", updated.status),
+            ("auphonic_production_id", updated.auphonic_production_id or "none"),
+            ("pre_edit_master_path", updated.pre_edit_master_path or "none"),
+            ("transcript_path", updated.transcript_path or "none"),
+        ]
+    )
 
 
 @app.command("auphonic-prepare")
@@ -344,10 +426,15 @@ def auphonic_prepare_command(
         typer.echo(f"Auphonic error: {exc}")
         raise typer.Exit(code=1)
 
-    typer.echo(f"session_uid: {updated.session_uid}")
-    typer.echo(f"status: {updated.status}")
-    typer.echo(f"auphonic_production_id: {updated.auphonic_production_id or 'none'}")
-    typer.echo("auphonic_started: no")
+    _print_header("Auphonic Prepared")
+    _print_key_values(
+        [
+            ("session_uid", updated.session_uid),
+            ("status", updated.status),
+            ("auphonic_production_id", updated.auphonic_production_id or "none"),
+            ("auphonic_started", "no"),
+        ]
+    )
 
 
 @app.command("auphonic-start")
@@ -379,11 +466,16 @@ def auphonic_start_command(
         typer.echo(f"Auphonic error: {exc}")
         raise typer.Exit(code=1)
 
-    typer.echo(f"session_uid: {updated.session_uid}")
-    typer.echo(f"status: {updated.status}")
-    typer.echo(f"auphonic_production_id: {updated.auphonic_production_id or 'none'}")
-    typer.echo(f"pre_edit_master_path: {updated.pre_edit_master_path or 'none'}")
-    typer.echo(f"transcript_path: {updated.transcript_path or 'none'}")
+    _print_header("Auphonic Started")
+    _print_key_values(
+        [
+            ("session_uid", updated.session_uid),
+            ("status", updated.status),
+            ("auphonic_production_id", updated.auphonic_production_id or "none"),
+            ("pre_edit_master_path", updated.pre_edit_master_path or "none"),
+            ("transcript_path", updated.transcript_path or "none"),
+        ]
+    )
 
 
 @app.command("auphonic-inspect")
@@ -422,20 +514,27 @@ def auphonic_inspect_command(
         typer.echo(f"Auphonic error: {exc}")
         raise typer.Exit(code=1)
 
-    typer.echo(f"production_id: {details['production_id']}")
-    typer.echo(f"status: {details['status']}")
-    typer.echo(f"status_string: {details['status_string'] or 'none'}")
-    typer.echo(f"start_allowed: {details['start_allowed']}")
-    typer.echo(f"change_allowed: {details['change_allowed']}")
-    typer.echo(f"edit_page: {details['edit_page'] or 'none'}")
-    typer.echo(f"status_page: {details['status_page'] or 'none'}")
-    typer.echo(f"error_message: {details['error_message'] or 'none'}")
-    typer.echo(f"warning_message: {details['warning_message'] or 'none'}")
+    _print_header("Auphonic Production")
+    _print_key_values(
+        [
+            ("production_id", details["production_id"]),
+            ("status", str(details["status"])),
+            ("status_string", details["status_string"] or "none"),
+            ("start_allowed", str(details["start_allowed"])),
+            ("change_allowed", str(details["change_allowed"])),
+            ("edit_page", details["edit_page"] or "none"),
+            ("status_page", details["status_page"] or "none"),
+            ("error_message", details["error_message"] or "none"),
+            ("warning_message", details["warning_message"] or "none"),
+        ]
+    )
+    if details["multi_input_files"]:
+        typer.echo()
+        _print_header("Tracks")
     for track in details["multi_input_files"]:
         typer.echo(
-            " | ".join(
+            "  ".join(
                 [
-                    "track",
                     f"id={track.get('id', '')}",
                     f"type={track.get('type', '')}",
                     f"input_file={track.get('input_file', '') or 'none'}",
@@ -487,8 +586,13 @@ def auphonic_sync_command(
         typer.echo(f"Auphonic error: {exc}")
         raise typer.Exit(code=1)
 
-    typer.echo(f"session_uid: {updated.session_uid}")
-    typer.echo(f"status: {updated.status}")
-    typer.echo(f"auphonic_production_id: {updated.auphonic_production_id or 'none'}")
-    typer.echo(f"pre_edit_master_path: {updated.pre_edit_master_path or 'none'}")
-    typer.echo(f"transcript_path: {updated.transcript_path or 'none'}")
+    _print_header("Auphonic Synced")
+    _print_key_values(
+        [
+            ("session_uid", updated.session_uid),
+            ("status", updated.status),
+            ("auphonic_production_id", updated.auphonic_production_id or "none"),
+            ("pre_edit_master_path", updated.pre_edit_master_path or "none"),
+            ("transcript_path", updated.transcript_path or "none"),
+        ]
+    )

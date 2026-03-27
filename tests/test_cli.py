@@ -65,7 +65,8 @@ def test_reset_db_recreates_database(tmp_path: Path) -> None:
     result = runner.invoke(app, ["reset-db", "--yes", "--config", str(config_file)])
 
     assert result.exit_code == 0
-    assert f"Reset database: {db_file}" in result.stdout
+    assert "Database Reset" in result.stdout
+    assert str(db_file) in result.stdout
     with connect(str(db_file)) as connection:
         row = connection.execute("SELECT COUNT(*) AS count FROM sessions").fetchone()
     assert row["count"] == 0
@@ -105,7 +106,54 @@ def test_refresh_resets_scans_and_lists_sessions(tmp_path: Path) -> None:
     result = runner.invoke(app, ["refresh", "--config", str(config_file)])
 
     assert result.exit_code == 0
-    assert "Reset database:" in result.stdout
-    assert "discovered: 1" in result.stdout
-    assert "created: 1" in result.stdout
+    assert "Refresh Complete" in result.stdout
+    assert "discovered" in result.stdout
+    assert "created" in result.stdout
     assert "010124_012430" in result.stdout
+
+
+def test_status_uses_sectioned_output(tmp_path: Path) -> None:
+    runtime_home = tmp_path / "runtime"
+    raw_root = tmp_path / "raw"
+    config_file = tmp_path / "config.yaml"
+    _write_config(config_file, runtime_home, raw_root)
+
+    db_file = runtime_home / "state" / "state.db"
+    initialize_database(str(db_file))
+    with connect(str(db_file)) as connection:
+        connection.execute(
+            """
+            INSERT INTO sessions (
+                session_uid, source_basename, source_date_folder, source_path,
+                recorded_at, recorded_at_source, fingerprint, status,
+                failure_reason, failed_at_stage, auphonic_production_id,
+                pre_edit_master_path, transcript_path, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "session-1",
+                "010124_012430",
+                None,
+                "/tmp/source",
+                "2024-01-01T01:24:30-08:00",
+                "file_birth_time",
+                "fingerprint-1",
+                "waiting_for_finalize",
+                None,
+                None,
+                "prod-123",
+                "/tmp/master.mp3",
+                "/tmp/transcript.vtt",
+                "now",
+                "now",
+            ),
+        )
+        connection.commit()
+
+    result = runner.invoke(app, ["status", "session-1", "--config", str(config_file)])
+
+    assert result.exit_code == 0
+    assert "Session" in result.stdout
+    assert "session_uid" in result.stdout
+    assert "waiting_for_finalize" in result.stdout
+    assert "/tmp/master.mp3" in result.stdout
