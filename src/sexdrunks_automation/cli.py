@@ -8,6 +8,7 @@ from sexdrunks_automation.auphonic import (
     inspect_production,
     prepare_session_with_auphonic,
     process_session_with_auphonic,
+    reconcile_production_to_session,
     start_prepared_session_with_auphonic,
 )
 from sexdrunks_automation.config import load_config
@@ -441,3 +442,53 @@ def auphonic_inspect_command(
                 ]
             )
         )
+
+
+@app.command("auphonic-sync")
+def auphonic_sync_command(
+    production_id: Optional[str] = typer.Argument(None),
+    session_uid: Optional[str] = typer.Option(
+        None, "--session", help="Tracked session to reconcile."
+    ),
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
+    config: Optional[Path] = typer.Option(
+        None, "--config", help="Path to config.yaml."
+    ),
+) -> None:
+    """Reconcile remote Auphonic state back into the local session DB."""
+    config_path = _resolve_config_path(config)
+    loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
+
+    if session_uid is None:
+        typer.echo("Use --session <session_uid> to choose the local session.")
+        raise typer.Exit(code=1)
+
+    session = get_session(runtime_paths.db_file, session_uid)
+    if session is None:
+        typer.echo(f"Session not found: {session_uid}")
+        raise typer.Exit(code=1)
+
+    resolved_production_id = production_id or session.auphonic_production_id
+    if not resolved_production_id:
+        typer.echo("Provide a production id or sync a session that already stores one.")
+        raise typer.Exit(code=1)
+
+    try:
+        updated = reconcile_production_to_session(
+            config=loaded_config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=session,
+            production_id=resolved_production_id,
+            logger=logger,
+        )
+    except AuphonicError as exc:
+        logger.error("Auphonic sync failed for %s: %s", session_uid, exc)
+        typer.echo(f"Auphonic error: {exc}")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"session_uid: {updated.session_uid}")
+    typer.echo(f"status: {updated.status}")
+    typer.echo(f"auphonic_production_id: {updated.auphonic_production_id or 'none'}")
+    typer.echo(f"pre_edit_master_path: {updated.pre_edit_master_path or 'none'}")
+    typer.echo(f"transcript_path: {updated.transcript_path or 'none'}")

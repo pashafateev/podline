@@ -10,6 +10,7 @@ from sexdrunks_automation.auphonic import (
     inspect_production,
     prepare_session_with_auphonic,
     process_session_with_auphonic,
+    reconcile_production_to_session,
     resolve_preset_id,
     start_prepared_session_with_auphonic,
 )
@@ -91,12 +92,32 @@ class FakeAuphonicClient:
                 "edit_page": f"https://example.test/edit/{production_id}",
                 "status_page": f"https://example.test/status/{production_id}",
                 "warning_message": "",
+                "output_files": [
+                    {
+                        "format": "mp3",
+                        "download_url": "https://example.test/master.mp3",
+                        "ending": "mp3",
+                    },
+                    {
+                        "format": "subtitle",
+                        "download_url": "https://example.test/transcript.vtt",
+                        "ending": "vtt",
+                    },
+                ],
                 "multi_input_files": [
                     {"id": "Jonathan", "type": "multitrack", "input_file": "Tr1.WAV"},
                     {"id": "Pasha", "type": "multitrack", "input_file": "Tr2.WAV"},
                 ],
             },
         }
+
+
+class FakeDoneAuphonicClient(FakeAuphonicClient):
+    def get_production(self, production_id: str):
+        payload = super().get_production(production_id)
+        payload["data"]["status"] = 3
+        payload["data"]["status_string"] = "Done"
+        return payload
 
 
 def test_resolve_preset_id_validates_config() -> None:
@@ -125,7 +146,7 @@ def test_process_session_with_auphonic_downloads_outputs(
         for item in list_sessions(runtime_paths.db_file)
         if item.source_basename == "010124_013143"
     )
-    client = FakeAuphonicClient()
+    client = FakeDoneAuphonicClient()
 
     updated = process_session_with_auphonic(
         config=config,
@@ -166,7 +187,7 @@ def test_prepare_then_start_splits_the_auphonic_flow(
         for item in list_sessions(runtime_paths.db_file)
         if item.source_basename == "010124_013143"
     )
-    client = FakeAuphonicClient()
+    client = FakeDoneAuphonicClient()
 
     prepared = prepare_session_with_auphonic(
         config=config,
@@ -198,7 +219,7 @@ def test_prepare_then_start_splits_the_auphonic_flow(
 
 def test_inspect_production_returns_verification_details(tmp_path: Path) -> None:
     config = _build_config(tmp_path)
-    client = FakeAuphonicClient()
+    client = FakeDoneAuphonicClient()
 
     details = inspect_production(config, "prod-123", client=client)
 
@@ -225,6 +246,36 @@ def test_error_status_is_treated_as_failed() -> None:
     data_node = {"status": 2, "status_string": "Error"}
 
     assert _is_failed_status(data_node) is True
+
+
+def test_reconcile_done_production_downloads_outputs(
+    fixture_raw_root, tmp_path: Path
+) -> None:
+    config = _build_config(tmp_path)
+    runtime_paths = build_runtime_paths(config)
+    ensure_runtime_dirs(runtime_paths)
+    initialize_database(runtime_paths.db_file)
+    scan_and_ingest(fixture_raw_root, runtime_paths.db_file)
+    session = next(
+        item
+        for item in list_sessions(runtime_paths.db_file)
+        if item.source_basename == "010124_013143"
+    )
+    client = FakeDoneAuphonicClient()
+
+    updated = reconcile_production_to_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        production_id="prod-123",
+        client=client,
+    )
+
+    assert updated.status == "waiting_for_finalize"
+    assert updated.auphonic_production_id == "prod-123"
+    assert Path(updated.pre_edit_master_path).exists()
+    assert Path(updated.transcript_path).exists()
 
 
 def _build_config(tmp_path: Path, enabled: bool = True) -> AppConfig:

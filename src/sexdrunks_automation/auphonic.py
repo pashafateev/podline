@@ -267,7 +267,7 @@ class AuphonicClient:
 
     def download_file(self, url: str, destination: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        with self._client.stream("GET", url) as response:
+        with self._client.stream("GET", url, follow_redirects=True) as response:
             response.raise_for_status()
             with destination.open("wb") as handle:
                 for chunk in response.iter_bytes():
@@ -727,7 +727,102 @@ def inspect_production(
         or "",
         "warning_message": data_node.get("warning_message") or "",
         "multi_input_files": data_node.get("multi_input_files") or [],
+        "output_files": data_node.get("output_files") or [],
     }
+
+
+def reconcile_production_to_session(
+    *,
+    config: AppConfig,
+    runtime_paths: RuntimePaths,
+    db_file: str,
+    session: SessionRecord,
+    production_id: str,
+    client: Optional[AuphonicClientProtocol] = None,
+    logger: Optional[logging.Logger] = None,
+) -> SessionRecord:
+    client = client or AuphonicClient(config)
+    details = inspect_production(config, production_id, client=client)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    current_state = session.status
+
+    _log(
+        logger,
+        "Reconciling Auphonic production %s into session %s",
+        production_id,
+        session.session_uid,
+    )
+
+    if _is_done_status(details):
+        production = AuphonicProduction(
+            production_id=production_id,
+            output_files=_extract_output_files(
+                {"output_files": details["output_files"]}
+            ),
+        )
+        paths = _download_and_copy_outputs(
+            client=client,
+            runtime_paths=runtime_paths,
+            deliverables_root=config.paths.deliverables_root,
+            session_uid=session.session_uid,
+            production=production,
+        )
+        update_session_status(
+            db_file,
+            session_uid=session.session_uid,
+            from_state=current_state,
+            to_state=SessionStatus.WAITING_FOR_FINALIZE.value,
+            timestamp=timestamp,
+            detail="reconciled completed Auphonic production and downloaded outputs",
+            auphonic_production_id=production_id,
+            pre_edit_master_path=str(paths["master"]),
+            transcript_path=str(paths["transcript"]),
+            failure_reason=None,
+            failed_at_stage=None,
+        )
+    elif details.get("start_allowed"):
+        update_session_status(
+            db_file,
+            session_uid=session.session_uid,
+            from_state=current_state,
+            to_state=SessionStatus.AUPHONIC_PREPARED.value,
+            timestamp=timestamp,
+            detail="reconciled prepared Auphonic production",
+            auphonic_production_id=production_id,
+            failure_reason=None,
+            failed_at_stage=None,
+        )
+    elif _is_failed_status(details):
+        update_session_status(
+            db_file,
+            session_uid=session.session_uid,
+            from_state=current_state,
+            to_state=SessionStatus.FAILED.value,
+            timestamp=timestamp,
+            detail=f"reconciled failed Auphonic production: {details.get('error_message') or details.get('status_string')}",
+            auphonic_production_id=production_id,
+            failure_reason=details.get("error_message") or details.get("status_string"),
+            failed_at_stage="auphonic",
+        )
+    else:
+        update_session_status(
+            db_file,
+            session_uid=session.session_uid,
+            from_state=current_state,
+            to_state=SessionStatus.AUPHONIC_STARTED.value,
+            timestamp=timestamp,
+            detail="reconciled in-progress Auphonic production",
+            auphonic_production_id=production_id,
+            failure_reason=None,
+            failed_at_stage=None,
+        )
+
+    from sexdrunks_automation.repository import get_session
+
+    updated = get_session(db_file, session.session_uid)
+    if updated is None:
+        raise AuphonicError(f"Reconciled session disappeared: {session.session_uid}")
+    return updated
 
 
 def _upload_attachment_summary(data_node: Dict) -> Dict[str, object]:
