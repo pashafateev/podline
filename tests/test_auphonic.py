@@ -5,6 +5,8 @@ from sexdrunks_automation.auphonic import (
     AuphonicOutputFile,
     AuphonicPreparedProduction,
     AuphonicProduction,
+    _is_done_status,
+    _is_failed_status,
     inspect_production,
     prepare_session_with_auphonic,
     process_session_with_auphonic,
@@ -203,6 +205,26 @@ def test_inspect_production_returns_verification_details(tmp_path: Path) -> None
     assert details["production_id"] == "prod-123"
     assert details["start_allowed"] is True
     assert details["multi_input_files"][0]["id"] == "Jonathan"
+
+
+def test_done_status_is_not_treated_as_failed() -> None:
+    data_node = {"status": 3, "status_string": "Done"}
+
+    assert _is_done_status(data_node) is True
+    assert _is_failed_status(data_node) is False
+
+
+def test_audio_processing_status_is_not_treated_as_failed() -> None:
+    data_node = {"status": 4, "status_string": "Audio Processing"}
+
+    assert _is_done_status(data_node) is False
+    assert _is_failed_status(data_node) is False
+
+
+def test_error_status_is_treated_as_failed() -> None:
+    data_node = {"status": 2, "status_string": "Error"}
+
+    assert _is_failed_status(data_node) is True
 
 
 def _build_config(tmp_path: Path, enabled: bool = True) -> AppConfig:

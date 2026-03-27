@@ -239,9 +239,20 @@ class AuphonicClient:
             )
             payload = response.json()
             data_node = payload.get("data", payload)
+            logging.getLogger("sexdrunks_automation").debug(
+                "Auphonic poll production_id=%s attempt=%s status=%s status_string=%s error_message=%s warning_message=%s",
+                production_id,
+                _attempt + 1,
+                data_node.get("status"),
+                data_node.get("status_string"),
+                payload.get("error_message") or data_node.get("error_message"),
+                data_node.get("warning_message"),
+            )
 
             if _is_failed_status(data_node):
-                raise AuphonicError(f"Auphonic production {production_id} failed")
+                raise AuphonicError(
+                    f"Auphonic production {production_id} failed with status={data_node.get('status')} status_string={data_node.get('status_string')} error={payload.get('error_message') or data_node.get('error_message') or 'none'}"
+                )
             if _is_done_status(data_node):
                 return AuphonicProduction(
                     production_id=production_id,
@@ -609,9 +620,11 @@ def _is_done_status(data_node: Dict) -> bool:
 def _is_failed_status(data_node: Dict) -> bool:
     status = str(data_node.get("status") or "").lower()
     status_string = str(data_node.get("status_string") or "").lower()
-    return status in {"4", "failed", "error"} or status_string in {
+    return status in {"2", "11", "12", "failed", "error"} or status_string in {
         "failed",
         "error",
+        "stopped",
+        "not enough credits",
     }
 
 
