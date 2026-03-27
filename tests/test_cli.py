@@ -154,6 +154,10 @@ def test_status_uses_sectioned_output(tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     assert "Session" in result.stdout
+    assert "Overview" in result.stdout
+    assert "Source" in result.stdout
+    assert "Auphonic" in result.stdout
+    assert "Metadata" in result.stdout
     assert "session_uid" in result.stdout
     assert "Ready To Finalize" in result.stdout
     assert "/tmp/master.mp3" in result.stdout

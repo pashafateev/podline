@@ -55,6 +55,12 @@ def _print_key_values(items) -> None:
         )
 
 
+def _print_section(title: str, items) -> None:
+    typer.echo()
+    typer.secho(title, fg=typer.colors.MAGENTA, bold=True)
+    _print_key_values(items)
+
+
 def _truncate(value: str, width: int) -> str:
     if len(value) <= width:
         return value
@@ -324,24 +330,40 @@ def status(
         raise typer.Exit(code=1)
 
     _print_header("Session")
-    _print_key_values(
+    _print_section(
+        "Overview",
         [
             ("session_uid", session.session_uid),
             ("status", _format_status(session.status)),
+            ("recorded_at", session.recorded_at or "none"),
+            ("recorded_at_source", session.recorded_at_source or "none"),
+        ],
+    )
+    _print_section(
+        "Source",
+        [
             ("source_basename", session.source_basename or "none"),
             ("source_date_folder", session.source_date_folder or "none"),
             ("source_path", session.source_path),
-            ("recorded_at", session.recorded_at or "none"),
-            ("recorded_at_source", session.recorded_at_source or "none"),
-            ("fingerprint", session.fingerprint),
+        ],
+    )
+    _print_section(
+        "Auphonic",
+        [
             ("auphonic_production_id", session.auphonic_production_id or "none"),
             ("pre_edit_master_path", session.pre_edit_master_path or "none"),
             ("transcript_path", session.transcript_path or "none"),
+        ],
+    )
+    _print_section(
+        "Metadata",
+        [
+            ("fingerprint", session.fingerprint),
             ("created_at", session.created_at),
             ("updated_at", session.updated_at),
             ("failure_reason", session.failure_reason or "none"),
             ("failed_at_stage", session.failed_at_stage or "none"),
-        ]
+        ],
     )
 
 
@@ -561,7 +583,8 @@ def auphonic_inspect_command(
         raise typer.Exit(code=1)
 
     _print_header("Auphonic Production")
-    _print_key_values(
+    _print_section(
+        "Overview",
         [
             ("production_id", details["production_id"]),
             (
@@ -571,11 +594,21 @@ def auphonic_inspect_command(
             ("status_string", details["status_string"] or "none"),
             ("start_allowed", str(details["start_allowed"])),
             ("change_allowed", str(details["change_allowed"])),
+        ],
+    )
+    _print_section(
+        "Links",
+        [
             ("edit_page", details["edit_page"] or "none"),
             ("status_page", details["status_page"] or "none"),
+        ],
+    )
+    _print_section(
+        "Messages",
+        [
             ("error_message", details["error_message"] or "none"),
             ("warning_message", details["warning_message"] or "none"),
-        ]
+        ],
     )
     if details["multi_input_files"]:
         typer.echo()
