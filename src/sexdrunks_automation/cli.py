@@ -21,16 +21,38 @@ from sexdrunks_automation.repository import get_session, list_sessions
 
 app = typer.Typer(help="Sex Drunks automation CLI.")
 
+STATUS_STYLES = {
+    "queued": ("Queued", typer.colors.YELLOW, "○"),
+    "auphonic_prepared": ("Prepared", typer.colors.BLUE, "↑"),
+    "auphonic_started": ("Running", typer.colors.BLUE, "◌"),
+    "waiting_for_finalize": ("Ready To Finalize", typer.colors.GREEN, "✓"),
+    "draft_created": ("Draft Created", typer.colors.GREEN, "★"),
+    "failed": ("Failed", typer.colors.RED, "✖"),
+}
+
+
+def _styled(text: str, *, fg=None, bold: bool = False) -> str:
+    return typer.style(text, fg=fg, bold=bold)
+
+
+def _format_status(status: str) -> str:
+    label, color, icon = STATUS_STYLES.get(
+        status, (status.replace("_", " ").title(), typer.colors.WHITE, "•")
+    )
+    return _styled(f"{icon} {label}", fg=color, bold=True)
+
 
 def _print_header(title: str) -> None:
-    typer.echo(title)
-    typer.echo("-" * len(title))
+    typer.secho(f"✦ {title}", fg=typer.colors.CYAN, bold=True)
+    typer.secho("─" * (len(title) + 2), fg=typer.colors.CYAN)
 
 
 def _print_key_values(items) -> None:
     width = max(len(label) for label, _value in items)
     for label, value in items:
-        typer.echo(f"{label.ljust(width)}  {value}")
+        typer.echo(
+            f"{_styled(label.ljust(width), fg=typer.colors.BRIGHT_BLUE, bold=True)}  {value}"
+        )
 
 
 def _truncate(value: str, width: int) -> str:
@@ -45,10 +67,13 @@ def _print_session_summary(session) -> None:
     typer.echo(
         "  ".join(
             [
-                _truncate(session.session_uid, 16).ljust(16),
-                session.status.ljust(20),
+                _styled(_truncate(session.session_uid, 16).ljust(16), bold=True),
+                _format_status(session.status).ljust(28),
                 _truncate(session.recorded_at or "unknown", 25).ljust(25),
-                _truncate(session.source_basename or "unknown", 18).ljust(18),
+                _styled(
+                    _truncate(session.source_basename or "unknown", 18).ljust(18),
+                    fg=typer.colors.MAGENTA,
+                ),
                 _truncate(session.source_path, 60),
             ]
         )
@@ -59,11 +84,13 @@ def _print_session_table(sessions) -> None:
     typer.echo(
         "  ".join(
             [
-                "session".ljust(16),
-                "status".ljust(20),
-                "recorded_at".ljust(25),
-                "source".ljust(18),
-                "path",
+                _styled("session".ljust(16), fg=typer.colors.BRIGHT_BLUE, bold=True),
+                _styled("status".ljust(28), fg=typer.colors.BRIGHT_BLUE, bold=True),
+                _styled(
+                    "recorded_at".ljust(25), fg=typer.colors.BRIGHT_BLUE, bold=True
+                ),
+                _styled("source".ljust(18), fg=typer.colors.BRIGHT_BLUE, bold=True),
+                _styled("path", fg=typer.colors.BRIGHT_BLUE, bold=True),
             ]
         )
     )
@@ -71,7 +98,7 @@ def _print_session_table(sessions) -> None:
         "  ".join(
             [
                 "-" * 16,
-                "-" * 20,
+                "-" * 28,
                 "-" * 25,
                 "-" * 18,
                 "-" * 40,
@@ -115,7 +142,7 @@ def _print_sessions(runtime_paths) -> None:
     sessions = list_sessions(runtime_paths.db_file)
 
     if not sessions:
-        typer.echo("No sessions tracked yet.")
+        typer.secho("☷ No sessions tracked yet.", fg=typer.colors.YELLOW, bold=True)
         return
 
     _print_session_table(sessions)
@@ -144,7 +171,9 @@ def init(
             ("health_file", runtime_paths.health_file),
             (
                 "deliverables_mounted",
-                "yes" if snapshot.external_drive_mounted else "no",
+                _styled("✓ yes", fg=typer.colors.GREEN, bold=True)
+                if snapshot.external_drive_mounted
+                else _styled("✖ no", fg=typer.colors.RED, bold=True),
             ),
         ]
     )
@@ -242,11 +271,18 @@ def health(
     _print_header("Health")
     _print_key_values(
         [
-            ("worker_status", snapshot.worker_status),
+            (
+                "worker_status",
+                _format_status(snapshot.worker_status)
+                if snapshot.worker_status in STATUS_STYLES
+                else snapshot.worker_status,
+            ),
             ("last_heartbeat", snapshot.last_heartbeat or "n/a"),
             (
                 "external_drive_mounted",
-                "yes" if snapshot.external_drive_mounted else "no",
+                _styled("✓ yes", fg=typer.colors.GREEN, bold=True)
+                if snapshot.external_drive_mounted
+                else _styled("✖ no", fg=typer.colors.RED, bold=True),
             ),
             ("queue_depth", str(snapshot.queue_depth)),
             ("session_count", str(snapshot.session_count)),
@@ -282,14 +318,16 @@ def status(
     session = get_session(runtime_paths.db_file, session_uid)
 
     if session is None:
-        typer.echo(f"Session not found: {session_uid}")
+        typer.secho(
+            f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
+        )
         raise typer.Exit(code=1)
 
     _print_header("Session")
     _print_key_values(
         [
             ("session_uid", session.session_uid),
-            ("status", session.status),
+            ("status", _format_status(session.status)),
             ("source_basename", session.source_basename or "none"),
             ("source_date_folder", session.source_date_folder or "none"),
             ("source_path", session.source_path),
@@ -370,7 +408,9 @@ def auphonic_command(
     loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
     session = get_session(runtime_paths.db_file, session_uid)
     if session is None:
-        typer.echo(f"Session not found: {session_uid}")
+        typer.secho(
+            f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
+        )
         raise typer.Exit(code=1)
 
     try:
@@ -390,7 +430,7 @@ def auphonic_command(
     _print_key_values(
         [
             ("session_uid", updated.session_uid),
-            ("status", updated.status),
+            ("status", _format_status(updated.status)),
             ("auphonic_production_id", updated.auphonic_production_id or "none"),
             ("pre_edit_master_path", updated.pre_edit_master_path or "none"),
             ("transcript_path", updated.transcript_path or "none"),
@@ -411,7 +451,9 @@ def auphonic_prepare_command(
     loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
     session = get_session(runtime_paths.db_file, session_uid)
     if session is None:
-        typer.echo(f"Session not found: {session_uid}")
+        typer.secho(
+            f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
+        )
         raise typer.Exit(code=1)
 
     try:
@@ -430,7 +472,7 @@ def auphonic_prepare_command(
     _print_key_values(
         [
             ("session_uid", updated.session_uid),
-            ("status", updated.status),
+            ("status", _format_status(updated.status)),
             ("auphonic_production_id", updated.auphonic_production_id or "none"),
             ("auphonic_started", "no"),
         ]
@@ -450,7 +492,9 @@ def auphonic_start_command(
     loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
     session = get_session(runtime_paths.db_file, session_uid)
     if session is None:
-        typer.echo(f"Session not found: {session_uid}")
+        typer.secho(
+            f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
+        )
         raise typer.Exit(code=1)
 
     try:
@@ -470,7 +514,7 @@ def auphonic_start_command(
     _print_key_values(
         [
             ("session_uid", updated.session_uid),
-            ("status", updated.status),
+            ("status", _format_status(updated.status)),
             ("auphonic_production_id", updated.auphonic_production_id or "none"),
             ("pre_edit_master_path", updated.pre_edit_master_path or "none"),
             ("transcript_path", updated.transcript_path or "none"),
@@ -497,7 +541,9 @@ def auphonic_inspect_command(
     if session_uid is not None:
         session = get_session(runtime_paths.db_file, session_uid)
         if session is None:
-            typer.echo(f"Session not found: {session_uid}")
+            typer.secho(
+                f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
+            )
             raise typer.Exit(code=1)
         if not session.auphonic_production_id:
             typer.echo(f"Session has no Auphonic production id: {session_uid}")
@@ -518,7 +564,10 @@ def auphonic_inspect_command(
     _print_key_values(
         [
             ("production_id", details["production_id"]),
-            ("status", str(details["status"])),
+            (
+                "status",
+                _styled(str(details["status"]), fg=typer.colors.WHITE, bold=True),
+            ),
             ("status_string", details["status_string"] or "none"),
             ("start_allowed", str(details["start_allowed"])),
             ("change_allowed", str(details["change_allowed"])),
@@ -564,7 +613,9 @@ def auphonic_sync_command(
 
     session = get_session(runtime_paths.db_file, session_uid)
     if session is None:
-        typer.echo(f"Session not found: {session_uid}")
+        typer.secho(
+            f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
+        )
         raise typer.Exit(code=1)
 
     resolved_production_id = production_id or session.auphonic_production_id
@@ -590,7 +641,7 @@ def auphonic_sync_command(
     _print_key_values(
         [
             ("session_uid", updated.session_uid),
-            ("status", updated.status),
+            ("status", _format_status(updated.status)),
             ("auphonic_production_id", updated.auphonic_production_id or "none"),
             ("pre_edit_master_path", updated.pre_edit_master_path or "none"),
             ("transcript_path", updated.transcript_path or "none"),

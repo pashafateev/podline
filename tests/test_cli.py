@@ -155,5 +155,5 @@ def test_status_uses_sectioned_output(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert "Session" in result.stdout
     assert "session_uid" in result.stdout
-    assert "waiting_for_finalize" in result.stdout
+    assert "Ready To Finalize" in result.stdout
     assert "/tmp/master.mp3" in result.stdout
