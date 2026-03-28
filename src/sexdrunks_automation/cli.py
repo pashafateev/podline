@@ -13,6 +13,11 @@ from sexdrunks_automation.auphonic import (
 )
 from sexdrunks_automation.config import load_config
 from sexdrunks_automation.db import initialize_database
+from sexdrunks_automation.finalize import (
+    FinalizeError,
+    finalize_session,
+    get_episode_metadata,
+)
 from sexdrunks_automation.health import read_health_snapshot, write_health_snapshot
 from sexdrunks_automation.ingest import scan_and_ingest
 from sexdrunks_automation.logging_setup import configure_logging
@@ -26,6 +31,7 @@ STATUS_STYLES = {
     "auphonic_prepared": ("Prepared", typer.colors.BLUE, "↑"),
     "auphonic_started": ("Running", typer.colors.BLUE, "◌"),
     "waiting_for_finalize": ("Ready To Finalize", typer.colors.GREEN, "✓"),
+    "ready_for_draft": ("Ready For Draft", typer.colors.GREEN, "✓"),
     "draft_created": ("Draft Created", typer.colors.GREEN, "★"),
     "failed": ("Failed", typer.colors.RED, "✖"),
 }
@@ -353,6 +359,7 @@ def status(
             ("auphonic_production_id", session.auphonic_production_id or "none"),
             ("pre_edit_master_path", session.pre_edit_master_path or "none"),
             ("transcript_path", session.transcript_path or "none"),
+            ("final_master_path", session.final_master_path or "none"),
         ],
     )
     _print_section(
@@ -365,6 +372,16 @@ def status(
             ("failed_at_stage", session.failed_at_stage or "none"),
         ],
     )
+    episode = get_episode_metadata(runtime_paths.db_file, session.session_uid)
+    if episode is not None:
+        _print_section(
+            "Episode Draft",
+            [
+                ("title", episode.title or "none"),
+                ("description", episode.description or "none"),
+                ("draft_url", episode.draft_url or "none"),
+            ],
+        )
 
 
 @app.command()
@@ -414,6 +431,58 @@ def scan(
                     f"spoken_tracks={unsupported.spoken_track_count}",
                 ]
             )
+        )
+
+
+@app.command("finalize")
+def finalize_command(
+    session_uid: str,
+    master: Path = typer.Option(
+        ..., "--master", help="Path to the edited final master file."
+    ),
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
+    config: Optional[Path] = typer.Option(
+        None, "--config", help="Path to config.yaml."
+    ),
+) -> None:
+    """Attach the final edited master and generate draft metadata."""
+    config_path = _resolve_config_path(config)
+    _loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
+    session = get_session(runtime_paths.db_file, session_uid)
+    if session is None:
+        typer.secho(
+            f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        updated = finalize_session(
+            db_file=runtime_paths.db_file,
+            session=session,
+            master_path=master,
+        )
+    except FinalizeError as exc:
+        logger.error("Finalize failed for %s: %s", session_uid, exc)
+        typer.echo(f"Finalize error: {exc}")
+        raise typer.Exit(code=1)
+
+    episode = get_episode_metadata(runtime_paths.db_file, updated.session_uid)
+    _print_header("Finalize Complete")
+    _print_section(
+        "Overview",
+        [
+            ("session_uid", updated.session_uid),
+            ("status", _format_status(updated.status)),
+            ("final_master_path", updated.final_master_path or "none"),
+        ],
+    )
+    if episode is not None:
+        _print_section(
+            "Episode Draft",
+            [
+                ("title", episode.title or "none"),
+                ("description", episode.description or "none"),
+            ],
         )
 
 

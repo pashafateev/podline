@@ -3,6 +3,7 @@ from typing import List, Optional
 from sexdrunks_automation.db import connect
 from sexdrunks_automation.models import (
     AssetRecord,
+    EpisodeRecord,
     ScanCandidate,
     SessionRecord,
     SessionStatus,
@@ -14,7 +15,7 @@ def list_sessions(db_file: str) -> List[SessionRecord]:
     SELECT session_uid, source_basename, source_date_folder, source_path,
            recorded_at, recorded_at_source, fingerprint, status,
            failure_reason, failed_at_stage, auphonic_production_id,
-           pre_edit_master_path, transcript_path,
+           pre_edit_master_path, transcript_path, final_master_path,
            created_at, updated_at
     FROM sessions
     ORDER BY created_at DESC
@@ -29,7 +30,7 @@ def get_session(db_file: str, session_uid: str) -> Optional[SessionRecord]:
     SELECT session_uid, source_basename, source_date_folder, source_path,
            recorded_at, recorded_at_source, fingerprint, status,
            failure_reason, failed_at_stage, auphonic_production_id,
-           pre_edit_master_path, transcript_path,
+           pre_edit_master_path, transcript_path, final_master_path,
            created_at, updated_at
     FROM sessions
     WHERE session_uid = ?
@@ -61,7 +62,7 @@ def get_session_by_fingerprint(
     SELECT session_uid, source_basename, source_date_folder, source_path,
            recorded_at, recorded_at_source, fingerprint, status,
            failure_reason, failed_at_stage, auphonic_production_id,
-           pre_edit_master_path, transcript_path,
+           pre_edit_master_path, transcript_path, final_master_path,
            created_at, updated_at
     FROM sessions
     WHERE fingerprint = ?
@@ -96,9 +97,10 @@ def create_session(
                 auphonic_production_id,
                 pre_edit_master_path,
                 transcript_path,
+                final_master_path,
                 created_at,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_uid,
@@ -109,6 +111,7 @@ def create_session(
                 candidate.recorded_at_source,
                 fingerprint,
                 SessionStatus.QUEUED.value,
+                None,
                 None,
                 None,
                 None,
@@ -186,6 +189,7 @@ def update_session_status(
     auphonic_production_id: Optional[str] = None,
     pre_edit_master_path: Optional[str] = None,
     transcript_path: Optional[str] = None,
+    final_master_path: Optional[str] = None,
     failure_reason: Optional[str] = None,
     failed_at_stage: Optional[str] = None,
 ) -> None:
@@ -198,6 +202,7 @@ def update_session_status(
                 auphonic_production_id = COALESCE(?, auphonic_production_id),
                 pre_edit_master_path = COALESCE(?, pre_edit_master_path),
                 transcript_path = COALESCE(?, transcript_path),
+                final_master_path = COALESCE(?, final_master_path),
                 failure_reason = ?,
                 failed_at_stage = ?
             WHERE session_uid = ?
@@ -208,6 +213,7 @@ def update_session_status(
                 auphonic_production_id,
                 pre_edit_master_path,
                 transcript_path,
+                final_master_path,
                 failure_reason,
                 failed_at_stage,
                 session_uid,
@@ -238,6 +244,55 @@ def _row_to_session(row) -> SessionRecord:
         auphonic_production_id=row["auphonic_production_id"],
         pre_edit_master_path=row["pre_edit_master_path"],
         transcript_path=row["transcript_path"],
+        final_master_path=row["final_master_path"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+    )
+
+
+def upsert_episode_metadata(
+    db_file: str,
+    *,
+    session_uid: str,
+    title: str,
+    description: str,
+) -> EpisodeRecord:
+    with connect(db_file) as connection:
+        connection.execute(
+            """
+            INSERT INTO episodes (session_uid, title, description)
+            VALUES (?, ?, ?)
+            ON CONFLICT(session_uid) DO UPDATE SET
+                title = excluded.title,
+                description = excluded.description
+            """,
+            (session_uid, title, description),
+        )
+        connection.commit()
+
+    episode = get_episode(db_file, session_uid)
+    if episode is None:
+        raise RuntimeError(f"Failed to upsert episode metadata for {session_uid}")
+    return episode
+
+
+def get_episode(db_file: str, session_uid: str) -> Optional[EpisodeRecord]:
+    with connect(db_file) as connection:
+        row = connection.execute(
+            """
+            SELECT session_uid, episode_number, podbean_post_id, draft_url, title, description
+            FROM episodes
+            WHERE session_uid = ?
+            """,
+            (session_uid,),
+        ).fetchone()
+    if row is None:
+        return None
+    return EpisodeRecord(
+        session_uid=row["session_uid"],
+        episode_number=row["episode_number"],
+        podbean_post_id=row["podbean_post_id"],
+        draft_url=row["draft_url"],
+        title=row["title"],
+        description=row["description"],
     )

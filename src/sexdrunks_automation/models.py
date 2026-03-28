@@ -10,6 +10,7 @@ class SessionStatus(str, Enum):
     AUPHONIC_STARTED = "auphonic_started"
     WAITING_FOR_FINALIZE = "waiting_for_finalize"
     FINALIZE_STARTED = "finalize_started"
+    READY_FOR_DRAFT = "ready_for_draft"
     DRAFT_CREATED = "draft_created"
     FAILED = "failed"
 
@@ -40,8 +41,19 @@ class SessionRecord:
     auphonic_production_id: Optional[str]
     pre_edit_master_path: Optional[str]
     transcript_path: Optional[str]
+    final_master_path: Optional[str]
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True)
+class EpisodeRecord:
+    session_uid: str
+    episode_number: Optional[int]
+    podbean_post_id: Optional[str]
+    draft_url: Optional[str]
+    title: Optional[str]
+    description: Optional[str]
 
 
 @dataclass(frozen=True)
