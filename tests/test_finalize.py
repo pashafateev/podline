@@ -4,6 +4,7 @@ from sexdrunks_automation.db import initialize_database
 from sexdrunks_automation.finalize import (
     FinalizeError,
     finalize_session,
+    generate_metadata,
     get_episode_metadata,
 )
 from sexdrunks_automation.ingest import scan_and_ingest
@@ -87,3 +88,20 @@ def test_finalize_requires_waiting_for_finalize_status(
         assert "waiting_for_finalize" in str(exc)
     else:
         raise AssertionError("Expected FinalizeError for non-finalizable session")
+
+
+def test_generate_metadata_ignores_utf8_bom_prefixed_webvtt(tmp_path: Path) -> None:
+    transcript = tmp_path / "transcript.vtt"
+    transcript.write_text(
+        "\ufeffWEBVTT\n\n00:00.000 --> 00:01.000\nPasha and Jonathan talk about nightlife and embarrassment.\n",
+        encoding="utf-8",
+    )
+
+    title, description = generate_metadata(
+        transcript_path=transcript,
+        source_basename="010124_012430",
+    )
+
+    assert "WEBVTT" not in title
+    assert "WEBVTT" not in description
+    assert title.startswith("Sex Drunks - Pasha and Jonathan")

@@ -84,7 +84,7 @@ def finalize_session(
 def generate_metadata(
     *, transcript_path: Path, source_basename: Optional[str]
 ) -> tuple[str, str]:
-    transcript_text = transcript_path.read_text(encoding="utf-8")
+    transcript_text = transcript_path.read_text(encoding="utf-8-sig")
     lines = _clean_transcript_lines(transcript_text)
     excerpt_lines = lines[:6]
     excerpt = " ".join(excerpt_lines).strip()
