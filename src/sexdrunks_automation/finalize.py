@@ -38,7 +38,7 @@ def finalize_session(
             f"Pre-edit master file not found: {session.pre_edit_master_path}"
         )
 
-    resolved_master_path = master_path.expanduser().resolve()
+    resolved_master_path = _resolve_master_path(master_path)
     if not resolved_master_path.exists():
         raise FinalizeError(f"Final master file not found: {resolved_master_path}")
     if resolved_master_path.suffix.lower() not in {
@@ -125,3 +125,17 @@ def _truncate_words(text: str, max_words: int) -> str:
 
 def get_episode_metadata(db_file: str, session_uid: str):
     return get_episode(db_file, session_uid)
+
+
+def _resolve_master_path(master_path: Path) -> Path:
+    resolved_master_path = master_path.expanduser().resolve()
+    if resolved_master_path.exists():
+        return resolved_master_path
+
+    raw_value = str(master_path)
+    if "\\ " in raw_value:
+        unescaped_path = Path(raw_value.replace("\\ ", " ")).expanduser().resolve()
+        if unescaped_path.exists():
+            return unescaped_path
+
+    return resolved_master_path
