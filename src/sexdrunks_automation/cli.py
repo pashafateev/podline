@@ -14,6 +14,10 @@ from sexdrunks_automation.auphonic import (
 )
 from sexdrunks_automation.config import load_config
 from sexdrunks_automation.db import initialize_database
+from sexdrunks_automation.episode_meta import (
+    EpisodeMetaError,
+    generate_episode_metadata_with_opencode,
+)
 from sexdrunks_automation.finalize import (
     FinalizeError,
     finalize_session,
@@ -495,7 +499,7 @@ def status(
                 (
                     "next_step",
                     _styled(
-                        "Generate with /episode-meta before Podbean draft",
+                        "Run sd episode-meta @n before Podbean draft",
                         fg=typer.colors.WHITE,
                     ),
                 ),
@@ -617,12 +621,54 @@ def finalize_command(
                 (
                     "next_step",
                     _styled(
-                        "Use /episode-meta on the transcript before Podbean draft",
+                        "Run sd episode-meta @n before Podbean draft",
                         fg=typer.colors.WHITE,
                     ),
                 ),
             ],
         )
+
+
+@app.command("episode-meta")
+def episode_meta_command(
+    session_uid: str,
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
+    config: Optional[Path] = typer.Option(
+        None, "--config", help="Path to config.yaml."
+    ),
+) -> None:
+    """Generate episode title and description using the local /episode-meta OpenCode command."""
+    config_path = _resolve_config_path(config)
+    loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
+    session = _resolve_session_arg(runtime_paths, session_uid)
+    if session is None:
+        typer.secho(
+            f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        episode = generate_episode_metadata_with_opencode(
+            config=loaded_config,
+            db_file=runtime_paths.db_file,
+            session=session,
+        )
+    except EpisodeMetaError as exc:
+        logger.error(
+            "Episode metadata generation failed for %s: %s", session.session_uid, exc
+        )
+        typer.echo(f"Episode metadata error: {exc}")
+        raise typer.Exit(code=1)
+
+    _print_header("Episode Metadata")
+    _print_section(
+        "Draft",
+        [
+            ("session_uid", episode.session_uid),
+            ("title", episode.title or "none"),
+            ("description", episode.description or "none"),
+        ],
+    )
 
 
 @app.command("auphonic")
