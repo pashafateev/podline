@@ -7,6 +7,8 @@ from sexdrunks_automation.config import AppConfig
 from sexdrunks_automation.models import EpisodeRecord, SessionRecord, SessionStatus
 from sexdrunks_automation.repository import upsert_episode_metadata
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 
 class EpisodeMetaError(RuntimeError):
     pass
@@ -33,7 +35,7 @@ def generate_episode_metadata_with_opencode(
         raise EpisodeMetaError(f"Transcript file not found: {transcript_path}")
 
     opencode_binary = _resolve_opencode_binary()
-    project_dir = config.paths.deliverables_root.parent
+    project_dir = PROJECT_ROOT
     transcript_text = transcript_path.read_text(encoding="utf-8-sig")
     output = _run_opencode_episode_meta(opencode_binary, project_dir, transcript_text)
     title, description = _parse_episode_meta_output(output)

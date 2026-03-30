@@ -2,6 +2,7 @@ from pathlib import Path
 
 from sexdrunks_automation.db import initialize_database
 from sexdrunks_automation.episode_meta import (
+    PROJECT_ROOT,
     _parse_episode_meta_output,
     generate_episode_metadata_with_opencode,
 )
@@ -71,10 +72,12 @@ def test_generate_episode_metadata_with_opencode_persists_episode(
         "sexdrunks_automation.episode_meta._resolve_opencode_binary",
         lambda: "/opt/homebrew/bin/opencode",
     )
+    seen = {}
     monkeypatch.setattr(
         "sexdrunks_automation.episode_meta._run_opencode_episode_meta",
         lambda opencode_binary, project_dir, transcript_text: (
-            "**Title:** Boba Boom\n\n**Description:**\nPasha and Jonathan debate boba tea and trends."
+            seen.update({"project_dir": project_dir})
+            or "**Title:** Boba Boom\n\n**Description:**\nPasha and Jonathan debate boba tea and trends."
         ),
     )
 
@@ -104,6 +107,7 @@ def test_generate_episode_metadata_with_opencode_persists_episode(
 
     assert episode.title == "Boba Boom"
     assert "boba tea" in episode.description
+    assert seen["project_dir"] == PROJECT_ROOT
     saved = get_episode(str(db_file), session.session_uid)
     assert saved is not None
     assert saved.title == "Boba Boom"
