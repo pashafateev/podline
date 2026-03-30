@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 from typing import Optional
 
 import typer
@@ -206,6 +207,32 @@ def _resolve_finalize_master(loaded_config, master: Optional[Path]) -> Path:
             cwd_candidate = master.resolve()
             if cwd_candidate.exists():
                 return cwd_candidate
+
+            episode_match = re.fullmatch(r"ep(\d+)", master.name.lower())
+            if episode_match:
+                episode_number = int(episode_match.group(1))
+                candidates = (
+                    sorted(
+                        path
+                        for path in masters_dir.iterdir()
+                        if path.is_file()
+                        and path.suffix.lower() in allowed_suffixes
+                        and re.fullmatch(
+                            rf"sexdrunks_ep0*{episode_number}_master{re.escape(path.suffix)}",
+                            path.name,
+                            re.IGNORECASE,
+                        )
+                    )
+                    if masters_dir.exists()
+                    else []
+                )
+                if len(candidates) == 1:
+                    return candidates[0]
+                if len(candidates) > 1:
+                    raise FinalizeError(
+                        f"Multiple masters matched shortcut {master.name} in {masters_dir}. Provide --master <filename> or --master <path>."
+                    )
+
             candidate = masters_dir / master.name
             if candidate.exists():
                 return candidate
