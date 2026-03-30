@@ -302,6 +302,12 @@ def _build_config(tmp_path: Path, enabled: bool = True) -> AppConfig:
                 "speakers_4": "preset-4",
             },
         ),
-        podbean=PodbeanConfig(enabled=False, client_id="", client_secret=""),
+        podbean=PodbeanConfig(
+            enabled=False,
+            client_id="",
+            client_secret="",
+            base_url="https://api.podbean.example/v1",
+            podcast_id="",
+        ),
         config_file=runtime_home / "config.yaml",
     )

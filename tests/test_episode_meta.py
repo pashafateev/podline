@@ -97,7 +97,13 @@ def test_generate_episode_metadata_with_opencode_persists_episode(
             max_poll_attempts=1,
             preset_ids={},
         ),
-        podbean=PodbeanConfig(enabled=False, client_id="", client_secret=""),
+        podbean=PodbeanConfig(
+            enabled=False,
+            client_id="",
+            client_secret="",
+            base_url="https://api.podbean.example/v1",
+            podcast_id="",
+        ),
         config_file=tmp_path / "config.yaml",
     )
 

@@ -21,3 +21,5 @@ podbean:
   enabled: false
   client_id: ""
   client_secret: ""
+  base_url: https://api.podbean.com/v1
+  podcast_id: ""

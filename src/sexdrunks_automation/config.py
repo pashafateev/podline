@@ -37,6 +37,8 @@ class PodbeanConfig:
     enabled: bool
     client_id: str
     client_secret: str
+    base_url: str
+    podcast_id: str
 
 
 @dataclass(frozen=True)
@@ -91,6 +93,8 @@ def load_config(config_path: Path) -> AppConfig:
             enabled=bool(_require_nested(data, "podbean", "enabled")),
             client_id=str(_require_nested(data, "podbean", "client_id")),
             client_secret=str(_require_nested(data, "podbean", "client_secret")),
+            base_url=str(_require_nested(data, "podbean", "base_url")),
+            podcast_id=str(_require_nested(data, "podbean", "podcast_id")),
         ),
         config_file=config_path,
     )

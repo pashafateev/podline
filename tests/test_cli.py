@@ -39,6 +39,8 @@ def _write_config(config_file: Path, runtime_home: Path, raw_root: Path) -> None
                     "  enabled: false",
                     '  client_id: ""',
                     '  client_secret: ""',
+                    '  base_url: "https://api.podbean.example/v1"',
+                    '  podcast_id: ""',
                 ]
             )
             + "\n"

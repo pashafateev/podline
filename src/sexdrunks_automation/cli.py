@@ -27,6 +27,7 @@ from sexdrunks_automation.health import read_health_snapshot, write_health_snaps
 from sexdrunks_automation.ingest import scan_and_ingest
 from sexdrunks_automation.logging_setup import configure_logging
 from sexdrunks_automation.paths import build_runtime_paths, ensure_runtime_dirs
+from sexdrunks_automation.podbean import PodbeanError, create_podbean_draft
 from sexdrunks_automation.repository import get_session, list_sessions
 
 app = typer.Typer(help="Sex Drunks automation CLI.")
@@ -667,6 +668,51 @@ def episode_meta_command(
             ("session_uid", episode.session_uid),
             ("title", episode.title or "none"),
             ("description", episode.description or "none"),
+        ],
+    )
+
+
+@app.command("podbean-draft")
+def podbean_draft_command(
+    session_uid: str,
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
+    config: Optional[Path] = typer.Option(
+        None, "--config", help="Path to config.yaml."
+    ),
+) -> None:
+    """Upload the finalized master and create a Podbean draft."""
+    config_path = _resolve_config_path(config)
+    loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
+    session = _resolve_session_arg(runtime_paths, session_uid)
+    if session is None:
+        typer.secho(
+            f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        episode = create_podbean_draft(
+            config=loaded_config,
+            db_file=runtime_paths.db_file,
+            session=session,
+        )
+    except PodbeanError as exc:
+        logger.error(
+            "Podbean draft creation failed for %s: %s", session.session_uid, exc
+        )
+        typer.echo(f"Podbean error: {exc}")
+        raise typer.Exit(code=1)
+
+    updated = get_session(runtime_paths.db_file, session.session_uid)
+    _print_header("Podbean Draft")
+    _print_section(
+        "Overview",
+        [
+            ("session_uid", session.session_uid),
+            ("status", _format_status(updated.status if updated else session.status)),
+            ("episode_number", str(episode.episode_number or "none")),
+            ("podbean_post_id", episode.podbean_post_id or "none"),
+            ("draft_url", episode.draft_url or "none"),
         ],
     )
 

@@ -30,6 +30,8 @@ podbean:
   enabled: false
   client_id: ""
   client_secret: ""
+  base_url: https://api.podbean.example/v1
+  podcast_id: ""
 """.strip()
         + "\n",
         encoding="utf-8",
@@ -43,6 +45,7 @@ podbean:
     assert config.auphonic.base_url == "https://auphonic.example/api"
     assert config.auphonic.max_poll_attempts == 180
     assert config.auphonic.request_timeout_seconds == 600
+    assert config.podbean.base_url == "https://api.podbean.example/v1"
 
 
 def test_load_config_overlays_local_config(tmp_path: Path) -> None:
@@ -72,6 +75,8 @@ podbean:
   enabled: false
   client_id: ""
   client_secret: ""
+  base_url: https://api.podbean.example/v1
+  podcast_id: ""
 """.strip()
         + "\n",
         encoding="utf-8",
@@ -86,6 +91,8 @@ auphonic:
   request_timeout_seconds: 1200
   preset_ids:
     speakers_2: preset-2
+podbean:
+  podcast_id: my-podcast-id
 """.strip()
         + "\n",
         encoding="utf-8",
@@ -99,3 +106,4 @@ auphonic:
     assert config.auphonic.request_timeout_seconds == 1200
     assert config.auphonic.preset_ids["speakers_2"] == "preset-2"
     assert config.auphonic.preset_ids["speakers_3"] == ""
+    assert config.podbean.podcast_id == "my-podcast-id"

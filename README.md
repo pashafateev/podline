@@ -19,6 +19,7 @@ Current scope
 - `sd auphonic-sync --session <session_uid> <production_id>` can reconcile a completed remote production back into local state and download outputs.
 - `sd finalize --session <session_uid> --master <path>` attaches the edited master and marks the session ready for AI-generated episode metadata.
 - `sd episode-meta <session_uid>` runs your existing local `/episode-meta` OpenCode command and stores the generated title/description.
+- `sd podbean-draft <session_uid>` uploads the finalized master/transcript and creates a Podbean draft episode.
 - Add `--debug` to CLI commands when you want verbose request-level logging in `logs/automation.log`.
 - `auphonic.request_timeout_seconds` controls how long large uploads can run before the client gives up.
 - If direct local uploads keep failing, the fallback plan is to upload WAVs to an external service first and point Auphonic `multi_input_files` at those remote files instead of streaming them from this machine.
