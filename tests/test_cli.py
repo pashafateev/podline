@@ -112,6 +112,64 @@ def test_refresh_resets_scans_and_lists_sessions(tmp_path: Path) -> None:
     assert "010124_012430" in result.stdout
 
 
+def test_list_shows_pick_column_and_full_mode(tmp_path: Path) -> None:
+    runtime_home = tmp_path / "runtime"
+    raw_root = tmp_path / "raw"
+    config_file = tmp_path / "config.yaml"
+    _write_config(config_file, runtime_home, raw_root)
+
+    db_file = runtime_home / "state" / "state.db"
+    initialize_database(str(db_file))
+    with connect(str(db_file)) as connection:
+        connection.execute(
+            "INSERT INTO sessions (session_uid, source_path, fingerprint, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "session-1234567890",
+                "/tmp/source/path",
+                "fingerprint-1",
+                "queued",
+                "now",
+                "now",
+            ),
+        )
+        connection.commit()
+
+    result = runner.invoke(app, ["list", "--config", str(config_file)])
+    full_result = runner.invoke(app, ["list", "--full", "--config", str(config_file)])
+
+    assert result.exit_code == 0
+    assert "pick" in result.stdout
+    assert "@1" in result.stdout
+    assert "session-12345..." in result.stdout
+    assert full_result.exit_code == 0
+    assert "session-1234567890" in full_result.stdout
+
+
+def test_status_accepts_selector_index(tmp_path: Path) -> None:
+    runtime_home = tmp_path / "runtime"
+    raw_root = tmp_path / "raw"
+    config_file = tmp_path / "config.yaml"
+    _write_config(config_file, runtime_home, raw_root)
+
+    db_file = runtime_home / "state" / "state.db"
+    initialize_database(str(db_file))
+    with connect(str(db_file)) as connection:
+        connection.execute(
+            "INSERT INTO sessions (session_uid, source_path, fingerprint, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ("session-1", "/tmp/source1", "fingerprint-1", "queued", "2024", "2024"),
+        )
+        connection.execute(
+            "INSERT INTO sessions (session_uid, source_path, fingerprint, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ("session-2", "/tmp/source2", "fingerprint-2", "queued", "2025", "2025"),
+        )
+        connection.commit()
+
+    result = runner.invoke(app, ["status", "@1", "--config", str(config_file)])
+
+    assert result.exit_code == 0
+    assert "session-2" in result.stdout
+
+
 def test_status_uses_sectioned_output(tmp_path: Path) -> None:
     runtime_home = tmp_path / "runtime"
     raw_root = tmp_path / "raw"

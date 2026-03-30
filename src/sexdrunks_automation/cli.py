@@ -83,26 +83,35 @@ def _truncate(value: str, width: int) -> str:
 
 
 def _print_session_summary(session) -> None:
+    _print_session_summary_row(session, index=None, full=False)
+
+
+def _print_session_summary_row(session, *, index: Optional[int], full: bool) -> None:
+    session_value = session.session_uid if full else _truncate(session.session_uid, 16)
+    path_value = session.source_path if full else _truncate(session.source_path, 60)
+    index_value = f"@{index}" if index is not None else ""
     typer.echo(
         "  ".join(
             [
-                _styled(_truncate(session.session_uid, 16).ljust(16), bold=True),
+                _styled(index_value.ljust(4), fg=typer.colors.YELLOW, bold=True),
+                _styled(session_value.ljust(36 if full else 16), bold=True),
                 _format_status(session.status).ljust(28),
                 _truncate(session.recorded_at or "unknown", 25).ljust(25),
                 _styled(
                     _truncate(session.source_basename or "unknown", 18).ljust(18),
                     fg=typer.colors.MAGENTA,
                 ),
-                _truncate(session.source_path, 60),
+                path_value,
             ]
         )
     )
 
 
-def _print_session_table(sessions) -> None:
+def _print_session_table(sessions, *, full: bool = False) -> None:
     typer.echo(
         "  ".join(
             [
+                _styled("pick".ljust(4), fg=typer.colors.BRIGHT_BLUE, bold=True),
                 _styled("session".ljust(16), fg=typer.colors.BRIGHT_BLUE, bold=True),
                 _styled("status".ljust(28), fg=typer.colors.BRIGHT_BLUE, bold=True),
                 _styled(
@@ -116,6 +125,7 @@ def _print_session_table(sessions) -> None:
     typer.echo(
         "  ".join(
             [
+                "-" * 4,
                 "-" * 16,
                 "-" * 28,
                 "-" * 25,
@@ -124,8 +134,8 @@ def _print_session_table(sessions) -> None:
             ]
         )
     )
-    for session in sessions:
-        _print_session_summary(session)
+    for index, session in enumerate(sessions, start=1):
+        _print_session_summary_row(session, index=index, full=full)
 
 
 def _resolve_config_path(config: Optional[Path]) -> Path:
@@ -157,14 +167,34 @@ def _reset_database_for_runtime(config_path: Path) -> tuple:
     return loaded_config, runtime_paths
 
 
-def _print_sessions(runtime_paths) -> None:
+def _print_sessions(runtime_paths, *, full: bool = False) -> None:
     sessions = list_sessions(runtime_paths.db_file)
 
     if not sessions:
         typer.secho("☷ No sessions tracked yet.", fg=typer.colors.YELLOW, bold=True)
         return
 
-    _print_session_table(sessions)
+    _print_session_table(sessions, full=full)
+
+
+def _resolve_session_arg(runtime_paths, session_arg: str):
+    if session_arg == "latest":
+        sessions = list_sessions(runtime_paths.db_file)
+        if not sessions:
+            return None
+        return sessions[0]
+
+    if session_arg.startswith("@"):
+        try:
+            index = int(session_arg[1:])
+        except ValueError:
+            return None
+        sessions = list_sessions(runtime_paths.db_file)
+        if 1 <= index <= len(sessions):
+            return sessions[index - 1]
+        return None
+
+    return get_session(runtime_paths.db_file, session_arg)
 
 
 @app.command()
@@ -312,6 +342,9 @@ def health(
 
 @app.command("list")
 def list_command(
+    full: bool = typer.Option(
+        False, "--full", help="Show full session ids and full paths."
+    ),
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
         None, "--config", help="Path to config.yaml."
@@ -320,7 +353,7 @@ def list_command(
     """List known sessions."""
     config_path = _resolve_config_path(config)
     _loaded_config, runtime_paths, _logger = _bootstrap(config_path, debug=debug)
-    _print_sessions(runtime_paths)
+    _print_sessions(runtime_paths, full=full)
 
 
 @app.command()
@@ -334,7 +367,7 @@ def status(
     """Show one tracked session."""
     config_path = _resolve_config_path(config)
     _loaded_config, runtime_paths, _logger = _bootstrap(config_path, debug=debug)
-    session = get_session(runtime_paths.db_file, session_uid)
+    session = _resolve_session_arg(runtime_paths, session_uid)
 
     if session is None:
         typer.secho(
@@ -472,7 +505,7 @@ def finalize_command(
     """Attach the final edited master and generate draft metadata."""
     config_path = _resolve_config_path(config)
     _loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
-    session = get_session(runtime_paths.db_file, session_uid)
+    session = _resolve_session_arg(runtime_paths, session_uid)
     if session is None:
         typer.secho(
             f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
@@ -538,7 +571,7 @@ def auphonic_command(
     """Upload one queued session to Auphonic and download outputs."""
     config_path = _resolve_config_path(config)
     loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
-    session = get_session(runtime_paths.db_file, session_uid)
+    session = _resolve_session_arg(runtime_paths, session_uid)
     if session is None:
         typer.secho(
             f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
@@ -581,7 +614,7 @@ def auphonic_prepare_command(
     """Create an Auphonic production and upload files without starting it."""
     config_path = _resolve_config_path(config)
     loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
-    session = get_session(runtime_paths.db_file, session_uid)
+    session = _resolve_session_arg(runtime_paths, session_uid)
     if session is None:
         typer.secho(
             f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
@@ -622,7 +655,7 @@ def auphonic_start_command(
     """Start an already-uploaded Auphonic production and fetch outputs."""
     config_path = _resolve_config_path(config)
     loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
-    session = get_session(runtime_paths.db_file, session_uid)
+    session = _resolve_session_arg(runtime_paths, session_uid)
     if session is None:
         typer.secho(
             f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
@@ -754,7 +787,7 @@ def auphonic_sync_command(
         typer.echo("Use --session <session_uid> to choose the local session.")
         raise typer.Exit(code=1)
 
-    session = get_session(runtime_paths.db_file, session_uid)
+    session = _resolve_session_arg(runtime_paths, session_uid)
     if session is None:
         typer.secho(
             f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
