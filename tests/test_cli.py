@@ -312,3 +312,190 @@ def test_status_shows_episode_draft_pending_only_when_ready_for_draft(
     assert result.exit_code == 0
     assert "Episode Draft" in result.stdout
     assert "AI metadata pending" in result.stdout
+
+
+def test_finalize_uses_single_master_from_expected_directory(tmp_path: Path) -> None:
+    runtime_home = tmp_path / "runtime"
+    raw_root = tmp_path / "raw"
+    config_file = tmp_path / "config.yaml"
+    _write_config(config_file, runtime_home, raw_root)
+
+    masters_dir = runtime_home / "deliverables" / "masters"
+    masters_dir.mkdir(parents=True)
+    final_master = masters_dir / "episode_master.mp3"
+    final_master.write_bytes(b"final")
+
+    transcript = tmp_path / "transcript.vtt"
+    transcript.write_text(
+        "WEBVTT\n\n00:00.000 --> 00:01.000\nhello\n", encoding="utf-8"
+    )
+    pre_edit = tmp_path / "pre.mp3"
+    pre_edit.write_bytes(b"pre")
+
+    db_file = runtime_home / "state" / "state.db"
+    initialize_database(str(db_file))
+    with connect(str(db_file)) as connection:
+        connection.execute(
+            """
+            INSERT INTO sessions (
+                session_uid, source_basename, source_date_folder, source_path,
+                recorded_at, recorded_at_source, fingerprint, status,
+                failure_reason, failed_at_stage, auphonic_production_id,
+                pre_edit_master_path, transcript_path, final_master_path, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "session-finalize-1",
+                "010124_012430",
+                None,
+                "/tmp/source",
+                None,
+                None,
+                "fingerprint-finalize-1",
+                "waiting_for_finalize",
+                None,
+                None,
+                "prod-123",
+                str(pre_edit),
+                str(transcript),
+                None,
+                "now",
+                "now",
+            ),
+        )
+        connection.commit()
+
+    result = runner.invoke(
+        app, ["finalize", "session-finalize-1", "--config", str(config_file)]
+    )
+
+    assert result.exit_code == 0
+    assert str(final_master) in result.stdout
+
+
+def test_finalize_errors_when_multiple_expected_masters_exist(tmp_path: Path) -> None:
+    runtime_home = tmp_path / "runtime"
+    raw_root = tmp_path / "raw"
+    config_file = tmp_path / "config.yaml"
+    _write_config(config_file, runtime_home, raw_root)
+
+    masters_dir = runtime_home / "deliverables" / "masters"
+    masters_dir.mkdir(parents=True)
+    (masters_dir / "one.mp3").write_bytes(b"1")
+    (masters_dir / "two.mp3").write_bytes(b"2")
+
+    transcript = tmp_path / "transcript.vtt"
+    transcript.write_text(
+        "WEBVTT\n\n00:00.000 --> 00:01.000\nhello\n", encoding="utf-8"
+    )
+    pre_edit = tmp_path / "pre.mp3"
+    pre_edit.write_bytes(b"pre")
+
+    db_file = runtime_home / "state" / "state.db"
+    initialize_database(str(db_file))
+    with connect(str(db_file)) as connection:
+        connection.execute(
+            """
+            INSERT INTO sessions (
+                session_uid, source_basename, source_date_folder, source_path,
+                recorded_at, recorded_at_source, fingerprint, status,
+                failure_reason, failed_at_stage, auphonic_production_id,
+                pre_edit_master_path, transcript_path, final_master_path, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "session-finalize-2",
+                "010124_012430",
+                None,
+                "/tmp/source",
+                None,
+                None,
+                "fingerprint-finalize-2",
+                "waiting_for_finalize",
+                None,
+                None,
+                "prod-123",
+                str(pre_edit),
+                str(transcript),
+                None,
+                "now",
+                "now",
+            ),
+        )
+        connection.commit()
+
+    result = runner.invoke(
+        app, ["finalize", "session-finalize-2", "--config", str(config_file)]
+    )
+
+    assert result.exit_code == 1
+    assert "multiple audio masters were found" in result.stdout
+
+
+def test_finalize_accepts_filename_relative_to_expected_directory(
+    tmp_path: Path,
+) -> None:
+    runtime_home = tmp_path / "runtime"
+    raw_root = tmp_path / "raw"
+    config_file = tmp_path / "config.yaml"
+    _write_config(config_file, runtime_home, raw_root)
+
+    masters_dir = runtime_home / "deliverables" / "masters"
+    masters_dir.mkdir(parents=True)
+    final_master = masters_dir / "episode_master.mp3"
+    final_master.write_bytes(b"final")
+
+    transcript = tmp_path / "transcript.vtt"
+    transcript.write_text(
+        "WEBVTT\n\n00:00.000 --> 00:01.000\nhello\n", encoding="utf-8"
+    )
+    pre_edit = tmp_path / "pre.mp3"
+    pre_edit.write_bytes(b"pre")
+
+    db_file = runtime_home / "state" / "state.db"
+    initialize_database(str(db_file))
+    with connect(str(db_file)) as connection:
+        connection.execute(
+            """
+            INSERT INTO sessions (
+                session_uid, source_basename, source_date_folder, source_path,
+                recorded_at, recorded_at_source, fingerprint, status,
+                failure_reason, failed_at_stage, auphonic_production_id,
+                pre_edit_master_path, transcript_path, final_master_path, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "session-finalize-3",
+                "010124_012430",
+                None,
+                "/tmp/source",
+                None,
+                None,
+                "fingerprint-finalize-3",
+                "waiting_for_finalize",
+                None,
+                None,
+                "prod-123",
+                str(pre_edit),
+                str(transcript),
+                None,
+                "now",
+                "now",
+            ),
+        )
+        connection.commit()
+
+    result = runner.invoke(
+        app,
+        [
+            "finalize",
+            "session-finalize-3",
+            "--master",
+            "episode_master.mp3",
+            "--config",
+            str(config_file),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert str(final_master) in result.stdout

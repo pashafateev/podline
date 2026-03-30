@@ -197,6 +197,38 @@ def _resolve_session_arg(runtime_paths, session_arg: str):
     return get_session(runtime_paths.db_file, session_arg)
 
 
+def _resolve_finalize_master(loaded_config, master: Optional[Path]) -> Path:
+    masters_dir = loaded_config.paths.deliverables_root / "masters"
+    allowed_suffixes = {".mp3", ".wav", ".m4a", ".aif", ".aiff"}
+
+    if master is not None:
+        if not master.is_absolute() and master.parent == Path("."):
+            candidate = masters_dir / master.name
+            if candidate.exists():
+                return candidate
+        return master
+
+    if not masters_dir.exists():
+        raise FinalizeError(
+            f"No --master provided and expected masters directory does not exist: {masters_dir}. Provide --master <path> or export into the expected directory."
+        )
+
+    candidates = sorted(
+        path
+        for path in masters_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in allowed_suffixes
+    )
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise FinalizeError(
+            f"No --master provided and no audio masters were found in {masters_dir}. Provide --master <path> or export into the expected directory."
+        )
+    raise FinalizeError(
+        f"No --master provided and multiple audio masters were found in {masters_dir}. Provide --master <filename> or --master <path>."
+    )
+
+
 @app.command()
 def init(
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
@@ -494,8 +526,10 @@ def scan(
 @app.command("finalize")
 def finalize_command(
     session_uid: str,
-    master: Path = typer.Option(
-        ..., "--master", help="Path to the edited final master file."
+    master: Optional[Path] = typer.Option(
+        None,
+        "--master",
+        help="Path to the edited final master file, or just the filename if it is already in deliverables/masters.",
     ),
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
@@ -513,10 +547,11 @@ def finalize_command(
         raise typer.Exit(code=1)
 
     try:
+        resolved_master = _resolve_finalize_master(_loaded_config, master)
         updated = finalize_session(
             db_file=runtime_paths.db_file,
             session=session,
-            master_path=master,
+            master_path=resolved_master,
         )
     except FinalizeError as exc:
         logger.error("Finalize failed for %s: %s", session_uid, exc)
