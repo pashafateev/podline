@@ -6,20 +6,13 @@ Environment note
 - This scaffold currently targets Python 3.9+ so it runs on the machine as-is.
 
 Current scope
-- Phase 0 scaffold is implemented.
-- The CLI can initialize runtime folders and database state.
-- Basic inspection commands are available: `sd init`, `sd health`, `sd list`, `sd status`.
-- Phase 1 scanning and ingest are implemented via `sd scan`.
-- `sd refresh` is a shortcut for reset-db + scan + list.
+- The working manual-assisted path is implemented end to end through Podbean draft creation.
+- Core inspection commands are available: `sd init`, `sd health`, `sd list`, `sd status`.
+- Ingest commands are available: `sd scan`, `sd refresh`.
+- Auphonic commands are available: `sd auphonic-prepare`, `sd auphonic-start`, `sd auphonic-inspect`, `sd auphonic-sync`.
+- Post-edit commands are available: `sd finalize`, `sd episode-meta`, `sd podbean-draft`.
 - `recorded_at` is best-effort metadata. The recorder date is not always reliable, so this value may reflect filesystem timing rather than a true recording timestamp.
 - Silent extra spoken tracks are ignored during scan, so sessions with empty `Tr3`/`Tr4` files can still classify correctly as 2-speaker sessions.
-- Phase 3 Auphonic processing is available via `sd auphonic <session_uid>`.
-- Safer Auphonic dry runs are available via `sd auphonic-prepare <session_uid>` followed by `sd auphonic-start <session_uid>`.
-- `sd auphonic-inspect <production_id>` lets you verify attached tracks and `start_allowed` before starting.
-- `sd auphonic-sync --session <session_uid> <production_id>` can reconcile a completed remote production back into local state and download outputs.
-- `sd finalize --session <session_uid> --master <path>` attaches the edited master and marks the session ready for AI-generated episode metadata.
-- `sd episode-meta <session_uid>` runs your existing local `/episode-meta` OpenCode command and stores the generated title/description.
-- `sd podbean-draft <session_uid>` uploads the finalized master/transcript and creates a Podbean draft episode.
 - Add `--debug` to CLI commands when you want verbose request-level logging in `logs/automation.log`.
 - `auphonic.request_timeout_seconds` controls how long large uploads can run before the client gives up.
 - If direct local uploads keep failing, the fallback plan is to upload WAVs to an external service first and point Auphonic `multi_input_files` at those remote files instead of streaming them from this machine.
@@ -48,8 +41,54 @@ Local config
 - The recording root is `02_recordings/`, with session folders directly under it.
 
 Planned next steps
-- manual end-to-end processing flow
-- Podbean draft creation
-- live Auphonic validation with real credentials
-- external-service Auphonic inputs as a backup path if local multipart uploads stay flaky
+- combine the post-edit steps into a smoother single command once the pieces stay stable
+- add cleanup/retention rules for staging and generated artifacts
+- improve release verification after Podbean draft creation
 - evaluate whether external-service inputs are worth formalizing into the workflow; see `docs/open-issues.md`
+
+Current workflow
+1. Scan and pick the session
+```bash
+cd ~/sexdrunks-automation
+source .venv/bin/activate
+sd refresh
+sd list
+```
+
+2. Upload to Auphonic without starting yet
+```bash
+sd auphonic-prepare @1 --debug
+sd auphonic-inspect --session @1
+```
+
+3. Start Auphonic and let it finish
+```bash
+sd auphonic-start @1 --debug
+sd status @1
+```
+
+4. Edit in Cubase, export the final master, then attach it
+```bash
+sd finalize @1 --master ep16
+```
+
+Notes:
+- `--master ep16` resolves to `04_deliverables/masters/sexdrunks_ep16_master.*` in the expected masters directory.
+- You can also pass a full path or a filename.
+
+5. Generate episode metadata using the local OpenCode command
+```bash
+sd episode-meta @1
+sd status @1
+```
+
+6. Create the Podbean draft
+```bash
+sd podbean-draft @1
+sd status @1
+```
+
+Cleanup status
+- There is currently no automatic cleanup after Podbean draft creation.
+- The app keeps the local DB state, logs, Auphonic staging files under `~/sexdrunks-automation/staging/`, and deliverable copies in `04_deliverables/`.
+- Cleanup/retention policy is still a follow-up item rather than an implemented step.
