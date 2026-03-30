@@ -203,6 +203,9 @@ def _resolve_finalize_master(loaded_config, master: Optional[Path]) -> Path:
 
     if master is not None:
         if not master.is_absolute() and master.parent == Path("."):
+            cwd_candidate = master.resolve()
+            if cwd_candidate.exists():
+                return cwd_candidate
             candidate = masters_dir / master.name
             if candidate.exists():
                 return candidate
