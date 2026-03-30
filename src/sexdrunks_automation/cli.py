@@ -704,7 +704,7 @@ def auphonic_inspect_command(
 
     resolved_production_id = production_id
     if session_uid is not None:
-        session = get_session(runtime_paths.db_file, session_uid)
+        session = _resolve_session_arg(runtime_paths, session_uid)
         if session is None:
             typer.secho(
                 f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True

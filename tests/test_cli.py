@@ -170,6 +170,50 @@ def test_status_accepts_selector_index(tmp_path: Path) -> None:
     assert "session-2" in result.stdout
 
 
+def test_auphonic_inspect_accepts_selector_index(tmp_path: Path) -> None:
+    runtime_home = tmp_path / "runtime"
+    raw_root = tmp_path / "raw"
+    config_file = tmp_path / "config.yaml"
+    _write_config(config_file, runtime_home, raw_root)
+
+    db_file = runtime_home / "state" / "state.db"
+    initialize_database(str(db_file))
+    with connect(str(db_file)) as connection:
+        connection.execute(
+            "INSERT INTO sessions (session_uid, source_path, fingerprint, status, auphonic_production_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "session-1",
+                "/tmp/source1",
+                "fingerprint-1",
+                "queued",
+                "prod-111",
+                "2024",
+                "2024",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO sessions (session_uid, source_path, fingerprint, status, auphonic_production_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "session-2",
+                "/tmp/source2",
+                "fingerprint-2",
+                "queued",
+                "prod-222",
+                "2025",
+                "2025",
+            ),
+        )
+        connection.commit()
+
+    result = runner.invoke(
+        app,
+        ["auphonic-inspect", "--session", "@1", "--config", str(config_file)],
+    )
+
+    assert result.exit_code != 0
+    assert "Session not found" not in result.stdout
+
+
 def test_status_uses_sectioned_output(tmp_path: Path) -> None:
     runtime_home = tmp_path / "runtime"
     raw_root = tmp_path / "raw"
