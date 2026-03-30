@@ -48,6 +48,13 @@ def _format_status(status: str) -> str:
     return _styled(f"{icon} {label}", fg=color, bold=True)
 
 
+def _should_show_episode_draft(session) -> bool:
+    return session.status in {
+        "ready_for_draft",
+        "draft_created",
+    }
+
+
 def _print_header(title: str) -> None:
     typer.secho(f"✦ {title}", fg=typer.colors.CYAN, bold=True)
     typer.secho("─" * (len(title) + 2), fg=typer.colors.CYAN)
@@ -382,7 +389,7 @@ def status(
                 ("draft_url", episode.draft_url or "none"),
             ],
         )
-    else:
+    elif _should_show_episode_draft(session):
         _print_section(
             "Episode Draft",
             [
