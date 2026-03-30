@@ -17,7 +17,7 @@ Current scope
 - Safer Auphonic dry runs are available via `sd auphonic-prepare <session_uid>` followed by `sd auphonic-start <session_uid>`.
 - `sd auphonic-inspect <production_id>` lets you verify attached tracks and `start_allowed` before starting.
 - `sd auphonic-sync --session <session_uid> <production_id>` can reconcile a completed remote production back into local state and download outputs.
-- `sd finalize --session <session_uid> --master <path>` attaches the edited master and generates draft episode metadata.
+- `sd finalize --session <session_uid> --master <path>` attaches the edited master and marks the session ready for AI-generated episode metadata.
 - Add `--debug` to CLI commands when you want verbose request-level logging in `logs/automation.log`.
 - `auphonic.request_timeout_seconds` controls how long large uploads can run before the client gives up.
 - If direct local uploads keep failing, the fallback plan is to upload WAVs to an external service first and point Auphonic `multi_input_files` at those remote files instead of streaming them from this machine.

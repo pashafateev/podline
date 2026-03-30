@@ -382,6 +382,23 @@ def status(
                 ("draft_url", episode.draft_url or "none"),
             ],
         )
+    else:
+        _print_section(
+            "Episode Draft",
+            [
+                (
+                    "status",
+                    _styled("AI metadata pending", fg=typer.colors.YELLOW, bold=True),
+                ),
+                (
+                    "next_step",
+                    _styled(
+                        "Generate with /episode-meta before Podbean draft",
+                        fg=typer.colors.WHITE,
+                    ),
+                ),
+            ],
+        )
 
 
 @app.command()
@@ -482,6 +499,23 @@ def finalize_command(
             [
                 ("title", episode.title or "none"),
                 ("description", episode.description or "none"),
+            ],
+        )
+    else:
+        _print_section(
+            "Episode Draft",
+            [
+                (
+                    "status",
+                    _styled("AI metadata pending", fg=typer.colors.YELLOW, bold=True),
+                ),
+                (
+                    "next_step",
+                    _styled(
+                        "Use /episode-meta on the transcript before Podbean draft",
+                        fg=typer.colors.WHITE,
+                    ),
+                ),
             ],
         )
 
