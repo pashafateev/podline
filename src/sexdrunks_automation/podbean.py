@@ -60,7 +60,7 @@ class PodbeanClient:
             data=data,
             auth=(self._config.podbean.client_id, self._config.podbean.client_secret),
         )
-        response.raise_for_status()
+        self._raise_for_status(response, "Podbean OAuth token request")
         payload = response.json()
         token = payload.get("access_token")
         if not token:
@@ -72,7 +72,7 @@ class PodbeanClient:
             f"{self._config.podbean.base_url.rstrip('/')}/episodes",
             params={"access_token": access_token, "offset": 0, "limit": limit},
         )
-        response.raise_for_status()
+        self._raise_for_status(response, "Podbean episode listing")
         payload = response.json()
         return list(payload.get("episodes") or [])
 
@@ -88,7 +88,7 @@ class PodbeanClient:
                 "content_type": content_type,
             },
         )
-        response.raise_for_status()
+        self._raise_for_status(response, "Podbean upload authorization")
         payload = response.json()
         if not payload.get("presigned_url") or not payload.get("file_key"):
             raise PodbeanError(
@@ -105,7 +105,9 @@ class PodbeanClient:
                 content=handle,
                 headers={"Content-Type": content_type},
             )
-        response.raise_for_status()
+        self._raise_for_status(
+            response, f"Podbean presigned upload for {file_path.name}"
+        )
 
     def create_draft_episode(
         self,
@@ -132,8 +134,17 @@ class PodbeanClient:
             f"{self._config.podbean.base_url.rstrip('/')}/episodes",
             data=data,
         )
-        response.raise_for_status()
+        self._raise_for_status(response, "Podbean draft creation")
         return response.json()
+
+    def _raise_for_status(self, response: httpx.Response, context: str) -> None:
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            body = exc.response.text[:500]
+            raise PodbeanError(
+                f"{context} failed with status {exc.response.status_code}: {body}"
+            ) from exc
 
 
 def create_podbean_draft(

@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import httpx
+
 from sexdrunks_automation.config import (
     AppConfig,
     AuphonicConfig,
@@ -11,6 +13,8 @@ from sexdrunks_automation.config import (
 from sexdrunks_automation.db import initialize_database
 from sexdrunks_automation.ingest import scan_and_ingest
 from sexdrunks_automation.podbean import (
+    PodbeanClient,
+    PodbeanError,
     PodbeanDraftResult,
     create_podbean_draft,
     _next_episode_number,
@@ -148,3 +152,42 @@ def test_create_podbean_draft_persists_episode_and_updates_session(
     saved = get_episode(str(db_file), session.session_uid)
     assert saved is not None
     assert saved.episode_number == 16
+
+
+def test_podbean_client_wraps_http_status_errors(tmp_path: Path) -> None:
+    config = AppConfig(
+        runtime_home=tmp_path,
+        paths=PathsConfig(
+            raw_root=tmp_path / "raw", deliverables_root=tmp_path / "deliverables"
+        ),
+        polling=PollingConfig(interval_seconds=30),
+        notifications=NotificationsConfig(enabled=False),
+        auphonic=AuphonicConfig(
+            enabled=False,
+            api_key="",
+            base_url="",
+            request_timeout_seconds=600,
+            poll_interval_seconds=1,
+            max_poll_attempts=1,
+            preset_ids={},
+        ),
+        podbean=PodbeanConfig(
+            enabled=True,
+            client_id="id",
+            client_secret="secret",
+            base_url="https://api.podbean.test/v1",
+            podcast_id="",
+        ),
+        config_file=tmp_path / "config.yaml",
+    )
+    client = PodbeanClient(config)
+    request = httpx.Request("POST", "https://api.podbean.test/v1/oauth/token")
+    response = httpx.Response(401, request=request, text="unauthorized")
+
+    try:
+        client._raise_for_status(response, "Podbean OAuth token request")
+    except PodbeanError as exc:
+        assert "status 401" in str(exc)
+        assert "unauthorized" in str(exc)
+    else:
+        raise AssertionError("Expected PodbeanError for wrapped HTTP failure")
