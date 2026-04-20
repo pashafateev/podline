@@ -188,17 +188,20 @@ class AuphonicClient:
             upload_track_ids,
         )
         result = None
+        success_attempt = None
         for attempt in range(3):
             result = subprocess.run(command, capture_output=True, text=True)
             if result.returncode == 0:
+                success_attempt = attempt + 1
                 break
 
             stderr_preview = result.stderr[:300]
             logging.getLogger("sexdrunks_automation").debug(
-                "Auphonic curl upload retry production_id=%s attempt=%s exit_code=%s stderr=%s",
+                "Auphonic curl upload transient failure production_id=%s attempt=%s exit_code=%s will_retry=%s stderr=%s",
                 production_id,
                 attempt + 1,
                 result.returncode,
+                attempt < 2,
                 stderr_preview,
             )
             if result.returncode not in {55, 56}:
@@ -211,6 +214,12 @@ class AuphonicClient:
         if result is None or result.returncode != 0:
             raise AuphonicError(
                 f"Auphonic curl upload failed with exit code {result.returncode if result else 'unknown'}: {(result.stderr[:300] if result else 'no stderr')}"
+            )
+        if success_attempt and success_attempt > 1:
+            logging.getLogger("sexdrunks_automation").debug(
+                "Auphonic curl upload recovered after retry production_id=%s success_attempt=%s",
+                production_id,
+                success_attempt,
             )
         try:
             payload = json.loads(result.stdout)
