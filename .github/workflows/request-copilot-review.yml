@@ -1,0 +1,34 @@
+name: Request Copilot review
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, reopened]
+
+jobs:
+  request-review:
+    # Skip drafts — Copilot doesn't review drafts anyway
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Request Copilot as reviewer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          # Skip if the PR author IS Copilot (avoid self-review loops)
+          AUTHOR="${{ github.event.pull_request.user.login }}"
+          if [[ "$AUTHOR" == *"copilot"* ]] || [[ "$AUTHOR" == *"[bot]"* ]]; then
+            echo "Skipping: PR author is a bot ($AUTHOR)"
+            exit 0
+          fi
+
+          # Request Copilot as reviewer; tolerate "already requested" errors
+          gh api \
+            --method POST \
+            "repos/$OWNER/$REPO/pulls/$PR/requested_reviewers" \
+            -f 'reviewers[]=github-copilot' \
+            || echo "Note: review request may have already been made"
