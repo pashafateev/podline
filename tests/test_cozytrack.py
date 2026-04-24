@@ -168,7 +168,7 @@ def test_client_list_ready_sessions_uses_api_key_header(tmp_path: Path) -> None:
     sessions = client.list_ready_sessions()
 
     assert captured["api_key"] == "test-key"
-    assert captured["url"].endswith("/api/sessions?status=ready")
+    assert captured["url"].endswith("/api/ingest/sessions?status=ready")
     assert len(sessions) == 1
     assert sessions[0].id == "sess-1"
     assert sessions[0].finalized_at == "2026-04-24T12:00:00Z"
@@ -179,7 +179,7 @@ def test_client_get_track_download_url_returns_presigned_url(tmp_path: Path) -> 
     config = _build_config(tmp_path)
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/api/tracks/track-1/download"
+        assert request.url.path == "/api/ingest/tracks/track-1/download"
         return httpx.Response(200, json={"url": "https://s3.example/presigned"})
 
     client = CozytrackClient(config)

@@ -54,23 +54,23 @@ class CozytrackClient:
         )
 
     def list_ready_sessions(self) -> List[CozytrackSession]:
-        payload = self._get_json("/api/sessions", params={"status": "ready"})
+        payload = self._get_json("/api/ingest/sessions", params={"status": "ready"})
         if not isinstance(payload, list):
             raise CozytrackError(
-                f"Cozytrack /api/sessions returned non-list payload: {payload!r:.300}"
+                f"Cozytrack /api/ingest/sessions returned non-list payload: {payload!r:.300}"
             )
         return [_parse_session(item) for item in payload]
 
     def get_session(self, session_id: str) -> CozytrackSession:
-        payload = self._get_json(f"/api/sessions/{session_id}")
+        payload = self._get_json(f"/api/ingest/sessions/{session_id}")
         if not isinstance(payload, dict):
             raise CozytrackError(
-                f"Cozytrack /api/sessions/{session_id} returned non-object payload"
+                f"Cozytrack /api/ingest/sessions/{session_id} returned non-object payload"
             )
         return _parse_session(payload)
 
     def get_track_download_url(self, track_id: str) -> str:
-        payload = self._get_json(f"/api/tracks/{track_id}/download")
+        payload = self._get_json(f"/api/ingest/tracks/{track_id}/download")
         if not isinstance(payload, dict) or "url" not in payload:
             raise CozytrackError(
                 f"Cozytrack download response for track {track_id} missing 'url'"
