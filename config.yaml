@@ -23,3 +23,8 @@ podbean:
   client_secret: ""
   base_url: https://api.podbean.com/v1
   podcast_id: ""
+cozytrack:
+  base_url: http://localhost:3000
+  api_key: ""
+  download_subdir: cozytrack
+  request_timeout_seconds: 600

@@ -14,7 +14,9 @@ from sexdrunks_automation.models import (
     UnsupportedSession,
 )
 
-TRACK_PATTERN = re.compile(r"(?P<basename>.+)_Tr(?P<track>LR|\d+)\.(?P<ext>wav|WAV)$")
+TRACK_PATTERN = re.compile(
+    r"(?:(?P<basename>.+)_)?Tr(?P<track>LR|\d+)\.(?P<ext>wav|WAV|webm|WEBM|opus|OPUS)$"
+)
 ROLE_MAP = {
     1: "host1",
     2: "host2",
@@ -72,7 +74,9 @@ def _parse_session_dir(session_dir: Path, logger: Optional[logging.Logger] = Non
             )
         if parsed_track is not None:
             track_files.append(parsed_track)
-            basenames.add(entry.name.split("_Tr", 1)[0])
+            match = TRACK_PATTERN.match(entry.name)
+            if match is not None:
+                basenames.add(match.group("basename") or "")
 
     if not track_files:
         return None
@@ -86,7 +90,7 @@ def _parse_session_dir(session_dir: Path, logger: Optional[logging.Logger] = Non
             ),
         )
 
-    source_basename = next(iter(basenames))
+    source_basename = next(iter(basenames)) or session_dir.name
     all_spoken_tracks = sorted(
         (track for track in track_files if track.track_number is not None),
         key=lambda item: item.track_number,

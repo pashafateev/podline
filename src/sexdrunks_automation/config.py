@@ -42,6 +42,14 @@ class PodbeanConfig:
 
 
 @dataclass(frozen=True)
+class CozytrackConfig:
+    base_url: str
+    api_key: str
+    download_subdir: str
+    request_timeout_seconds: int
+
+
+@dataclass(frozen=True)
 class AppConfig:
     runtime_home: Path
     paths: PathsConfig
@@ -49,6 +57,7 @@ class AppConfig:
     notifications: NotificationsConfig
     auphonic: AuphonicConfig
     podbean: PodbeanConfig
+    cozytrack: CozytrackConfig
     config_file: Path
 
 
@@ -96,7 +105,20 @@ def load_config(config_path: Path) -> AppConfig:
             base_url=str(_require_nested(data, "podbean", "base_url")),
             podcast_id=str(_require_nested(data, "podbean", "podcast_id")),
         ),
+        cozytrack=_load_cozytrack_config(data),
         config_file=config_path,
+    )
+
+
+def _load_cozytrack_config(data: Dict[str, Any]) -> CozytrackConfig:
+    section = data.get("cozytrack") or {}
+    if not isinstance(section, dict):
+        section = {}
+    return CozytrackConfig(
+        base_url=str(section.get("base_url", "http://localhost:3000")),
+        api_key=str(section.get("api_key", "")),
+        download_subdir=str(section.get("download_subdir", "cozytrack")),
+        request_timeout_seconds=int(section.get("request_timeout_seconds", 600)),
     )
 
 

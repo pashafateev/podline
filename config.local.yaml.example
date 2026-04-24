@@ -9,3 +9,8 @@ auphonic:
     speakers_2: "replace-me"
     speakers_3: "replace-me"
     speakers_4: "replace-me"
+
+cozytrack:
+  base_url: http://localhost:3000
+  api_key: "replace-me"
+  download_subdir: cozytrack

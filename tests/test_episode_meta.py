@@ -19,7 +19,17 @@ from sexdrunks_automation.config import (
     NotificationsConfig,
     AuphonicConfig,
     PodbeanConfig,
+    CozytrackConfig,
 )
+
+
+def _default_cozytrack_config() -> CozytrackConfig:
+    return CozytrackConfig(
+        base_url="http://localhost:3000",
+        api_key="",
+        download_subdir="cozytrack",
+        request_timeout_seconds=600,
+    )
 
 
 def test_parse_episode_meta_output() -> None:
@@ -104,6 +114,7 @@ def test_generate_episode_metadata_with_opencode_persists_episode(
             base_url="https://api.podbean.example/v1",
             podcast_id="",
         ),
+        cozytrack=_default_cozytrack_config(),
         config_file=tmp_path / "config.yaml",
     )
 
