@@ -14,3 +14,5 @@ cozytrack:
   base_url: http://localhost:3000
   api_key: "replace-me"
   download_subdir: cozytrack
+  # HTTP timeout (seconds) for Cozytrack API calls and S3 downloads.
+  request_timeout_seconds: 600
