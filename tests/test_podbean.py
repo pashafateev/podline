@@ -11,15 +11,6 @@ from sexdrunks_automation.config import (
     PodbeanConfig,
     PollingConfig,
 )
-
-
-def _default_cozytrack_config() -> CozytrackConfig:
-    return CozytrackConfig(
-        base_url="http://localhost:3000",
-        api_key="",
-        download_subdir="cozytrack",
-        request_timeout_seconds=600,
-    )
 from sexdrunks_automation.db import initialize_database
 from sexdrunks_automation.ingest import scan_and_ingest
 from sexdrunks_automation.podbean import (
@@ -36,6 +27,15 @@ from sexdrunks_automation.repository import (
     update_session_status,
     upsert_episode_metadata,
 )
+
+
+def _default_cozytrack_config() -> CozytrackConfig:
+    return CozytrackConfig(
+        base_url="http://localhost:3000",
+        api_key="",
+        download_subdir="cozytrack",
+        request_timeout_seconds=600,
+    )
 
 
 class FakePodbeanClient:
