@@ -5,6 +5,7 @@ import httpx
 from sexdrunks_automation.config import (
     AppConfig,
     AuphonicConfig,
+    CozytrackConfig,
     NotificationsConfig,
     PathsConfig,
     PodbeanConfig,
@@ -26,6 +27,15 @@ from sexdrunks_automation.repository import (
     update_session_status,
     upsert_episode_metadata,
 )
+
+
+def _default_cozytrack_config() -> CozytrackConfig:
+    return CozytrackConfig(
+        base_url="http://localhost:3000",
+        api_key="",
+        download_subdir="cozytrack",
+        request_timeout_seconds=600,
+    )
 
 
 class FakePodbeanClient:
@@ -136,6 +146,7 @@ def test_create_podbean_draft_persists_episode_and_updates_session(
             base_url="https://api.podbean.test/v1",
             podcast_id="",
         ),
+        cozytrack=_default_cozytrack_config(),
         config_file=tmp_path / "config.yaml",
     )
 
@@ -178,6 +189,7 @@ def test_podbean_client_wraps_http_status_errors(tmp_path: Path) -> None:
             base_url="https://api.podbean.test/v1",
             podcast_id="",
         ),
+        cozytrack=_default_cozytrack_config(),
         config_file=tmp_path / "config.yaml",
     )
     client = PodbeanClient(config)

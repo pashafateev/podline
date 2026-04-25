@@ -42,6 +42,7 @@ class SessionRecord:
     pre_edit_master_path: Optional[str]
     transcript_path: Optional[str]
     final_master_path: Optional[str]
+    cozytrack_session_id: Optional[str]
     created_at: str
     updated_at: str
 

@@ -13,6 +13,12 @@ from sexdrunks_automation.auphonic import (
     start_prepared_session_with_auphonic,
 )
 from sexdrunks_automation.config import load_config
+from sexdrunks_automation.cozytrack.client import CozytrackError
+from sexdrunks_automation.cozytrack.ingest import (
+    CozytrackIngestError,
+    ingest_session as cozytrack_ingest_session,
+    list_ready_sessions_for_ingest,
+)
 from sexdrunks_automation.db import initialize_database
 from sexdrunks_automation.episode_meta import (
     EpisodeMetaError,
@@ -923,6 +929,99 @@ def auphonic_inspect_command(
                 ]
             )
         )
+
+
+@app.command("ct-list")
+def ct_list_command(
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
+    config: Optional[Path] = typer.Option(
+        None, "--config", help="Path to config.yaml."
+    ),
+) -> None:
+    """List Cozytrack sessions ready to ingest (excludes already-ingested)."""
+    config_path = _resolve_config_path(config)
+    loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
+
+    try:
+        sessions = list_ready_sessions_for_ingest(
+            config=loaded_config,
+            db_file=runtime_paths.db_file,
+        )
+    except CozytrackError as exc:
+        logger.error("Cozytrack list failed: %s", exc)
+        typer.echo(f"Cozytrack error: {exc}")
+        raise typer.Exit(code=1)
+
+    _print_header("Cozytrack Ready Sessions")
+    if not sessions:
+        typer.secho(
+            "☷ No new Cozytrack sessions ready for ingest.",
+            fg=typer.colors.YELLOW,
+            bold=True,
+        )
+        return
+
+    typer.echo(
+        "  ".join(
+            [
+                _styled("cozytrack_id".ljust(36), fg=typer.colors.BRIGHT_BLUE, bold=True),
+                _styled("name".ljust(28), fg=typer.colors.BRIGHT_BLUE, bold=True),
+                _styled("tracks".ljust(6), fg=typer.colors.BRIGHT_BLUE, bold=True),
+                _styled("finalized_at", fg=typer.colors.BRIGHT_BLUE, bold=True),
+            ]
+        )
+    )
+    typer.echo("  ".join(["-" * 36, "-" * 28, "-" * 6, "-" * 25]))
+    for session in sessions:
+        typer.echo(
+            "  ".join(
+                [
+                    _truncate(session.id, 36).ljust(36),
+                    _truncate(session.name or "(unnamed)", 28).ljust(28),
+                    str(len(session.tracks)).ljust(6),
+                    session.finalized_at or "unknown",
+                ]
+            )
+        )
+
+
+@app.command("ct-ingest")
+def ct_ingest_command(
+    cozytrack_id: str,
+    name: Optional[str] = typer.Option(
+        None, "--name", help="Override the session name when building the folder slug."
+    ),
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
+    config: Optional[Path] = typer.Option(
+        None, "--config", help="Path to config.yaml."
+    ),
+) -> None:
+    """Download a Cozytrack session's tracks and register it in podline."""
+    config_path = _resolve_config_path(config)
+    loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
+
+    try:
+        record = cozytrack_ingest_session(
+            config=loaded_config,
+            db_file=runtime_paths.db_file,
+            cozytrack_session_id=cozytrack_id,
+            name_override=name,
+            logger=logger,
+        )
+    except (CozytrackError, CozytrackIngestError) as exc:
+        logger.error("Cozytrack ingest failed for %s: %s", cozytrack_id, exc)
+        typer.echo(f"Cozytrack error: {exc}")
+        raise typer.Exit(code=1)
+
+    _print_header("Cozytrack Ingest Complete")
+    _print_key_values(
+        [
+            ("cozytrack_id", cozytrack_id),
+            ("session_uid", record.session_uid),
+            ("source_path", record.source_path),
+            ("status", _format_status(record.status)),
+        ]
+    )
 
 
 @app.command("auphonic-sync")

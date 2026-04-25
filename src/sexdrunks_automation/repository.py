@@ -16,7 +16,7 @@ def list_sessions(db_file: str) -> List[SessionRecord]:
            recorded_at, recorded_at_source, fingerprint, status,
            failure_reason, failed_at_stage, auphonic_production_id,
            pre_edit_master_path, transcript_path, final_master_path,
-           created_at, updated_at
+           cozytrack_session_id, created_at, updated_at
     FROM sessions
     ORDER BY created_at DESC
     """
@@ -31,7 +31,7 @@ def get_session(db_file: str, session_uid: str) -> Optional[SessionRecord]:
            recorded_at, recorded_at_source, fingerprint, status,
            failure_reason, failed_at_stage, auphonic_production_id,
            pre_edit_master_path, transcript_path, final_master_path,
-           created_at, updated_at
+           cozytrack_session_id, created_at, updated_at
     FROM sessions
     WHERE session_uid = ?
     """
@@ -63,7 +63,7 @@ def get_session_by_fingerprint(
            recorded_at, recorded_at_source, fingerprint, status,
            failure_reason, failed_at_stage, auphonic_production_id,
            pre_edit_master_path, transcript_path, final_master_path,
-           created_at, updated_at
+           cozytrack_session_id, created_at, updated_at
     FROM sessions
     WHERE fingerprint = ?
     """
@@ -79,6 +79,7 @@ def create_session(
     fingerprint: str,
     candidate: ScanCandidate,
     timestamp: str,
+    cozytrack_session_id: Optional[str] = None,
 ) -> SessionRecord:
     with connect(db_file) as connection:
         connection.execute(
@@ -98,9 +99,10 @@ def create_session(
                 pre_edit_master_path,
                 transcript_path,
                 final_master_path,
+                cozytrack_session_id,
                 created_at,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_uid,
@@ -117,6 +119,7 @@ def create_session(
                 None,
                 None,
                 None,
+                cozytrack_session_id,
                 timestamp,
                 timestamp,
             ),
@@ -245,9 +248,36 @@ def _row_to_session(row) -> SessionRecord:
         pre_edit_master_path=row["pre_edit_master_path"],
         transcript_path=row["transcript_path"],
         final_master_path=row["final_master_path"],
+        cozytrack_session_id=row["cozytrack_session_id"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
+
+
+def list_cozytrack_session_ids(db_file: str) -> List[str]:
+    with connect(db_file) as connection:
+        rows = connection.execute(
+            "SELECT cozytrack_session_id FROM sessions "
+            "WHERE cozytrack_session_id IS NOT NULL"
+        ).fetchall()
+    return [row["cozytrack_session_id"] for row in rows]
+
+
+def get_session_by_cozytrack_id(
+    db_file: str, cozytrack_session_id: str
+) -> Optional[SessionRecord]:
+    query = """
+    SELECT session_uid, source_basename, source_date_folder, source_path,
+           recorded_at, recorded_at_source, fingerprint, status,
+           failure_reason, failed_at_stage, auphonic_production_id,
+           pre_edit_master_path, transcript_path, final_master_path,
+           cozytrack_session_id, created_at, updated_at
+    FROM sessions
+    WHERE cozytrack_session_id = ?
+    """
+    with connect(db_file) as connection:
+        row = connection.execute(query, (cozytrack_session_id,)).fetchone()
+    return _row_to_session(row) if row else None
 
 
 def upsert_episode_metadata(

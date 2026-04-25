@@ -17,6 +17,7 @@ from sexdrunks_automation.auphonic import (
 from sexdrunks_automation.config import (
     AppConfig,
     AuphonicConfig,
+    CozytrackConfig,
     NotificationsConfig,
     PathsConfig,
     PodbeanConfig,
@@ -309,5 +310,15 @@ def _build_config(tmp_path: Path, enabled: bool = True) -> AppConfig:
             base_url="https://api.podbean.example/v1",
             podcast_id="",
         ),
+        cozytrack=_default_cozytrack_config(),
         config_file=runtime_home / "config.yaml",
+    )
+
+
+def _default_cozytrack_config() -> CozytrackConfig:
+    return CozytrackConfig(
+        base_url="http://localhost:3000",
+        api_key="",
+        download_subdir="cozytrack",
+        request_timeout_seconds=600,
     )

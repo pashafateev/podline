@@ -8,7 +8,7 @@ Environment note
 Current scope
 - The working manual-assisted path is implemented end to end through Podbean draft creation.
 - Core inspection commands are available: `sd init`, `sd health`, `sd list`, `sd status`.
-- Ingest commands are available: `sd scan`, `sd refresh`.
+- Ingest commands are available: `sd scan`, `sd refresh`, `sd ct-list`, `sd ct-ingest`.
 - Auphonic commands are available: `sd auphonic-prepare`, `sd auphonic-start`, `sd auphonic-inspect`, `sd auphonic-sync`.
 - Post-edit commands are available: `sd finalize`, `sd episode-meta`, `sd podbean-draft`.
 - `recorded_at` is best-effort metadata. The recorder date is not always reliable, so this value may reflect filesystem timing rather than a true recording timestamp.
@@ -39,6 +39,11 @@ Local config
 - Put machine-specific paths and secrets in `config.local.yaml`, which is gitignored.
 - Start from `config.local.yaml.example` and copy it to `config.local.yaml`.
 - The recording root is `02_recordings/`, with session folders directly under it.
+- Cozytrack ingest config lives under `cozytrack.*`:
+  - `base_url` — Cozytrack API base URL (default `http://localhost:3000`).
+  - `api_key` — value sent as `X-API-Key` to Cozytrack endpoints; required.
+  - `download_subdir` — subfolder under `raw_root` where Cozytrack ingests land (default `cozytrack`).
+  - `request_timeout_seconds` — HTTP request/download timeout (default `600`).
 
 Planned next steps
 - combine the post-edit steps into a smoother single command once the pieces stay stable
@@ -48,12 +53,27 @@ Planned next steps
 
 Current workflow
 1. Scan and pick the session
+
+For Riverside (local files):
 ```bash
 cd ~/sexdrunks-automation
 source .venv/bin/activate
 sd refresh
 sd list
 ```
+
+For Cozytrack (remote stems via S3):
+```bash
+sd ct-list                    # show ready Cozytrack sessions, excludes already-ingested
+sd ct-ingest <cozytrack-id>   # download stems to 02_recordings/cozytrack/<YYYY-MM-DD>_<slug>/
+sd list
+```
+
+Notes on Cozytrack ingest:
+- Tracks land as `Tr1.webm`, `Tr2.webm`, … in the session folder, in `createdAt` order.
+- The session is registered in podline's DB tagged with `cozytrack_session_id` and is then handled by the existing pipeline (`sd auphonic-prepare` → `sd podbean-draft`).
+- Re-running `sd ct-ingest <id>` is a no-op once the session is already ingested — it just prints the existing folder path.
+- WebM/Opus stems are passed through to Auphonic as-is. Auphonic's docs list Opus/WebM as supported `multi_input_files`. If a real run rejects them in practice, the planned follow-up is an inline `ffmpeg` transcode step during ingest (see issue #19).
 
 2. Upload to Auphonic without starting yet
 ```bash
