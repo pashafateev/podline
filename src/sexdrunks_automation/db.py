@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     pre_edit_master_path TEXT,
     transcript_path TEXT,
     final_master_path TEXT,
-    cozytrack_session_id TEXT UNIQUE,
+    cozytrack_session_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -89,6 +89,9 @@ def _apply_migrations(connection: sqlite3.Connection) -> None:
         if column_name not in existing_columns:
             connection.execute(statement)
 
+    # SQLite cannot drop a column-level UNIQUE constraint without a full table
+    # rewrite; existing DBs that were initialized with the prior schema may keep
+    # the redundant constraint. Fresh DBs use only this partial index.
     connection.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_cozytrack_session_id "
         "ON sessions(cozytrack_session_id) WHERE cozytrack_session_id IS NOT NULL"
