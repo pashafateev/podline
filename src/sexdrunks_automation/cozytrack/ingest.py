@@ -8,9 +8,7 @@ from sexdrunks_automation.config import AppConfig
 from sexdrunks_automation.cozytrack.client import (
     CozytrackClient,
     CozytrackClientProtocol,
-    CozytrackError,
     CozytrackSession,
-    CozytrackTrack,
 )
 from sexdrunks_automation.fingerprint import build_fingerprint, build_session_uid
 from sexdrunks_automation.models import SessionRecord
@@ -150,7 +148,17 @@ def _build_session_folder(
 ) -> Path:
     raw_root = Path(config.paths.raw_root)
     download_subdir = config.cozytrack.download_subdir.strip()
-    base_dir = raw_root / download_subdir if download_subdir else raw_root
+    if download_subdir:
+        subdir_path = Path(download_subdir)
+        assert not subdir_path.is_absolute(), (
+            f"cozytrack.download_subdir must be relative: {download_subdir!r}"
+        )
+        assert ".." not in subdir_path.parts, (
+            f"cozytrack.download_subdir must not contain '..': {download_subdir!r}"
+        )
+        base_dir = raw_root / subdir_path
+    else:
+        base_dir = raw_root
 
     date_part = _format_date(session.finalized_at)
     slug = slugify(name_override or session.name or session.id)
