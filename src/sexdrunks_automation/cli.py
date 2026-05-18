@@ -153,7 +153,7 @@ def _print_session_table(sessions, *, full: bool = False) -> None:
 def _resolve_config_path(config: Optional[Path]) -> Path:
     if config is not None:
         return config.expanduser().resolve()
-    return (Path.home() / "sexdrunks-automation" / "config.yaml").resolve()
+    return (Path.home() / "podline" / "config.yaml").resolve()
 
 
 def _bootstrap(config_path: Path, debug: bool = False):
