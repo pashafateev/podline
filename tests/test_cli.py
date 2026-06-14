@@ -3,6 +3,7 @@ import logging
 
 from typer.testing import CliRunner
 
+from sexdrunks_automation import cli as cli_module
 from sexdrunks_automation.cli import app
 from sexdrunks_automation.db import connect, initialize_database
 from sexdrunks_automation.logging_setup import configure_logging
@@ -47,6 +48,12 @@ def _write_config(config_file: Path, runtime_home: Path, raw_root: Path) -> None
         ),
         encoding="utf-8",
     )
+
+
+def test_default_config_path_points_at_podline_checkout(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(cli_module.Path, "home", lambda: tmp_path)
+
+    assert cli_module._resolve_config_path(None) == tmp_path / "podline" / "config.yaml"
 
 
 def test_reset_db_recreates_database(tmp_path: Path) -> None:
