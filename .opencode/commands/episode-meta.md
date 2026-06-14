@@ -20,6 +20,7 @@ DESCRIPTION guidelines:
 - Tease the main topics and any funny moments
 - Can use aside punctuation when helpful
 - Reference specific things discussed (names, concepts, stories)
+- Use `J.` for the co-host's J-name in generated text; do not spell it out
 - End with something intriguing when possible
 
 Output format:

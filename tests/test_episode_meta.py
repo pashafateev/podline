@@ -34,11 +34,20 @@ def _default_cozytrack_config() -> CozytrackConfig:
 
 def test_parse_episode_meta_output() -> None:
     title, description = _parse_episode_meta_output(
-        "**Title:** Boba Boom\n\n**Description:**\nPasha and Jonathan debate boba tea and trends."
+        "**Title:** Boba Boom\n\n**Description:**\nPasha and J. debate boba tea and trends."
     )
 
     assert title == "Boba Boom"
-    assert description == "Pasha and Jonathan debate boba tea and trends."
+    assert description == "Pasha and J. debate boba tea and trends."
+
+
+def test_episode_meta_prompt_uses_j_initial_for_cohost() -> None:
+    prompt = (PROJECT_ROOT / ".opencode/commands/episode-meta.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Use `J.`" in prompt
+    assert "Jonathan" not in prompt
 
 
 def test_generate_episode_metadata_with_opencode_persists_episode(
@@ -87,7 +96,7 @@ def test_generate_episode_metadata_with_opencode_persists_episode(
         "sexdrunks_automation.episode_meta._run_opencode_episode_meta",
         lambda opencode_binary, project_dir, transcript_text: (
             seen.update({"project_dir": project_dir})
-            or "**Title:** Boba Boom\n\n**Description:**\nPasha and Jonathan debate boba tea and trends."
+            or "**Title:** Boba Boom\n\n**Description:**\nPasha and J. debate boba tea and trends."
         ),
     )
 
