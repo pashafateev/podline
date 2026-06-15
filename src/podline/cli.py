@@ -13,6 +13,7 @@ from podline.auphonic import (
     preview_prepared_session_with_auphonic,
     process_session_with_auphonic,
     reconcile_production_to_session,
+    refresh_transcript_with_auphonic,
     start_prepared_session_with_auphonic,
 )
 from podline.config import load_config
@@ -691,6 +692,55 @@ def episode_meta_command(
             ("session_uid", episode.session_uid),
             ("title", episode.title or "none"),
             ("description", episode.description or "none"),
+        ],
+    )
+
+
+@app.command("transcript-refresh")
+def transcript_refresh_command(
+    session_uid: str,
+    preset_id: Optional[str] = typer.Option(
+        None,
+        "--preset",
+        help="Auphonic preset id or name to use for final-master transcript refresh.",
+    ),
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
+    config: Optional[Path] = typer.Option(
+        None, "--config", help="Path to config.yaml."
+    ),
+) -> None:
+    """Regenerate the transcript from the finalized master."""
+    config_path = _resolve_config_path(config)
+    loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
+    session = _resolve_session_arg(runtime_paths, session_uid)
+    if session is None:
+        typer.secho(
+            f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        updated = refresh_transcript_with_auphonic(
+            config=loaded_config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=session,
+            preset_id=preset_id,
+            logger=logger,
+        )
+    except AuphonicError as exc:
+        logger.error("Transcript refresh failed for %s: %s", session.session_uid, exc)
+        typer.echo(f"Auphonic error: {exc}")
+        raise typer.Exit(code=1)
+
+    _print_header("Transcript Refreshed")
+    _print_section(
+        "Overview",
+        [
+            ("session_uid", updated.session_uid),
+            ("status", _format_status(updated.status)),
+            ("transcript_path", updated.transcript_path or "none"),
+            ("final_master_path", updated.final_master_path or "none"),
         ],
     )
 

@@ -39,6 +39,7 @@ Local config
 - Put machine-specific paths and secrets in `config.local.yaml`, which is gitignored.
 - Start from `config.local.yaml.example` and copy it to `config.local.yaml`.
 - The recording root is `02_recordings/`, with session folders directly under it.
+- `auphonic.preset_ids.transcript_refresh` should point at a single-track preset that produces WebVTT subtitles from the edited final master. You can also pass this per run with `pod transcript-refresh --preset <id-or-name>`.
 - Cozytrack ingest config lives under `cozytrack.*`:
   - `base_url` — Cozytrack API base URL (default `http://localhost:3000`).
   - `api_key` — value sent as `X-API-Key` to Cozytrack endpoints; required.
@@ -101,13 +102,22 @@ Notes:
 - `--master ep16` resolves to `04_deliverables/masters/sexdrunks_ep16_master.*` in the expected masters directory.
 - You can also pass a full path or a filename.
 
-5. Generate episode metadata using the local OpenCode command
+5. Refresh the transcript from the edited final master
+```bash
+pod transcript-refresh @1
+```
+
+Notes:
+- This creates a single-track Auphonic production from `final_master_path`, downloads the new WebVTT file, and overwrites `04_deliverables/transcripts/<session_uid>.vtt`.
+- Run this before `pod episode-meta` and `pod podbean-draft` when the cut version differs from the original Auphonic transcript.
+
+6. Generate episode metadata using the local OpenCode command
 ```bash
 pod episode-meta @1
 pod status @1
 ```
 
-6. Create the Podbean draft
+7. Create the Podbean draft
 ```bash
 pod podbean-draft @1
 pod status @1
