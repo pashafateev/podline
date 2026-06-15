@@ -20,6 +20,7 @@ from podline.auphonic import (
     preview_prepared_session_with_auphonic,
     process_session_with_auphonic,
     reconcile_production_to_session,
+    refresh_transcript_with_auphonic,
     resolve_preset_id,
     start_prepared_session_with_auphonic,
 )
@@ -35,7 +36,7 @@ from podline.config import (
 from podline.db import connect, initialize_database
 from podline.ingest import scan_and_ingest
 from podline.paths import build_runtime_paths, ensure_runtime_dirs
-from podline.repository import get_session, list_sessions
+from podline.repository import get_session, list_sessions, update_session_status
 
 
 class FakeAuphonicClient:
@@ -172,6 +173,39 @@ class FakeOffsetAuphonicClient:
             if track.get("id") == track_id:
                 track["offset"] = offset
         return {"status_code": 200, "data": {"id": track_id, "offset": offset}}
+
+
+class FakeTranscriptRefreshClient(FakeAuphonicClient):
+    def create_production(
+        self, *, session, assets, preset_id: str
+    ) -> AuphonicPreparedProduction:
+        self.created.append((session.session_uid, assets, preset_id))
+        return AuphonicPreparedProduction(
+            production_id="prod-refresh",
+            upload_track_ids=["final_master"],
+            status_page="https://example.test/status/prod-refresh",
+            edit_page="https://example.test/edit/prod-refresh",
+        )
+
+    def wait_for_production(self, production_id: str) -> AuphonicProduction:
+        assert production_id == "prod-refresh"
+        return AuphonicProduction(
+            production_id=production_id,
+            output_files=[
+                AuphonicOutputFile(
+                    kind="vtt",
+                    download_url="https://example.test/final-transcript.vtt",
+                    extension="vtt",
+                ),
+            ],
+        )
+
+    def download_file(self, url: str, destination: Path) -> None:
+        self.downloads.append((url, destination))
+        destination.write_text(
+            "WEBVTT\n\n00:00.000 --> 00:01.000\nFinal cut transcript\n",
+            encoding="utf-8",
+        )
 
 
 def test_resolve_preset_id_validates_config() -> None:
@@ -650,6 +684,64 @@ def test_reconcile_preserves_previewed_status(
     assert reloaded.status == "auphonic_previewed"
 
 
+def test_refresh_transcript_with_auphonic_uses_final_master(
+    fixture_raw_root, tmp_path: Path
+) -> None:
+    config = _build_config(tmp_path)
+    runtime_paths = build_runtime_paths(config)
+    ensure_runtime_dirs(runtime_paths)
+    initialize_database(runtime_paths.db_file)
+    scan_and_ingest(fixture_raw_root, runtime_paths.db_file)
+    session = next(
+        item
+        for item in list_sessions(runtime_paths.db_file)
+        if item.source_basename == "010124_013143"
+    )
+    old_transcript = tmp_path / "old-transcript.vtt"
+    old_transcript.write_text(
+        "WEBVTT\n\n00:00.000 --> 00:01.000\nPre-edit transcript\n",
+        encoding="utf-8",
+    )
+    pre_edit = tmp_path / "pre-edit.mp3"
+    pre_edit.write_bytes(b"pre-edit")
+    final_master = tmp_path / "final-master.mp3"
+    final_master.write_bytes(b"final-master")
+
+    update_session_status(
+        runtime_paths.db_file,
+        session_uid=session.session_uid,
+        from_state=session.status,
+        to_state="ready_for_draft",
+        timestamp="now",
+        detail="ready for transcript refresh",
+        pre_edit_master_path=str(pre_edit),
+        transcript_path=str(old_transcript),
+        final_master_path=str(final_master),
+    )
+    session = get_session(runtime_paths.db_file, session.session_uid)
+    assert session is not None
+    client = FakeTranscriptRefreshClient()
+
+    updated = refresh_transcript_with_auphonic(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        client=client,
+    )
+
+    refreshed_transcript = Path(updated.transcript_path)
+    assert updated.status == "ready_for_draft"
+    assert refreshed_transcript == config.paths.deliverables_root / "transcripts" / (
+        f"{session.session_uid}.vtt"
+    )
+    assert "Final cut transcript" in refreshed_transcript.read_text(encoding="utf-8")
+    assert client.created[0][2] == "transcript-preset"
+    assert client.created[0][1][0].local_path == str(final_master)
+    assert client.uploaded[0][2] == ["final_master"]
+    assert client.started == ["prod-refresh"]
+
+
 def _build_config(tmp_path: Path, enabled: bool = True) -> AppConfig:
     runtime_home = tmp_path / "runtime"
     deliverables_root = tmp_path / "deliverables"
@@ -669,6 +761,7 @@ def _build_config(tmp_path: Path, enabled: bool = True) -> AppConfig:
             poll_interval_seconds=0,
             max_poll_attempts=2,
             preset_ids={
+                "transcript_refresh": "transcript-preset",
                 "speakers_2": "preset-2",
                 "speakers_3": "preset-3",
                 "speakers_4": "preset-4",

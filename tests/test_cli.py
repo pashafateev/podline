@@ -845,3 +845,91 @@ def test_finalize_accepts_episode_shortcut_for_expected_master(tmp_path: Path) -
 
     assert result.exit_code == 0
     assert str(final_master) in result.stdout
+
+
+def test_transcript_refresh_accepts_selector_index(tmp_path: Path, monkeypatch) -> None:
+    runtime_home = tmp_path / "runtime"
+    raw_root = tmp_path / "raw"
+    config_file = tmp_path / "config.yaml"
+    _write_config(config_file, runtime_home, raw_root)
+
+    transcript = tmp_path / "old-transcript.vtt"
+    transcript.write_text(
+        "WEBVTT\n\n00:00.000 --> 00:01.000\nold\n", encoding="utf-8"
+    )
+    final_master = tmp_path / "final-master.mp3"
+    final_master.write_bytes(b"final")
+
+    db_file = runtime_home / "state" / "state.db"
+    initialize_database(str(db_file))
+    with connect(str(db_file)) as connection:
+        connection.execute(
+            """
+            INSERT INTO sessions (
+                session_uid, source_path, fingerprint, status, transcript_path,
+                final_master_path, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "session-refresh-1",
+                "/tmp/source1",
+                "fingerprint-refresh-1",
+                "ready_for_draft",
+                str(transcript),
+                str(final_master),
+                "2024",
+                "2024",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO sessions (
+                session_uid, source_path, fingerprint, status, transcript_path,
+                final_master_path, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "session-refresh-2",
+                "/tmp/source2",
+                "fingerprint-refresh-2",
+                "ready_for_draft",
+                str(transcript),
+                str(final_master),
+                "2025",
+                "2025",
+            ),
+        )
+        connection.commit()
+
+    seen = {}
+
+    def fake_refresh_transcript_with_auphonic(**kwargs):
+        seen["session_uid"] = kwargs["session"].session_uid
+        seen["preset_id"] = kwargs["preset_id"]
+        return kwargs["session"]
+
+    monkeypatch.setattr(
+        cli_module,
+        "refresh_transcript_with_auphonic",
+        fake_refresh_transcript_with_auphonic,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "transcript-refresh",
+            "@1",
+            "--preset",
+            "one-off-preset",
+            "--config",
+            str(config_file),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert seen == {
+        "session_uid": "session-refresh-2",
+        "preset_id": "one-off-preset",
+    }
+    assert "Transcript Refreshed" in result.stdout
+    assert "session-refresh-2" in result.stdout
