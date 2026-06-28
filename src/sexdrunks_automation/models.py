@@ -7,6 +7,7 @@ from typing import List, Optional
 class SessionStatus(str, Enum):
     QUEUED = "queued"
     AUPHONIC_PREPARED = "auphonic_prepared"
+    AUPHONIC_PREVIEWED = "auphonic_previewed"
     AUPHONIC_STARTED = "auphonic_started"
     WAITING_FOR_FINALIZE = "waiting_for_finalize"
     FINALIZE_STARTED = "finalize_started"

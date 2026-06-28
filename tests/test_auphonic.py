@@ -9,6 +9,7 @@ from sexdrunks_automation.auphonic import (
     _is_failed_status,
     inspect_production,
     prepare_session_with_auphonic,
+    preview_prepared_session_with_auphonic,
     process_session_with_auphonic,
     reconcile_production_to_session,
     resolve_preset_id,
@@ -174,7 +175,7 @@ def test_process_session_with_auphonic_downloads_outputs(
     assert reloaded.status == "waiting_for_finalize"
 
 
-def test_prepare_then_start_splits_the_auphonic_flow(
+def test_prepare_preview_then_start_splits_the_auphonic_flow(
     fixture_raw_root, tmp_path: Path
 ) -> None:
     config = _build_config(tmp_path)
@@ -188,7 +189,7 @@ def test_prepare_then_start_splits_the_auphonic_flow(
         for item in list_sessions(runtime_paths.db_file)
         if item.source_basename == "010124_013143"
     )
-    client = FakeDoneAuphonicClient()
+    client = FakeAuphonicClient()
 
     prepared = prepare_session_with_auphonic(
         config=config,
@@ -205,11 +206,144 @@ def test_prepare_then_start_splits_the_auphonic_flow(
     assert client.downloads == []
     assert client.uploaded[0][2] == ["Jonathan", "Pasha"]
 
+    preview = preview_prepared_session_with_auphonic(
+        config=config,
+        db_file=runtime_paths.db_file,
+        session=prepared,
+        client=client,
+    )
+
+    assert preview.session.status == "auphonic_previewed"
+    assert preview.details["edit_page"] == "https://example.test/edit/prod-123"
+    assert client.started == []
+
     started = start_prepared_session_with_auphonic(
         config=config,
         runtime_paths=runtime_paths,
         db_file=runtime_paths.db_file,
+        session=preview.session,
+        client=client,
+    )
+
+    assert started.status == "waiting_for_finalize"
+    assert client.started == ["prod-123"]
+    assert len(client.downloads) == 2
+
+
+def test_split_start_requires_preview_first(
+    fixture_raw_root, tmp_path: Path
+) -> None:
+    config = _build_config(tmp_path)
+    runtime_paths = build_runtime_paths(config)
+    ensure_runtime_dirs(runtime_paths)
+    initialize_database(runtime_paths.db_file)
+
+    scan_and_ingest(fixture_raw_root, runtime_paths.db_file)
+    session = next(
+        item
+        for item in list_sessions(runtime_paths.db_file)
+        if item.source_basename == "010124_013143"
+    )
+    client = FakeAuphonicClient()
+    prepared = prepare_session_with_auphonic(
+        config=config,
+        db_file=runtime_paths.db_file,
+        session=session,
+        client=client,
+    )
+
+    try:
+        start_prepared_session_with_auphonic(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=prepared,
+            client=client,
+        )
+    except AuphonicError as exc:
+        assert "auphonic_previewed" in str(exc)
+    else:
+        raise AssertionError("Expected AuphonicError before preview")
+
+    assert client.started == []
+    reloaded = get_session(runtime_paths.db_file, session.session_uid)
+    assert reloaded is not None
+    assert reloaded.status == "auphonic_prepared"
+
+
+def test_preview_prepared_session_marks_session_previewed(
+    fixture_raw_root, tmp_path: Path
+) -> None:
+    config = _build_config(tmp_path)
+    runtime_paths = build_runtime_paths(config)
+    ensure_runtime_dirs(runtime_paths)
+    initialize_database(runtime_paths.db_file)
+
+    scan_and_ingest(fixture_raw_root, runtime_paths.db_file)
+    session = next(
+        item
+        for item in list_sessions(runtime_paths.db_file)
+        if item.source_basename == "010124_013143"
+    )
+    client = FakeAuphonicClient()
+    prepared = prepare_session_with_auphonic(
+        config=config,
+        db_file=runtime_paths.db_file,
+        session=session,
+        client=client,
+    )
+
+    preview = preview_prepared_session_with_auphonic(
+        config=config,
+        db_file=runtime_paths.db_file,
         session=prepared,
+        client=client,
+    )
+
+    assert preview.session.status == "auphonic_previewed"
+    assert preview.session.auphonic_production_id == "prod-123"
+    assert preview.details["edit_page"] == "https://example.test/edit/prod-123"
+    assert client.started == []
+    assert client.downloads == []
+
+    reloaded = get_session(runtime_paths.db_file, session.session_uid)
+    assert reloaded is not None
+    assert reloaded.status == "auphonic_previewed"
+
+
+def test_start_accepts_previewed_auphonic_session(
+    fixture_raw_root, tmp_path: Path
+) -> None:
+    config = _build_config(tmp_path)
+    runtime_paths = build_runtime_paths(config)
+    ensure_runtime_dirs(runtime_paths)
+    initialize_database(runtime_paths.db_file)
+
+    scan_and_ingest(fixture_raw_root, runtime_paths.db_file)
+    session = next(
+        item
+        for item in list_sessions(runtime_paths.db_file)
+        if item.source_basename == "010124_013143"
+    )
+    client = FakeAuphonicClient()
+    prepared = prepare_session_with_auphonic(
+        config=config,
+        db_file=runtime_paths.db_file,
+        session=session,
+        client=client,
+    )
+    preview = preview_prepared_session_with_auphonic(
+        config=config,
+        db_file=runtime_paths.db_file,
+        session=prepared,
+        client=client,
+    )
+
+    started = start_prepared_session_with_auphonic(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=preview.session,
         client=client,
     )
 
@@ -277,6 +411,52 @@ def test_reconcile_done_production_downloads_outputs(
     assert updated.auphonic_production_id == "prod-123"
     assert Path(updated.pre_edit_master_path).exists()
     assert Path(updated.transcript_path).exists()
+
+
+def test_reconcile_preserves_previewed_status(
+    fixture_raw_root, tmp_path: Path
+) -> None:
+    config = _build_config(tmp_path)
+    runtime_paths = build_runtime_paths(config)
+    ensure_runtime_dirs(runtime_paths)
+    initialize_database(runtime_paths.db_file)
+    scan_and_ingest(fixture_raw_root, runtime_paths.db_file)
+    session = next(
+        item
+        for item in list_sessions(runtime_paths.db_file)
+        if item.source_basename == "010124_013143"
+    )
+    client = FakeAuphonicClient()
+    prepared = prepare_session_with_auphonic(
+        config=config,
+        db_file=runtime_paths.db_file,
+        session=session,
+        client=client,
+    )
+    preview = preview_prepared_session_with_auphonic(
+        config=config,
+        db_file=runtime_paths.db_file,
+        session=prepared,
+        client=client,
+    )
+    assert preview.session.status == "auphonic_previewed"
+
+    # Auphonic still reports start_allowed=True for a previewed-but-not-started
+    # production; sync must not downgrade the local previewed marker.
+    updated = reconcile_production_to_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=preview.session,
+        production_id="prod-123",
+        client=client,
+    )
+
+    assert updated.status == "auphonic_previewed"
+    assert client.started == []
+    reloaded = get_session(runtime_paths.db_file, session.session_uid)
+    assert reloaded is not None
+    assert reloaded.status == "auphonic_previewed"
 
 
 def _build_config(tmp_path: Path, enabled: bool = True) -> AppConfig:

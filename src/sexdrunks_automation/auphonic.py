@@ -18,6 +18,7 @@ from sexdrunks_automation.models import (
     SessionStatus,
 )
 from sexdrunks_automation.repository import (
+    get_session,
     list_assets_for_session,
     update_session_status,
 )
@@ -46,6 +47,12 @@ class AuphonicPreparedProduction:
     upload_track_ids: List[str]
     status_page: Optional[str]
     edit_page: Optional[str]
+
+
+@dataclass(frozen=True)
+class AuphonicPreview:
+    session: SessionRecord
+    details: Dict
 
 
 class AuphonicClientProtocol(Protocol):
@@ -365,6 +372,7 @@ def process_session_with_auphonic(
         session=prepared,
         client=client,
         logger=logger,
+        allow_unpreviewed=True,
     )
 
 
@@ -456,12 +464,69 @@ def prepare_session_with_auphonic(
         )
         raise
 
-    from sexdrunks_automation.repository import get_session
-
     updated = get_session(db_file, session.session_uid)
     if updated is None:
         raise AuphonicError(f"Processed session disappeared: {session.session_uid}")
     return updated
+
+
+def preview_prepared_session_with_auphonic(
+    *,
+    config: AppConfig,
+    db_file: str,
+    session: SessionRecord,
+    client: Optional[AuphonicClientProtocol] = None,
+    logger: Optional[logging.Logger] = None,
+) -> AuphonicPreview:
+    if session.status not in {
+        SessionStatus.AUPHONIC_PREPARED.value,
+        SessionStatus.AUPHONIC_PREVIEWED.value,
+    }:
+        raise AuphonicError(
+            f"Session {session.session_uid} must be auphonic_prepared before preview"
+        )
+    if not session.auphonic_production_id:
+        raise AuphonicError(
+            f"Session {session.session_uid} has no stored Auphonic production id"
+        )
+
+    production_id = session.auphonic_production_id
+    details = inspect_production(config, production_id, client=client)
+    if _is_failed_status(details):
+        raise AuphonicError(
+            f"Auphonic production {production_id} is failed and cannot be previewed"
+        )
+    if not details.get("edit_page"):
+        raise AuphonicError(
+            f"Auphonic production {production_id} did not include an edit page for preview"
+        )
+
+    updated = session
+    if session.status != SessionStatus.AUPHONIC_PREVIEWED.value:
+        update_session_status(
+            db_file,
+            session_uid=session.session_uid,
+            from_state=session.status,
+            to_state=SessionStatus.AUPHONIC_PREVIEWED.value,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            detail="opened Auphonic edit preview",
+            auphonic_production_id=production_id,
+        )
+        refreshed = get_session(db_file, session.session_uid)
+        if refreshed is None:
+            raise AuphonicError(
+                f"Previewed session disappeared: {session.session_uid}"
+            )
+        updated = refreshed
+
+    _log(
+        logger,
+        "Auphonic preview ready for %s production=%s edit_page=%s",
+        session.session_uid,
+        production_id,
+        details.get("edit_page"),
+    )
+    return AuphonicPreview(session=updated, details=details)
 
 
 def start_prepared_session_with_auphonic(
@@ -472,10 +537,14 @@ def start_prepared_session_with_auphonic(
     session: SessionRecord,
     client: Optional[AuphonicClientProtocol] = None,
     logger: Optional[logging.Logger] = None,
+    allow_unpreviewed: bool = False,
 ) -> SessionRecord:
-    if session.status != SessionStatus.AUPHONIC_PREPARED.value:
+    allowed_statuses = {SessionStatus.AUPHONIC_PREVIEWED.value}
+    if allow_unpreviewed:
+        allowed_statuses.add(SessionStatus.AUPHONIC_PREPARED.value)
+    if session.status not in allowed_statuses:
         raise AuphonicError(
-            f"Session {session.session_uid} must be auphonic_prepared before start"
+            f"Session {session.session_uid} must be auphonic_previewed before start"
         )
     if not session.auphonic_production_id:
         raise AuphonicError(
@@ -549,8 +618,6 @@ def start_prepared_session_with_auphonic(
             failed_at_stage="auphonic",
         )
         raise
-
-    from sexdrunks_automation.repository import get_session
 
     updated = get_session(db_file, session.session_uid)
     if updated is None:
@@ -790,11 +857,19 @@ def reconcile_production_to_session(
             failed_at_stage=None,
         )
     elif details.get("start_allowed"):
+        # Auphonic has no notion of "previewed"; both prepared and previewed
+        # productions report start_allowed=True. Preserve the local previewed
+        # marker so sync doesn't silently force a re-preview before start.
+        reconciled_state = (
+            SessionStatus.AUPHONIC_PREVIEWED.value
+            if current_state == SessionStatus.AUPHONIC_PREVIEWED.value
+            else SessionStatus.AUPHONIC_PREPARED.value
+        )
         update_session_status(
             db_file,
             session_uid=session.session_uid,
             from_state=current_state,
-            to_state=SessionStatus.AUPHONIC_PREPARED.value,
+            to_state=reconciled_state,
             timestamp=timestamp,
             detail="reconciled prepared Auphonic production",
             auphonic_production_id=production_id,
