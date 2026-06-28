@@ -1,7 +1,7 @@
 from typing import List, Optional
 
-from sexdrunks_automation.db import connect
-from sexdrunks_automation.models import (
+from podline.db import connect
+from podline.models import (
     AssetRecord,
     EpisodeRecord,
     ScanCandidate,

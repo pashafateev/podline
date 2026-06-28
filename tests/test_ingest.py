@@ -1,6 +1,6 @@
-from sexdrunks_automation.db import initialize_database
-from sexdrunks_automation.ingest import scan_and_ingest
-from sexdrunks_automation.repository import count_sessions, list_sessions
+from podline.db import initialize_database
+from podline.ingest import scan_and_ingest
+from podline.repository import count_sessions, list_sessions
 
 
 def test_scan_and_ingest_is_idempotent(fixture_raw_root, tmp_path) -> None:

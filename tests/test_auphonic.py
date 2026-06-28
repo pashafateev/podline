@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from sexdrunks_automation.auphonic import (
+from podline.auphonic import (
     AuphonicError,
     AuphonicOutputFile,
     AuphonicPreparedProduction,
@@ -14,7 +14,7 @@ from sexdrunks_automation.auphonic import (
     resolve_preset_id,
     start_prepared_session_with_auphonic,
 )
-from sexdrunks_automation.config import (
+from podline.config import (
     AppConfig,
     AuphonicConfig,
     CozytrackConfig,
@@ -23,10 +23,10 @@ from sexdrunks_automation.config import (
     PodbeanConfig,
     PollingConfig,
 )
-from sexdrunks_automation.db import initialize_database
-from sexdrunks_automation.ingest import scan_and_ingest
-from sexdrunks_automation.paths import build_runtime_paths, ensure_runtime_dirs
-from sexdrunks_automation.repository import get_session, list_sessions
+from podline.db import initialize_database
+from podline.ingest import scan_and_ingest
+from podline.paths import build_runtime_paths, ensure_runtime_dirs
+from podline.repository import get_session, list_sessions
 
 
 class FakeAuphonicClient:

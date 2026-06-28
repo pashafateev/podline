@@ -3,9 +3,9 @@ import re
 import shutil
 import subprocess
 
-from sexdrunks_automation.config import AppConfig
-from sexdrunks_automation.models import EpisodeRecord, SessionRecord, SessionStatus
-from sexdrunks_automation.repository import upsert_episode_metadata
+from podline.config import AppConfig
+from podline.models import EpisodeRecord, SessionRecord, SessionStatus
+from podline.repository import upsert_episode_metadata
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 

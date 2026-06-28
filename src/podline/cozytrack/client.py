@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional, Protocol
 
 import httpx
 
-from sexdrunks_automation.config import AppConfig
+from podline.config import AppConfig
 
 
 class CozytrackError(RuntimeError):

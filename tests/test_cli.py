@@ -3,9 +3,9 @@ import logging
 
 from typer.testing import CliRunner
 
-from sexdrunks_automation.cli import app
-from sexdrunks_automation.db import connect, initialize_database
-from sexdrunks_automation.logging_setup import configure_logging
+from podline.cli import app
+from podline.db import connect, initialize_database
+from podline.logging_setup import configure_logging
 
 
 runner = CliRunner()

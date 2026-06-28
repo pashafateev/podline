@@ -3,13 +3,13 @@ description: Generate podcast title and description from transcript
 ---
 Generate a podcast episode title and description based on a transcript.
 
-Reference the Sex Drunks podcast feed for style:
+Reference the podcast feed for style:
 https://feed.podbean.com/sexdrunks/feed.xml
 
 TITLE guidelines:
 - Short and punchy (2-7 words)
 - Can be a question (example: "Are we recovered or recovering?")
-- Can be descriptive (example: "A weekend with sex drunks")
+- Can be descriptive (example: "A weekend to remember")
 - Casual, conversational tone
 - Captures the main topic or theme
 - Do NOT include the episode number

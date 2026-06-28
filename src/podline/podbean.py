@@ -5,9 +5,9 @@ from typing import Dict, List, Optional, Protocol
 
 import httpx
 
-from sexdrunks_automation.config import AppConfig
-from sexdrunks_automation.models import EpisodeRecord, SessionRecord, SessionStatus
-from sexdrunks_automation.repository import get_episode, update_session_status
+from podline.config import AppConfig
+from podline.models import EpisodeRecord, SessionRecord, SessionStatus
+from podline.repository import get_episode, update_session_status
 
 
 class PodbeanError(RuntimeError):
@@ -279,7 +279,7 @@ def _persist_podbean_draft(
     podbean_post_id: str,
     draft_url: str,
 ) -> EpisodeRecord:
-    from sexdrunks_automation.db import connect
+    from podline.db import connect
 
     with connect(db_file) as connection:
         connection.execute(

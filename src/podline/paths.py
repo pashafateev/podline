@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from sexdrunks_automation.config import AppConfig
-from sexdrunks_automation.models import RuntimePaths
+from podline.config import AppConfig
+from podline.models import RuntimePaths
 
 
 def build_runtime_paths(config: AppConfig) -> RuntimePaths:

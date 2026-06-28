@@ -4,20 +4,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
-from sexdrunks_automation.config import AppConfig
-from sexdrunks_automation.cozytrack.client import (
+from podline.config import AppConfig
+from podline.cozytrack.client import (
     CozytrackClient,
     CozytrackClientProtocol,
     CozytrackSession,
 )
-from sexdrunks_automation.fingerprint import build_fingerprint, build_session_uid
-from sexdrunks_automation.models import SessionRecord
-from sexdrunks_automation.repository import (
+from podline.fingerprint import build_fingerprint, build_session_uid
+from podline.models import SessionRecord
+from podline.repository import (
     create_session,
     get_session_by_cozytrack_id,
 )
-from sexdrunks_automation.scanner import _parse_session_dir
-from sexdrunks_automation.models import ScanCandidate, UnsupportedSession
+from podline.scanner import _parse_session_dir
+from podline.models import ScanCandidate, UnsupportedSession
 
 
 class CozytrackIngestError(RuntimeError):
@@ -37,7 +37,7 @@ def list_ready_sessions_for_ingest(
 
 
 def _existing_cozytrack_ids(db_file: str) -> List[str]:
-    from sexdrunks_automation.repository import list_cozytrack_session_ids
+    from podline.repository import list_cozytrack_session_ids
 
     return list_cozytrack_session_ids(db_file)
 

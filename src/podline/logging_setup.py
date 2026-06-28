@@ -5,7 +5,7 @@ from pathlib import Path
 def configure_logging(logs_dir: str, debug: bool = False) -> logging.Logger:
     Path(logs_dir).mkdir(parents=True, exist_ok=True)
 
-    logger = logging.getLogger("sexdrunks_automation")
+    logger = logging.getLogger("podline")
     level = logging.DEBUG if debug else logging.INFO
     logger.setLevel(level)
 

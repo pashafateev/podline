@@ -1,4 +1,4 @@
-"""Sex Drunks automation package."""
+"""podline automation package."""
 
 __all__ = ["__version__"]
 

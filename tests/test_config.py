@@ -2,14 +2,14 @@ from pathlib import Path
 
 import pytest
 
-from sexdrunks_automation.config import load_config
+from podline.config import load_config
 
 
 def test_load_config(tmp_path: Path) -> None:
     config_file = tmp_path / "config.yaml"
     config_file.write_text(
         """
-runtime_home: /tmp/sexdrunks-automation
+runtime_home: /tmp/podline
 paths:
   raw_root: /tmp/raw
   deliverables_root: /tmp/deliverables
@@ -41,7 +41,7 @@ podbean:
 
     config = load_config(config_file)
 
-    assert config.runtime_home == Path("/tmp/sexdrunks-automation")
+    assert config.runtime_home == Path("/tmp/podline")
     assert config.paths.raw_root == Path("/tmp/raw")
     assert config.polling.interval_seconds == 30
     assert config.auphonic.base_url == "https://auphonic.example/api"
@@ -54,7 +54,7 @@ def test_load_config_overlays_local_config(tmp_path: Path) -> None:
     config_file = tmp_path / "config.yaml"
     config_file.write_text(
         """
-runtime_home: /tmp/sexdrunks-automation
+runtime_home: /tmp/podline
 paths:
   raw_root: /tmp/raw
   deliverables_root: /tmp/deliverables
@@ -112,7 +112,7 @@ podbean:
 
 
 _BASE_CONFIG = """
-runtime_home: /tmp/sexdrunks-automation
+runtime_home: /tmp/podline
 paths:
   raw_root: /tmp/raw
   deliverables_root: /tmp/deliverables

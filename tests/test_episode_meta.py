@@ -1,18 +1,18 @@
 from pathlib import Path
 
-from sexdrunks_automation.db import initialize_database
-from sexdrunks_automation.episode_meta import (
+from podline.db import initialize_database
+from podline.episode_meta import (
     PROJECT_ROOT,
     _parse_episode_meta_output,
     generate_episode_metadata_with_opencode,
 )
-from sexdrunks_automation.ingest import scan_and_ingest
-from sexdrunks_automation.repository import (
+from podline.ingest import scan_and_ingest
+from podline.repository import (
     get_episode,
     list_sessions,
     update_session_status,
 )
-from sexdrunks_automation.config import (
+from podline.config import (
     AppConfig,
     PathsConfig,
     PollingConfig,
@@ -88,12 +88,12 @@ def test_generate_episode_metadata_with_opencode_persists_episode(
     )
 
     monkeypatch.setattr(
-        "sexdrunks_automation.episode_meta._resolve_opencode_binary",
+        "podline.episode_meta._resolve_opencode_binary",
         lambda: "/opt/homebrew/bin/opencode",
     )
     seen = {}
     monkeypatch.setattr(
-        "sexdrunks_automation.episode_meta._run_opencode_episode_meta",
+        "podline.episode_meta._run_opencode_episode_meta",
         lambda opencode_binary, project_dir, transcript_text: (
             seen.update({"project_dir": project_dir})
             or "**Title:** Boba Boom\n\n**Description:**\nPasha and J. debate boba tea and trends."

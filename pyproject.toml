@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sexdrunks-automation"
+name = "podline"
 version = "0.1.0"
-description = "Local automation for the Sex Drunks podcast workflow"
+description = "Local automation for the podline podcast workflow"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
@@ -20,7 +20,7 @@ dev = [
 ]
 
 [project.scripts]
-sd = "sexdrunks_automation.cli:app"
+sd = "podline.cli:app"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

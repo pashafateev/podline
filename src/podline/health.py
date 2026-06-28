@@ -3,9 +3,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from sexdrunks_automation.config import AppConfig
-from sexdrunks_automation.models import HealthSnapshot, RuntimePaths, SessionStatus
-from sexdrunks_automation.repository import count_sessions, count_sessions_by_status
+from podline.config import AppConfig
+from podline.models import HealthSnapshot, RuntimePaths, SessionStatus
+from podline.repository import count_sessions, count_sessions_by_status
 
 
 def write_health_snapshot(

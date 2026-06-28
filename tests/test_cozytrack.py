@@ -4,7 +4,7 @@ from typing import List, Optional
 import httpx
 import pytest
 
-from sexdrunks_automation.config import (
+from podline.config import (
     AppConfig,
     AuphonicConfig,
     CozytrackConfig,
@@ -13,24 +13,24 @@ from sexdrunks_automation.config import (
     PodbeanConfig,
     PollingConfig,
 )
-from sexdrunks_automation.cozytrack.client import (
+from podline.cozytrack.client import (
     CozytrackClient,
     CozytrackError,
     CozytrackSession,
     CozytrackTrack,
 )
-from sexdrunks_automation.cozytrack.ingest import (
+from podline.cozytrack.ingest import (
     CozytrackIngestError,
     ingest_session,
     list_ready_sessions_for_ingest,
     slugify,
 )
-from sexdrunks_automation.db import initialize_database
-from sexdrunks_automation.repository import (
+from podline.db import initialize_database
+from podline.repository import (
     get_session_by_cozytrack_id,
     list_cozytrack_session_ids,
 )
-from sexdrunks_automation.scanner import scan_raw_sessions
+from podline.scanner import scan_raw_sessions
 
 
 def _build_config(tmp_path: Path, *, api_key: str = "test-key") -> AppConfig:

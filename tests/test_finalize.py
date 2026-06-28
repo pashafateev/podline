@@ -1,13 +1,13 @@
 from pathlib import Path
 
-from sexdrunks_automation.db import initialize_database
-from sexdrunks_automation.finalize import (
+from podline.db import initialize_database
+from podline.finalize import (
     FinalizeError,
     finalize_session,
     get_episode_metadata,
 )
-from sexdrunks_automation.ingest import scan_and_ingest
-from sexdrunks_automation.repository import (
+from podline.ingest import scan_and_ingest
+from podline.repository import (
     get_session,
     list_sessions,
     update_session_status,

@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from pathlib import Path
-from sexdrunks_automation.models import SessionRecord, SessionStatus
-from sexdrunks_automation.repository import (
+from podline.models import SessionRecord, SessionStatus
+from podline.repository import (
     get_episode,
     get_session,
     update_session_status,

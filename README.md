@@ -1,6 +1,6 @@
-# Sex Drunks Automation
+# podline Automation
 
-Local automation project for the Sex Drunks production workflow.
+Local automation project for the podline production workflow.
 
 Environment note
 - This scaffold currently targets Python 3.9+ so it runs on the machine as-is.
@@ -18,7 +18,7 @@ Current scope
 - If direct local uploads keep failing, the fallback plan is to upload WAVs to an external service first and point Auphonic `multi_input_files` at those remote files instead of streaming them from this machine.
 
 Project layout
-- `src/sexdrunks_automation/`: application code
+- `src/podline/`: application code
 - `tests/`: unit tests
 - `state/`: SQLite DB and health file
 - `logs/`: local logs
@@ -26,7 +26,7 @@ Project layout
 
 Getting started
 ```bash
-cd ~/sexdrunks-automation
+cd ~/podline
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .[dev]
@@ -56,7 +56,7 @@ Current workflow
 
 For Riverside (local files):
 ```bash
-cd ~/sexdrunks-automation
+cd ~/podline
 source .venv/bin/activate
 sd refresh
 sd list
@@ -110,5 +110,5 @@ sd status @1
 
 Cleanup status
 - There is currently no automatic cleanup after Podbean draft creation.
-- The app keeps the local DB state, logs, Auphonic staging files under `~/sexdrunks-automation/staging/`, and deliverable copies in `04_deliverables/`.
+- The app keeps the local DB state, logs, Auphonic staging files under `~/podline/staging/`, and deliverable copies in `04_deliverables/`.
 - Cleanup/retention policy is still a follow-up item rather than an implemented step.
