@@ -506,7 +506,7 @@ def status(
                 (
                     "next_step",
                     _styled(
-                        "Run sd episode-meta @n before Podbean draft",
+                        "Run pod episode-meta @n before Podbean draft",
                         fg=typer.colors.WHITE,
                     ),
                 ),
@@ -628,7 +628,7 @@ def finalize_command(
                 (
                     "next_step",
                     _styled(
-                        "Run sd episode-meta @n before Podbean draft",
+                        "Run pod episode-meta @n before Podbean draft",
                         fg=typer.colors.WHITE,
                     ),
                 ),

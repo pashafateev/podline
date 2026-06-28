@@ -169,7 +169,7 @@ def create_podbean_draft(
     episode = get_episode(db_file, session.session_uid)
     if episode is None or not episode.title or not episode.description:
         raise PodbeanError(
-            f"Session {session.session_uid} does not have saved episode metadata. Run sd episode-meta first."
+            f"Session {session.session_uid} does not have saved episode metadata. Run pod episode-meta first."
         )
 
     client = client or PodbeanClient(config)

@@ -20,7 +20,7 @@ dev = [
 ]
 
 [project.scripts]
-sd = "podline.cli:app"
+pod = "podline.cli:app"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
