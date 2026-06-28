@@ -413,6 +413,52 @@ def test_reconcile_done_production_downloads_outputs(
     assert Path(updated.transcript_path).exists()
 
 
+def test_reconcile_preserves_previewed_status(
+    fixture_raw_root, tmp_path: Path
+) -> None:
+    config = _build_config(tmp_path)
+    runtime_paths = build_runtime_paths(config)
+    ensure_runtime_dirs(runtime_paths)
+    initialize_database(runtime_paths.db_file)
+    scan_and_ingest(fixture_raw_root, runtime_paths.db_file)
+    session = next(
+        item
+        for item in list_sessions(runtime_paths.db_file)
+        if item.source_basename == "010124_013143"
+    )
+    client = FakeAuphonicClient()
+    prepared = prepare_session_with_auphonic(
+        config=config,
+        db_file=runtime_paths.db_file,
+        session=session,
+        client=client,
+    )
+    preview = preview_prepared_session_with_auphonic(
+        config=config,
+        db_file=runtime_paths.db_file,
+        session=prepared,
+        client=client,
+    )
+    assert preview.session.status == "auphonic_previewed"
+
+    # Auphonic still reports start_allowed=True for a previewed-but-not-started
+    # production; sync must not downgrade the local previewed marker.
+    updated = reconcile_production_to_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=preview.session,
+        production_id="prod-123",
+        client=client,
+    )
+
+    assert updated.status == "auphonic_previewed"
+    assert client.started == []
+    reloaded = get_session(runtime_paths.db_file, session.session_uid)
+    assert reloaded is not None
+    assert reloaded.status == "auphonic_previewed"
+
+
 def _build_config(tmp_path: Path, enabled: bool = True) -> AppConfig:
     runtime_home = tmp_path / "runtime"
     deliverables_root = tmp_path / "deliverables"

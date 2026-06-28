@@ -857,11 +857,19 @@ def reconcile_production_to_session(
             failed_at_stage=None,
         )
     elif details.get("start_allowed"):
+        # Auphonic has no notion of "previewed"; both prepared and previewed
+        # productions report start_allowed=True. Preserve the local previewed
+        # marker so sync doesn't silently force a re-preview before start.
+        reconciled_state = (
+            SessionStatus.AUPHONIC_PREVIEWED.value
+            if current_state == SessionStatus.AUPHONIC_PREVIEWED.value
+            else SessionStatus.AUPHONIC_PREPARED.value
+        )
         update_session_status(
             db_file,
             session_uid=session.session_uid,
             from_state=current_state,
-            to_state=SessionStatus.AUPHONIC_PREPARED.value,
+            to_state=reconciled_state,
             timestamp=timestamp,
             detail="reconciled prepared Auphonic production",
             auphonic_production_id=production_id,
