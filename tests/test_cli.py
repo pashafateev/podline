@@ -1,5 +1,7 @@
 from pathlib import Path
+from dataclasses import replace
 import logging
+from types import SimpleNamespace
 
 from typer.testing import CliRunner
 
@@ -221,6 +223,78 @@ def test_auphonic_inspect_accepts_selector_index(tmp_path: Path) -> None:
 
     assert result.exit_code != 0
     assert "Session not found" not in result.stdout
+
+
+def test_auphonic_preview_accepts_selector_index_without_opening_browser(
+    monkeypatch, tmp_path: Path
+) -> None:
+    runtime_home = tmp_path / "runtime"
+    raw_root = tmp_path / "raw"
+    config_file = tmp_path / "config.yaml"
+    _write_config(config_file, runtime_home, raw_root)
+
+    db_file = runtime_home / "state" / "state.db"
+    initialize_database(str(db_file))
+    with connect(str(db_file)) as connection:
+        connection.execute(
+            "INSERT INTO sessions (session_uid, source_path, fingerprint, status, auphonic_production_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "session-1",
+                "/tmp/source1",
+                "fingerprint-1",
+                "auphonic_prepared",
+                "prod-111",
+                "2024",
+                "2024",
+            ),
+        )
+        connection.commit()
+
+    browser_calls = []
+
+    def fake_open(url: str) -> bool:
+        browser_calls.append(url)
+        return True
+
+    def fake_preview(*, config, db_file, session, logger=None):
+        return SimpleNamespace(
+            session=replace(session, status="auphonic_previewed"),
+            details={
+                "edit_page": "https://example.test/edit/prod-111",
+                "status_page": "https://example.test/status/prod-111",
+                "multi_input_files": [
+                    {
+                        "id": "Jonathan",
+                        "type": "multitrack",
+                        "input_file": "Tr1.webm",
+                        "offset": 0,
+                    },
+                    {
+                        "id": "Pasha",
+                        "type": "multitrack",
+                        "input_file": "Tr2.webm",
+                        "offset": 1.612,
+                    },
+                ],
+            },
+        )
+
+    monkeypatch.setattr(cli_module.webbrowser, "open", fake_open)
+    monkeypatch.setattr(
+        cli_module, "preview_prepared_session_with_auphonic", fake_preview
+    )
+
+    result = runner.invoke(
+        app,
+        ["auphonic-preview", "@1", "--no-open", "--config", str(config_file)],
+    )
+
+    assert result.exit_code == 0
+    assert "Auphonic Preview" in result.stdout
+    assert "https://example.test/edit/prod-111" in result.stdout
+    assert "offset=1.612" in result.stdout
+    assert "sd auphonic-start @1" in result.stdout
+    assert browser_calls == []
 
 
 def test_status_uses_sectioned_output(tmp_path: Path) -> None:

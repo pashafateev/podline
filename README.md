@@ -78,10 +78,11 @@ Notes on Cozytrack ingest:
 2. Upload to Auphonic without starting yet
 ```bash
 sd auphonic-prepare @1 --debug
+sd auphonic-preview @1
 sd auphonic-inspect --session @1
 ```
 
-3. Start Auphonic and let it finish
+3. Start Auphonic after previewing the edit page
 ```bash
 sd auphonic-start @1 --debug
 sd status @1
