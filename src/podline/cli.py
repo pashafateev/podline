@@ -1,6 +1,7 @@
 from pathlib import Path
 import re
 from typing import Optional
+import webbrowser
 
 import typer
 
@@ -8,6 +9,7 @@ from podline.auphonic import (
     AuphonicError,
     inspect_production,
     prepare_session_with_auphonic,
+    preview_prepared_session_with_auphonic,
     process_session_with_auphonic,
     reconcile_production_to_session,
     start_prepared_session_with_auphonic,
@@ -41,6 +43,7 @@ app = typer.Typer(help="podline automation CLI.")
 STATUS_STYLES = {
     "queued": ("Queued", typer.colors.YELLOW, "○"),
     "auphonic_prepared": ("Prepared", typer.colors.BLUE, "↑"),
+    "auphonic_previewed": ("Previewed", typer.colors.BLUE, "◉"),
     "auphonic_started": ("Running", typer.colors.BLUE, "◌"),
     "waiting_for_finalize": ("Ready To Finalize", typer.colors.GREEN, "✓"),
     "ready_for_draft": ("Ready For Draft", typer.colors.GREEN, "✓"),
@@ -803,8 +806,68 @@ def auphonic_prepare_command(
             ("status", _format_status(updated.status)),
             ("auphonic_production_id", updated.auphonic_production_id or "none"),
             ("auphonic_started", "no"),
+            ("next", f"pod auphonic-preview {session_uid}"),
         ]
     )
+
+
+@app.command("auphonic-preview")
+def auphonic_preview_command(
+    session_uid: str,
+    open_browser: bool = typer.Option(
+        True,
+        "--open/--no-open",
+        help="Open the Auphonic edit page in the default browser.",
+    ),
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
+    config: Optional[Path] = typer.Option(
+        None, "--config", help="Path to config.yaml."
+    ),
+) -> None:
+    """Open the prepared Auphonic production for preview before starting."""
+    config_path = _resolve_config_path(config)
+    loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
+    session = _resolve_session_arg(runtime_paths, session_uid)
+    if session is None:
+        typer.secho(
+            f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        preview = preview_prepared_session_with_auphonic(
+            config=loaded_config,
+            db_file=runtime_paths.db_file,
+            session=session,
+            logger=logger,
+        )
+    except AuphonicError as exc:
+        logger.error("Auphonic preview failed for %s: %s", session_uid, exc)
+        typer.echo(f"Auphonic error: {exc}")
+        raise typer.Exit(code=1)
+
+    details = preview.details
+    edit_page = details["edit_page"] or ""
+    browser_opened = False
+    if open_browser and edit_page:
+        browser_opened = webbrowser.open(edit_page)
+
+    _print_header("Auphonic Preview")
+    _print_key_values(
+        [
+            ("session_uid", preview.session.session_uid),
+            ("status", _format_status(preview.session.status)),
+            (
+                "auphonic_production_id",
+                preview.session.auphonic_production_id or "none",
+            ),
+            ("edit_page", edit_page or "none"),
+            ("status_page", details["status_page"] or "none"),
+            ("browser_opened", "yes" if browser_opened else "no"),
+            ("next", f"pod auphonic-start {session_uid}"),
+        ]
+    )
+    _print_auphonic_tracks(details["multi_input_files"])
 
 
 @app.command("auphonic-start")
@@ -917,15 +980,22 @@ def auphonic_inspect_command(
         ],
     )
     if details["multi_input_files"]:
-        typer.echo()
-        _print_header("Tracks")
-    for track in details["multi_input_files"]:
+        _print_auphonic_tracks(details["multi_input_files"])
+
+
+def _print_auphonic_tracks(tracks) -> None:
+    if not tracks:
+        return
+    typer.echo()
+    _print_header("Tracks")
+    for track in tracks:
         typer.echo(
             "  ".join(
                 [
                     f"id={track.get('id', '')}",
                     f"type={track.get('type', '')}",
                     f"input_file={track.get('input_file', '') or 'none'}",
+                    f"offset={track.get('offset', 0)}",
                 ]
             )
         )
