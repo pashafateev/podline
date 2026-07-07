@@ -6,9 +6,15 @@ from types import SimpleNamespace
 from typer.testing import CliRunner
 
 from podline import cli as cli_module
+from podline.auphonic import (
+    AuphonicAssetDuration,
+    AuphonicOffsetPlan,
+    AuphonicOffsetResult,
+)
 from podline.cli import app
 from podline.db import connect, initialize_database
 from podline.logging_setup import configure_logging
+from podline.models import AssetRecord
 
 
 runner = CliRunner()
@@ -225,6 +231,46 @@ def test_auphonic_inspect_accepts_selector_index(tmp_path: Path) -> None:
     assert "Session not found" not in result.stdout
 
 
+def test_auphonic_inspect_prints_track_offsets(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runtime_home = tmp_path / "runtime"
+    raw_root = tmp_path / "raw"
+    config_file = tmp_path / "config.yaml"
+    _write_config(config_file, runtime_home, raw_root)
+
+    def fake_inspect(config, production_id):
+        return {
+            "production_id": production_id,
+            "status": 10,
+            "status_string": "Production Not Started Yet",
+            "start_allowed": True,
+            "change_allowed": True,
+            "edit_page": "https://example.test/edit/prod-123",
+            "status_page": "https://example.test/status/prod-123",
+            "error_message": "",
+            "warning_message": "",
+            "multi_input_files": [
+                {
+                    "id": "Pasha",
+                    "type": "multitrack",
+                    "input_file": "Tr2.webm",
+                    "offset": 1.801,
+                }
+            ],
+            "output_files": [],
+        }
+
+    monkeypatch.setattr(cli_module, "inspect_production", fake_inspect)
+
+    result = runner.invoke(
+        app, ["auphonic-inspect", "prod-123", "--config", str(config_file)]
+    )
+
+    assert result.exit_code == 0
+    assert "offset=1.801" in result.stdout
+
+
 def test_auphonic_preview_accepts_selector_index_without_opening_browser(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -295,6 +341,81 @@ def test_auphonic_preview_accepts_selector_index_without_opening_browser(
     assert "offset=1.612" in result.stdout
     assert "pod auphonic-start @1" in result.stdout
     assert browser_calls == []
+
+
+def test_auphonic_offset_command_prints_dry_run_plan(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runtime_home = tmp_path / "runtime"
+    raw_root = tmp_path / "raw"
+    config_file = tmp_path / "config.yaml"
+    _write_config(config_file, runtime_home, raw_root)
+
+    db_file = runtime_home / "state" / "state.db"
+    initialize_database(str(db_file))
+    with connect(str(db_file)) as connection:
+        connection.execute(
+            "INSERT INTO sessions (session_uid, source_path, fingerprint, status, auphonic_production_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "session-1",
+                "/tmp/source1",
+                "fingerprint-1",
+                "queued",
+                "prod-111",
+                "2024",
+                "2024",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO sessions (session_uid, source_path, fingerprint, status, auphonic_production_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "session-2",
+                "/tmp/source2",
+                "fingerprint-2",
+                "queued",
+                "prod-222",
+                "2025",
+                "2025",
+            ),
+        )
+        connection.commit()
+
+    calls = []
+    tr1 = AssetRecord("host1", "Tr1.webm", 9, "/tmp/source2/Tr1.webm")
+    tr2 = AssetRecord("host2", "Tr2.webm", 9, "/tmp/source2/Tr2.webm")
+
+    def fake_offset(*, config, db_file, session, apply):
+        calls.append((session.session_uid, apply))
+        return AuphonicOffsetResult(
+            plan=AuphonicOffsetPlan(
+                production_id="prod-222",
+                asset_durations=[
+                    AuphonicAssetDuration(tr1, 101.234),
+                    AuphonicAssetDuration(tr2, 99.433),
+                ],
+                target_asset=tr2,
+                longer_asset=tr1,
+                target_track_id="Pasha",
+                target_input_file="Tr2.webm",
+                offset_seconds=1.801,
+            ),
+            applied=False,
+            track_state=None,
+        )
+
+    monkeypatch.setattr(cli_module, "offset_session_auphonic_production", fake_offset)
+
+    result = runner.invoke(
+        app, ["auphonic-offset", "@1", "--config", str(config_file)]
+    )
+
+    assert result.exit_code == 0
+    assert calls == [("session-2", False)]
+    assert "Auphonic Offset Plan" in result.stdout
+    assert "Tr2.webm" in result.stdout
+    assert "offset_seconds" in result.stdout
+    assert "1.801" in result.stdout
+    assert "applied" in result.stdout
 
 
 def test_status_uses_sectioned_output(tmp_path: Path) -> None:

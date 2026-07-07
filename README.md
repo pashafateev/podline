@@ -9,7 +9,7 @@ Current scope
 - The working manual-assisted path is implemented end to end through Podbean draft creation.
 - Core inspection commands are available: `pod init`, `pod health`, `pod list`, `pod status`.
 - Ingest commands are available: `pod scan`, `pod refresh`, `pod ct-list`, `pod ct-ingest`.
-- Auphonic commands are available: `pod auphonic-prepare`, `pod auphonic-start`, `pod auphonic-inspect`, `pod auphonic-sync`.
+- Auphonic commands are available: `pod auphonic-prepare`, `pod auphonic-preview`, `pod auphonic-offset`, `pod auphonic-start`, `pod auphonic-inspect`, `pod auphonic-sync`.
 - Post-edit commands are available: `pod finalize`, `pod episode-meta`, `pod podbean-draft`.
 - `recorded_at` is best-effort metadata. The recorder date is not always reliable, so this value may reflect filesystem timing rather than a true recording timestamp.
 - Silent extra spoken tracks are ignored during scan, so sessions with empty `Tr3`/`Tr4` files can still classify correctly as 2-speaker sessions.
@@ -78,9 +78,13 @@ Notes on Cozytrack ingest:
 2. Upload to Auphonic without starting yet
 ```bash
 pod auphonic-prepare @1 --debug
+pod auphonic-offset @1          # dry run; computes duration delta from registered assets
+pod auphonic-offset @1 --apply  # apply the positive offset to the shorter Auphonic track
 pod auphonic-preview @1
 pod auphonic-inspect --session @1
 ```
+
+For two-track Cozytrack sessions, run `pod auphonic-offset` before preview/start. Browser WebM files may not report format duration, so this command derives each track duration from audio packet timing and updates the prepared Auphonic production with a per-track `offset`; it does not start processing.
 
 3. Start Auphonic after previewing the edit page
 ```bash
