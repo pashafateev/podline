@@ -1,12 +1,14 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import json
 import logging
 from pathlib import Path
 import shutil
 import subprocess
 from time import sleep
-from typing import Dict, Iterable, List, Optional, Protocol
+from typing import Callable, Dict, Iterable, List, Optional, Protocol
+from urllib.parse import quote, unquote, urlparse
 
 import httpx
 
@@ -55,6 +57,33 @@ class AuphonicPreview:
     details: Dict
 
 
+@dataclass(frozen=True)
+class AuphonicAssetDuration:
+    asset: AssetRecord
+    duration_seconds: float
+
+
+@dataclass(frozen=True)
+class AuphonicOffsetPlan:
+    production_id: str
+    asset_durations: List[AuphonicAssetDuration]
+    target_asset: AssetRecord
+    longer_asset: AssetRecord
+    target_track_id: str
+    target_input_file: str
+    offset_seconds: float
+
+
+@dataclass(frozen=True)
+class AuphonicOffsetResult:
+    plan: AuphonicOffsetPlan
+    applied: bool
+    track_state: Optional[Dict]
+
+
+DurationProbe = Callable[[Path], float]
+
+
 class AuphonicClientProtocol(Protocol):
     def create_production(
         self, *, session: SessionRecord, assets: List[AssetRecord], preset_id: str
@@ -71,6 +100,10 @@ class AuphonicClientProtocol(Protocol):
     def download_file(self, url: str, destination: Path) -> None: ...
 
     def get_production(self, production_id: str) -> Dict: ...
+
+    def update_multi_input_file_offset(
+        self, production_id: str, track_id: str, offset: float
+    ) -> Dict: ...
 
 
 class AuphonicClient:
@@ -295,6 +328,23 @@ class AuphonicClient:
             f"/production/{production_id}.json",
         )
         return response.json()
+
+    def update_multi_input_file_offset(
+        self, production_id: str, track_id: str, offset: float
+    ) -> Dict:
+        escaped_track_id = quote(str(track_id), safe="")
+        response = self._request_with_retries(
+            "POST",
+            f"/production/{production_id}/multi_input_files/{escaped_track_id}.json",
+            json={"type": "multitrack", "offset": offset},
+            headers={"Content-Type": "application/json"},
+        )
+        payload = response.json()
+        if payload.get("status_code", response.status_code) >= 400:
+            raise AuphonicError(
+                f"Auphonic offset update failed with status {payload.get('status_code')}: {payload.get('error_message') or payload.get('form_errors') or payload}"
+            )
+        return payload
 
     def _request_with_retries(self, method: str, url: str, **kwargs) -> httpx.Response:
         last_error: Optional[Exception] = None
@@ -807,6 +857,137 @@ def inspect_production(
     }
 
 
+def probe_audio_duration_from_packets(path: Path) -> float:
+    ffprobe_path = shutil.which("ffprobe")
+    if ffprobe_path is None:
+        raise AuphonicError("ffprobe is required to compute audio duration")
+    if not path.exists():
+        raise AuphonicError(f"Audio asset does not exist: {path}")
+
+    command = [
+        ffprobe_path,
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_packets",
+        "-show_entries",
+        "packet=pts_time,duration_time",
+        "-of",
+        "json",
+        str(path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr_preview = result.stderr[:300] or result.stdout[:300]
+        raise AuphonicError(
+            f"ffprobe failed while reading audio packets for {path}: {stderr_preview}"
+        )
+
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise AuphonicError(
+            f"ffprobe returned non-JSON packet output for {path}: {result.stdout[:300]}"
+        ) from exc
+
+    return _duration_from_ffprobe_packet_data(payload, source=path)
+
+
+def plan_session_auphonic_offset(
+    *,
+    config: AppConfig,
+    db_file: str,
+    session: SessionRecord,
+    client: Optional[AuphonicClientProtocol] = None,
+    duration_probe: DurationProbe = probe_audio_duration_from_packets,
+) -> AuphonicOffsetPlan:
+    assets = list_assets_for_session(db_file, session.session_uid)
+    if len(assets) != 2:
+        raise AuphonicError(
+            f"Session {session.session_uid} must have exactly 2 audio assets to compute an Auphonic offset; found {len(assets)}"
+        )
+    if not session.auphonic_production_id:
+        raise AuphonicError(
+            f"Session {session.session_uid} has no stored Auphonic production id"
+        )
+
+    asset_durations = [
+        AuphonicAssetDuration(
+            asset=asset,
+            duration_seconds=_probe_asset_duration(asset, duration_probe),
+        )
+        for asset in assets
+    ]
+    sorted_durations = sorted(asset_durations, key=lambda item: item.duration_seconds)
+    shorter = sorted_durations[0]
+    longer = sorted_durations[-1]
+    offset_decimal = Decimal(str(longer.duration_seconds)) - Decimal(
+        str(shorter.duration_seconds)
+    )
+    if offset_decimal <= 0:
+        raise AuphonicError(
+            f"Session {session.session_uid} assets have equal durations; no positive Auphonic offset can be computed"
+        )
+
+    client = client or AuphonicClient(config)
+    details = inspect_production(config, session.auphonic_production_id, client=client)
+    _validate_offset_production_state(details)
+    target_track = _find_multi_input_track_for_asset(
+        details.get("multi_input_files") or [], shorter.asset
+    )
+    target_track_id = str(target_track.get("id") or "")
+    if not target_track_id:
+        raise AuphonicError(
+            f"Matched Auphonic track for {shorter.asset.filename} has no id; inspected tracks: {_format_track_choices(details.get('multi_input_files') or [])}"
+        )
+
+    return AuphonicOffsetPlan(
+        production_id=session.auphonic_production_id,
+        asset_durations=asset_durations,
+        target_asset=shorter.asset,
+        longer_asset=longer.asset,
+        target_track_id=target_track_id,
+        target_input_file=str(target_track.get("input_file") or ""),
+        offset_seconds=float(offset_decimal),
+    )
+
+
+def offset_session_auphonic_production(
+    *,
+    config: AppConfig,
+    db_file: str,
+    session: SessionRecord,
+    apply: bool = False,
+    client: Optional[AuphonicClientProtocol] = None,
+    duration_probe: DurationProbe = probe_audio_duration_from_packets,
+) -> AuphonicOffsetResult:
+    client = client or AuphonicClient(config)
+    plan = plan_session_auphonic_offset(
+        config=config,
+        db_file=db_file,
+        session=session,
+        client=client,
+        duration_probe=duration_probe,
+    )
+
+    if not apply:
+        return AuphonicOffsetResult(plan=plan, applied=False, track_state=None)
+
+    client.update_multi_input_file_offset(
+        plan.production_id, plan.target_track_id, plan.offset_seconds
+    )
+    details = inspect_production(config, plan.production_id, client=client)
+    track_state = _find_multi_input_track_by_id(
+        details.get("multi_input_files") or [], plan.target_track_id
+    )
+    if track_state is None:
+        raise AuphonicError(
+            f"Auphonic offset was applied but updated track {plan.target_track_id} was not present on re-inspection"
+        )
+    return AuphonicOffsetResult(plan=plan, applied=True, track_state=track_state)
+
+
 def reconcile_production_to_session(
     *,
     config: AppConfig,
@@ -907,6 +1088,139 @@ def reconcile_production_to_session(
     if updated is None:
         raise AuphonicError(f"Reconciled session disappeared: {session.session_uid}")
     return updated
+
+
+def _duration_from_ffprobe_packet_data(payload: Dict, *, source: Path) -> float:
+    packets = payload.get("packets") if isinstance(payload, dict) else None
+    if not isinstance(packets, list) or not packets:
+        raise AuphonicError(f"ffprobe found no audio packets for {source}")
+
+    last_packet = packets[-1]
+    if not isinstance(last_packet, dict):
+        raise AuphonicError(f"ffprobe last packet was malformed for {source}")
+
+    pts_time = _parse_packet_time(last_packet.get("pts_time"))
+    duration_time = _parse_packet_time(last_packet.get("duration_time"))
+    if pts_time is None or duration_time is None:
+        raise AuphonicError(
+            f"ffprobe could not compute duration for {source}: last audio packet is missing pts_time or duration_time"
+        )
+
+    duration = pts_time + duration_time
+    if duration <= 0:
+        raise AuphonicError(
+            f"ffprobe computed a non-positive duration for {source}: {duration}"
+        )
+    return float(duration)
+
+
+def _parse_packet_time(value) -> Optional[Decimal]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.upper() == "N/A":
+        return None
+    try:
+        parsed = Decimal(text)
+    except (InvalidOperation, ValueError):
+        return None
+    if not parsed.is_finite():
+        return None
+    return parsed
+
+
+def _probe_asset_duration(asset: AssetRecord, duration_probe: DurationProbe) -> float:
+    path = Path(asset.local_path)
+    try:
+        duration = duration_probe(path)
+    except AuphonicError:
+        raise
+    except Exception as exc:
+        raise AuphonicError(f"Could not compute duration for {path}: {exc}") from exc
+
+    try:
+        duration_decimal = Decimal(str(duration))
+    except (InvalidOperation, ValueError) as exc:
+        raise AuphonicError(
+            f"Could not compute duration for {path}: duration must be numeric"
+        ) from exc
+    if not duration_decimal.is_finite() or duration_decimal <= 0:
+        raise AuphonicError(
+            f"Could not compute duration for {path}: duration must be positive"
+        )
+    return float(duration_decimal)
+
+
+def _validate_offset_production_state(details: Dict) -> None:
+    production_id = details.get("production_id") or "unknown"
+    status_summary = (
+        f"status={details.get('status')} status_string={details.get('status_string')}"
+    )
+    if details.get("change_allowed") is not True:
+        raise AuphonicError(
+            f"Auphonic production {production_id} is not change_allowed; {status_summary}"
+        )
+    if _is_done_status(details) or _is_failed_status(details):
+        raise AuphonicError(
+            f"Auphonic production {production_id} cannot be offset after completion or failure; {status_summary}"
+        )
+    if details.get("start_allowed") is not True:
+        raise AuphonicError(
+            f"Auphonic production {production_id} is not start_allowed; it may already be started or processing; {status_summary}"
+        )
+
+
+def _find_multi_input_track_for_asset(
+    multi_input_files: List[Dict], asset: AssetRecord
+) -> Dict:
+    target_basenames = {
+        Path(asset.local_path).name.lower(),
+        asset.filename.lower(),
+    }
+    matches = [
+        track
+        for track in multi_input_files
+        if _input_file_basename(track.get("input_file")).lower() in target_basenames
+    ]
+    if len(matches) == 1:
+        return matches[0]
+
+    target_name = Path(asset.local_path).name or asset.filename
+    inspected = _format_track_choices(multi_input_files)
+    if not matches:
+        raise AuphonicError(
+            f"Could not match Auphonic track for {target_name}; inspected tracks: {inspected}"
+        )
+    raise AuphonicError(
+        f"Ambiguous Auphonic track match for {target_name}; inspected tracks: {inspected}"
+    )
+
+
+def _find_multi_input_track_by_id(
+    multi_input_files: List[Dict], track_id: str
+) -> Optional[Dict]:
+    for track in multi_input_files:
+        if str(track.get("id") or "") == track_id:
+            return track
+    return None
+
+
+def _input_file_basename(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    path_value = parsed.path if parsed.scheme or parsed.netloc else text
+    return Path(unquote(path_value.split("?", 1)[0])).name
+
+
+def _format_track_choices(multi_input_files: List[Dict]) -> str:
+    if not multi_input_files:
+        return "none"
+    return ", ".join(
+        f"id={track.get('id') or 'none'} input_file={track.get('input_file') or 'none'}"
+        for track in multi_input_files
+    )
 
 
 def _upload_attachment_summary(data_node: Dict) -> Dict[str, object]:

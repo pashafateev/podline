@@ -8,6 +8,7 @@ import typer
 from podline.auphonic import (
     AuphonicError,
     inspect_production,
+    offset_session_auphonic_production,
     prepare_session_with_auphonic,
     preview_prepared_session_with_auphonic,
     process_session_with_auphonic,
@@ -95,6 +96,19 @@ def _truncate(value: str, width: int) -> str:
     if width <= 3:
         return value[:width]
     return value[: width - 3] + "..."
+
+
+def _format_seconds(value: float) -> str:
+    return f"{value:.3f}"
+
+
+def _format_track_offset(value) -> str:
+    if value is None or value == "":
+        return "none"
+    try:
+        return _format_seconds(float(value))
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def _print_session_summary(session) -> None:
@@ -995,9 +1009,81 @@ def _print_auphonic_tracks(tracks) -> None:
                     f"id={track.get('id', '')}",
                     f"type={track.get('type', '')}",
                     f"input_file={track.get('input_file', '') or 'none'}",
-                    f"offset={track.get('offset', 0)}",
+                    f"offset={_format_track_offset(track.get('offset'))}",
                 ]
             )
+        )
+
+
+@app.command("auphonic-offset")
+def auphonic_offset_command(
+    session_uid: str,
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="Apply the computed offset to the prepared Auphonic production.",
+    ),
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
+    config: Optional[Path] = typer.Option(
+        None, "--config", help="Path to config.yaml."
+    ),
+) -> None:
+    """Compute and optionally apply a duration-based Auphonic track offset."""
+    config_path = _resolve_config_path(config)
+    loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
+    session = _resolve_session_arg(runtime_paths, session_uid)
+    if session is None:
+        typer.secho(
+            f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        result = offset_session_auphonic_production(
+            config=loaded_config,
+            db_file=runtime_paths.db_file,
+            session=session,
+            apply=apply,
+        )
+    except AuphonicError as exc:
+        logger.error("Auphonic offset failed for %s: %s", session_uid, exc)
+        typer.echo(f"Auphonic error: {exc}")
+        raise typer.Exit(code=1)
+
+    plan = result.plan
+    _print_header("Auphonic Offset Applied" if result.applied else "Auphonic Offset Plan")
+    _print_section(
+        "Durations",
+        [
+            (
+                item.asset.filename,
+                f"{_format_seconds(item.duration_seconds)}s  {item.asset.local_path}",
+            )
+            for item in plan.asset_durations
+        ],
+    )
+    _print_section(
+        "Target",
+        [
+            ("session_uid", session.session_uid),
+            ("production_id", plan.production_id),
+            ("target_asset", plan.target_asset.filename),
+            ("longer_asset", plan.longer_asset.filename),
+            ("track_id", plan.target_track_id),
+            ("input_file", plan.target_input_file or "none"),
+            ("offset_seconds", _format_seconds(plan.offset_seconds)),
+            ("applied", "yes" if result.applied else "no"),
+        ],
+    )
+    if result.track_state is not None:
+        _print_section(
+            "Updated Track",
+            [
+                ("id", result.track_state.get("id", "none")),
+                ("type", result.track_state.get("type", "none")),
+                ("input_file", result.track_state.get("input_file") or "none"),
+                ("offset", _format_track_offset(result.track_state.get("offset"))),
+            ],
         )
 
 

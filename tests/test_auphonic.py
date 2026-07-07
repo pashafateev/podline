@@ -1,13 +1,21 @@
 from pathlib import Path
+import json
+
+import httpx
+import pytest
 
 from podline.auphonic import (
+    AuphonicClient,
     AuphonicError,
     AuphonicOutputFile,
     AuphonicPreparedProduction,
     AuphonicProduction,
+    _duration_from_ffprobe_packet_data,
     _is_done_status,
     _is_failed_status,
     inspect_production,
+    offset_session_auphonic_production,
+    plan_session_auphonic_offset,
     prepare_session_with_auphonic,
     preview_prepared_session_with_auphonic,
     process_session_with_auphonic,
@@ -24,7 +32,7 @@ from podline.config import (
     PodbeanConfig,
     PollingConfig,
 )
-from podline.db import initialize_database
+from podline.db import connect, initialize_database
 from podline.ingest import scan_and_ingest
 from podline.paths import build_runtime_paths, ensure_runtime_dirs
 from podline.repository import get_session, list_sessions
@@ -120,6 +128,50 @@ class FakeDoneAuphonicClient(FakeAuphonicClient):
         payload["data"]["status"] = 3
         payload["data"]["status_string"] = "Done"
         return payload
+
+
+class FakeOffsetAuphonicClient:
+    def __init__(
+        self,
+        *,
+        change_allowed: bool = True,
+        start_allowed: bool = True,
+        tracks=None,
+    ) -> None:
+        self.change_allowed = change_allowed
+        self.start_allowed = start_allowed
+        self.tracks = tracks or [
+            {"id": "Jonathan", "type": "multitrack", "input_file": "Tr1.webm"},
+            {"id": "Pasha", "type": "multitrack", "input_file": "Tr2.webm"},
+        ]
+        self.offset_updates = []
+
+    def get_production(self, production_id: str):
+        return {
+            "status_code": 200,
+            "error_message": "",
+            "data": {
+                "uuid": production_id,
+                "status": 10,
+                "status_string": "Production Not Started Yet",
+                "start_allowed": self.start_allowed,
+                "change_allowed": self.change_allowed,
+                "edit_page": f"https://example.test/edit/{production_id}",
+                "status_page": f"https://example.test/status/{production_id}",
+                "warning_message": "",
+                "multi_input_files": [dict(track) for track in self.tracks],
+                "output_files": [],
+            },
+        }
+
+    def update_multi_input_file_offset(
+        self, production_id: str, track_id: str, offset: float
+    ):
+        self.offset_updates.append((production_id, track_id, offset))
+        for track in self.tracks:
+            if track.get("id") == track_id:
+                track["offset"] = offset
+        return {"status_code": 200, "data": {"id": track_id, "offset": offset}}
 
 
 def test_resolve_preset_id_validates_config() -> None:
@@ -363,6 +415,145 @@ def test_inspect_production_returns_verification_details(tmp_path: Path) -> None
     assert details["multi_input_files"][0]["id"] == "Jonathan"
 
 
+def test_duration_from_ffprobe_packet_json_uses_last_packet() -> None:
+    duration = _duration_from_ffprobe_packet_data(
+        {
+            "packets": [
+                {"pts_time": "0.000000", "duration_time": "0.021333"},
+                {"pts_time": "12.300000", "duration_time": "0.023000"},
+            ]
+        },
+        source=Path("Tr2.webm"),
+    )
+
+    assert duration == pytest.approx(12.323)
+
+
+def test_auphonic_client_updates_multi_input_file_offset(tmp_path: Path) -> None:
+    config = _build_config(tmp_path)
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(200, json={"status_code": 200, "data": {"id": "Pasha"}})
+
+    client = AuphonicClient(config)
+    client._client = httpx.Client(
+        base_url=config.auphonic.base_url.rstrip("/"),
+        headers={"Authorization": f"Bearer {config.auphonic.api_key}"},
+        transport=httpx.MockTransport(handler),
+    )
+
+    client.update_multi_input_file_offset("prod-123", "Pasha", 1.801)
+
+    assert seen["method"] == "POST"
+    assert (
+        seen["url"]
+        == "https://auphonic.example/api/production/prod-123/multi_input_files/Pasha.json"
+    )
+    assert seen["body"] == {"type": "multitrack", "offset": 1.801}
+
+
+def test_session_offset_plan_targets_shorter_asset(tmp_path: Path) -> None:
+    config, runtime_paths, session = _build_offset_session(tmp_path)
+    client = FakeOffsetAuphonicClient()
+
+    plan = plan_session_auphonic_offset(
+        config=config,
+        db_file=runtime_paths.db_file,
+        session=session,
+        client=client,
+        duration_probe=_duration_probe({"Tr1.webm": 101.234, "Tr2.webm": 99.433}),
+    )
+
+    assert plan.target_asset.filename == "Tr2.webm"
+    assert plan.longer_asset.filename == "Tr1.webm"
+    assert plan.target_track_id == "Pasha"
+    assert plan.target_input_file == "Tr2.webm"
+    assert plan.offset_seconds == pytest.approx(1.801)
+
+
+def test_session_offset_dry_run_does_not_update_auphonic(tmp_path: Path) -> None:
+    config, runtime_paths, session = _build_offset_session(tmp_path)
+    client = FakeOffsetAuphonicClient()
+
+    result = offset_session_auphonic_production(
+        config=config,
+        db_file=runtime_paths.db_file,
+        session=session,
+        apply=False,
+        client=client,
+        duration_probe=_duration_probe({"Tr1.webm": 101.234, "Tr2.webm": 99.433}),
+    )
+
+    assert result.applied is False
+    assert result.track_state is None
+    assert client.offset_updates == []
+
+
+def test_session_offset_apply_updates_matched_track_id(tmp_path: Path) -> None:
+    config, runtime_paths, session = _build_offset_session(tmp_path)
+    client = FakeOffsetAuphonicClient()
+
+    result = offset_session_auphonic_production(
+        config=config,
+        db_file=runtime_paths.db_file,
+        session=session,
+        apply=True,
+        client=client,
+        duration_probe=_duration_probe({"Tr1.webm": 101.234, "Tr2.webm": 99.433}),
+    )
+
+    assert result.applied is True
+    assert client.offset_updates == [("prod-123", "Pasha", pytest.approx(1.801))]
+    assert result.track_state is not None
+    assert result.track_state["id"] == "Pasha"
+    assert result.track_state["offset"] == pytest.approx(1.801)
+
+
+def test_session_offset_fails_when_production_is_not_change_allowed(
+    tmp_path: Path,
+) -> None:
+    config, runtime_paths, session = _build_offset_session(tmp_path)
+    client = FakeOffsetAuphonicClient(change_allowed=False)
+
+    with pytest.raises(AuphonicError, match="change_allowed"):
+        plan_session_auphonic_offset(
+            config=config,
+            db_file=runtime_paths.db_file,
+            session=session,
+            client=client,
+            duration_probe=_duration_probe({"Tr1.webm": 101.234, "Tr2.webm": 99.433}),
+        )
+
+
+def test_session_offset_fails_when_track_matching_is_ambiguous(
+    tmp_path: Path,
+) -> None:
+    config, runtime_paths, session = _build_offset_session(tmp_path)
+    client = FakeOffsetAuphonicClient(
+        tracks=[
+            {"id": "Pasha-a", "type": "multitrack", "input_file": "Tr2.webm"},
+            {"id": "Pasha-b", "type": "multitrack", "input_file": "Tr2.webm"},
+        ]
+    )
+
+    with pytest.raises(AuphonicError) as exc_info:
+        plan_session_auphonic_offset(
+            config=config,
+            db_file=runtime_paths.db_file,
+            session=session,
+            client=client,
+            duration_probe=_duration_probe({"Tr1.webm": 101.234, "Tr2.webm": 99.433}),
+        )
+
+    assert "Ambiguous" in str(exc_info.value)
+    assert "Pasha-a" in str(exc_info.value)
+    assert "Pasha-b" in str(exc_info.value)
+
+
 def test_done_status_is_not_treated_as_failed() -> None:
     data_node = {"status": 3, "status_string": "Done"}
 
@@ -502,3 +693,51 @@ def _default_cozytrack_config() -> CozytrackConfig:
         download_subdir="cozytrack",
         request_timeout_seconds=600,
     )
+
+
+def _build_offset_session(tmp_path: Path):
+    config = _build_config(tmp_path)
+    runtime_paths = build_runtime_paths(config)
+    ensure_runtime_dirs(runtime_paths)
+    initialize_database(runtime_paths.db_file)
+
+    source_dir = tmp_path / "raw" / "cozytrack-session"
+    source_dir.mkdir(parents=True)
+    tr1 = source_dir / "Tr1.webm"
+    tr2 = source_dir / "Tr2.webm"
+    tr1.write_bytes(b"track-one")
+    tr2.write_bytes(b"track-two")
+
+    with connect(runtime_paths.db_file) as connection:
+        connection.execute(
+            "INSERT INTO sessions (session_uid, source_path, fingerprint, status, auphonic_production_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "session-offset-1",
+                str(source_dir),
+                "fingerprint-offset-1",
+                "auphonic_prepared",
+                "prod-123",
+                "now",
+                "now",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO assets (session_uid, role, filename, file_size, local_path) VALUES (?, ?, ?, ?, ?)",
+            ("session-offset-1", "host1", "Tr1.webm", 9, str(tr1)),
+        )
+        connection.execute(
+            "INSERT INTO assets (session_uid, role, filename, file_size, local_path) VALUES (?, ?, ?, ?, ?)",
+            ("session-offset-1", "host2", "Tr2.webm", 9, str(tr2)),
+        )
+        connection.commit()
+
+    session = get_session(runtime_paths.db_file, "session-offset-1")
+    assert session is not None
+    return config, runtime_paths, session
+
+
+def _duration_probe(durations):
+    def probe(path: Path) -> float:
+        return durations[path.name]
+
+    return probe
