@@ -10,14 +10,14 @@ from typing import Dict, Iterable, List, Optional, Protocol
 
 import httpx
 
-from sexdrunks_automation.config import AppConfig
-from sexdrunks_automation.models import (
+from podline.config import AppConfig
+from podline.models import (
     AssetRecord,
     RuntimePaths,
     SessionRecord,
     SessionStatus,
 )
-from sexdrunks_automation.repository import (
+from podline.repository import (
     get_session,
     list_assets_for_session,
     update_session_status,
@@ -117,7 +117,7 @@ class AuphonicClient:
                 "Auphonic create response did not include a production id"
             )
         upload_track_ids = _resolve_upload_track_ids(data_node, assets)
-        logging.getLogger("sexdrunks_automation").debug(
+        logging.getLogger("podline").debug(
             "Auphonic create details production_id=%s status_page=%s edit_page=%s start_allowed=%s change_allowed=%s upload_track_ids=%s",
             production_id,
             data_node.get("status_page"),
@@ -142,7 +142,7 @@ class AuphonicClient:
             upload_track_ids=upload_track_ids,
         )
         data_node = payload.get("data", payload)
-        logging.getLogger("sexdrunks_automation").debug(
+        logging.getLogger("podline").debug(
             "Auphonic upload details production_id=%s attached=%s start_allowed=%s multi_input_files=%s",
             production_id,
             _upload_attachment_summary(data_node),
@@ -188,7 +188,7 @@ class AuphonicClient:
                 ]
             )
 
-        logging.getLogger("sexdrunks_automation").debug(
+        logging.getLogger("podline").debug(
             "Auphonic curl upload command production_id=%s curl=%s track_ids=%s",
             production_id,
             curl_binary,
@@ -203,7 +203,7 @@ class AuphonicClient:
                 break
 
             stderr_preview = result.stderr[:300]
-            logging.getLogger("sexdrunks_automation").debug(
+            logging.getLogger("podline").debug(
                 "Auphonic curl upload transient failure production_id=%s attempt=%s exit_code=%s will_retry=%s stderr=%s",
                 production_id,
                 attempt + 1,
@@ -223,7 +223,7 @@ class AuphonicClient:
                 f"Auphonic curl upload failed with exit code {result.returncode if result else 'unknown'}: {(result.stderr[:300] if result else 'no stderr')}"
             )
         if success_attempt and success_attempt > 1:
-            logging.getLogger("sexdrunks_automation").debug(
+            logging.getLogger("podline").debug(
                 "Auphonic curl upload recovered after retry production_id=%s success_attempt=%s",
                 production_id,
                 success_attempt,
@@ -255,7 +255,7 @@ class AuphonicClient:
             )
             payload = response.json()
             data_node = payload.get("data", payload)
-            logging.getLogger("sexdrunks_automation").debug(
+            logging.getLogger("podline").debug(
                 "Auphonic poll production_id=%s attempt=%s status=%s status_string=%s error_message=%s warning_message=%s",
                 production_id,
                 _attempt + 1,
@@ -300,14 +300,14 @@ class AuphonicClient:
         last_error: Optional[Exception] = None
         for _attempt in range(3):
             try:
-                logging.getLogger("sexdrunks_automation").debug(
+                logging.getLogger("podline").debug(
                     "Auphonic request method=%s url=%s attempt=%s",
                     method,
                     url,
                     _attempt + 1,
                 )
                 response = self._client.request(method, url, **kwargs)
-                logging.getLogger("sexdrunks_automation").debug(
+                logging.getLogger("podline").debug(
                     "Auphonic response method=%s url=%s status=%s",
                     method,
                     url,
@@ -315,7 +315,7 @@ class AuphonicClient:
                 )
                 if response.status_code >= 400:
                     body_preview = response.text[:1000]
-                    logging.getLogger("sexdrunks_automation").debug(
+                    logging.getLogger("podline").debug(
                         "Auphonic error body method=%s url=%s body=%s",
                         method,
                         url,
@@ -330,7 +330,7 @@ class AuphonicClient:
                     raise AuphonicError(
                         f"Auphonic request failed with status {status_code}: {exc.response.text[:300]}"
                     ) from exc
-                logging.getLogger("sexdrunks_automation").debug(
+                logging.getLogger("podline").debug(
                     "Auphonic retry method=%s url=%s error=%s",
                     method,
                     url,
@@ -339,7 +339,7 @@ class AuphonicClient:
                 sleep(1)
             except (httpx.HTTPError, httpx.TransportError) as exc:
                 last_error = exc
-                logging.getLogger("sexdrunks_automation").debug(
+                logging.getLogger("podline").debug(
                     "Auphonic retry method=%s url=%s error=%s",
                     method,
                     url,
@@ -901,7 +901,7 @@ def reconcile_production_to_session(
             failed_at_stage=None,
         )
 
-    from sexdrunks_automation.repository import get_session
+    from podline.repository import get_session
 
     updated = get_session(db_file, session.session_uid)
     if updated is None:

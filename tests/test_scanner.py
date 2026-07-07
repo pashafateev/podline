@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from sexdrunks_automation import scanner
-from sexdrunks_automation.scanner import scan_raw_sessions
+from podline import scanner
+from podline.scanner import scan_raw_sessions
 
 
 def test_scanner_detects_supported_and_unsupported_sessions(fixture_raw_root) -> None:

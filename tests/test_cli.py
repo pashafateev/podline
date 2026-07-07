@@ -5,10 +5,10 @@ from types import SimpleNamespace
 
 from typer.testing import CliRunner
 
-from sexdrunks_automation import cli as cli_module
-from sexdrunks_automation.cli import app
-from sexdrunks_automation.db import connect, initialize_database
-from sexdrunks_automation.logging_setup import configure_logging
+from podline import cli as cli_module
+from podline.cli import app
+from podline.db import connect, initialize_database
+from podline.logging_setup import configure_logging
 
 
 runner = CliRunner()
@@ -293,7 +293,7 @@ def test_auphonic_preview_accepts_selector_index_without_opening_browser(
     assert "Auphonic Preview" in result.stdout
     assert "https://example.test/edit/prod-111" in result.stdout
     assert "offset=1.612" in result.stdout
-    assert "sd auphonic-start @1" in result.stdout
+    assert "pod auphonic-start @1" in result.stdout
     assert browser_calls == []
 
 

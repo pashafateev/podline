@@ -2,7 +2,7 @@ import hashlib
 import uuid
 from pathlib import Path
 
-from sexdrunks_automation.models import ScanCandidate
+from podline.models import ScanCandidate
 
 
 TRACK_HASH_BYTES = 65536

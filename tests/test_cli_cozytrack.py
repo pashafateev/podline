@@ -3,11 +3,11 @@ from typing import List
 
 from typer.testing import CliRunner
 
-from sexdrunks_automation import cli as cli_module
-from sexdrunks_automation.cli import app
-from sexdrunks_automation.cozytrack.client import CozytrackSession, CozytrackTrack
-from sexdrunks_automation.db import initialize_database
-from sexdrunks_automation.repository import get_session_by_cozytrack_id
+from podline import cli as cli_module
+from podline.cli import app
+from podline.cozytrack.client import CozytrackSession, CozytrackTrack
+from podline.db import initialize_database
+from podline.repository import get_session_by_cozytrack_id
 
 
 runner = CliRunner()
@@ -135,7 +135,7 @@ def test_ct_ingest_creates_session_row(tmp_path: Path, monkeypatch) -> None:
     fake = _FakeClient([_make_session("sess-1", "Demo Episode")])
 
     def fake_ingest(*, config, db_file, cozytrack_session_id, name_override, logger):
-        from sexdrunks_automation.cozytrack.ingest import ingest_session
+        from podline.cozytrack.ingest import ingest_session
 
         return ingest_session(
             config=config,

@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
-from sexdrunks_automation.models import (
+from podline.models import (
     ScanCandidate,
     ScanResult,
     TrackFile,

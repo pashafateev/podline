@@ -5,7 +5,7 @@ import webbrowser
 
 import typer
 
-from sexdrunks_automation.auphonic import (
+from podline.auphonic import (
     AuphonicError,
     inspect_production,
     prepare_session_with_auphonic,
@@ -14,31 +14,31 @@ from sexdrunks_automation.auphonic import (
     reconcile_production_to_session,
     start_prepared_session_with_auphonic,
 )
-from sexdrunks_automation.config import load_config
-from sexdrunks_automation.cozytrack.client import CozytrackError
-from sexdrunks_automation.cozytrack.ingest import (
+from podline.config import load_config
+from podline.cozytrack.client import CozytrackError
+from podline.cozytrack.ingest import (
     CozytrackIngestError,
     ingest_session as cozytrack_ingest_session,
     list_ready_sessions_for_ingest,
 )
-from sexdrunks_automation.db import initialize_database
-from sexdrunks_automation.episode_meta import (
+from podline.db import initialize_database
+from podline.episode_meta import (
     EpisodeMetaError,
     generate_episode_metadata_with_opencode,
 )
-from sexdrunks_automation.finalize import (
+from podline.finalize import (
     FinalizeError,
     finalize_session,
     get_episode_metadata,
 )
-from sexdrunks_automation.health import read_health_snapshot, write_health_snapshot
-from sexdrunks_automation.ingest import scan_and_ingest
-from sexdrunks_automation.logging_setup import configure_logging
-from sexdrunks_automation.paths import build_runtime_paths, ensure_runtime_dirs
-from sexdrunks_automation.podbean import PodbeanError, create_podbean_draft
-from sexdrunks_automation.repository import get_session, list_sessions
+from podline.health import read_health_snapshot, write_health_snapshot
+from podline.ingest import scan_and_ingest
+from podline.logging_setup import configure_logging
+from podline.paths import build_runtime_paths, ensure_runtime_dirs
+from podline.podbean import PodbeanError, create_podbean_draft
+from podline.repository import get_session, list_sessions
 
-app = typer.Typer(help="Sex Drunks automation CLI.")
+app = typer.Typer(help="podline automation CLI.")
 
 STATUS_STYLES = {
     "queued": ("Queued", typer.colors.YELLOW, "○"),
@@ -509,7 +509,7 @@ def status(
                 (
                     "next_step",
                     _styled(
-                        "Run sd episode-meta @n before Podbean draft",
+                        "Run pod episode-meta @n before Podbean draft",
                         fg=typer.colors.WHITE,
                     ),
                 ),
@@ -631,7 +631,7 @@ def finalize_command(
                 (
                     "next_step",
                     _styled(
-                        "Run sd episode-meta @n before Podbean draft",
+                        "Run pod episode-meta @n before Podbean draft",
                         fg=typer.colors.WHITE,
                     ),
                 ),
@@ -806,7 +806,7 @@ def auphonic_prepare_command(
             ("status", _format_status(updated.status)),
             ("auphonic_production_id", updated.auphonic_production_id or "none"),
             ("auphonic_started", "no"),
-            ("next", f"sd auphonic-preview {session_uid}"),
+            ("next", f"pod auphonic-preview {session_uid}"),
         ]
     )
 
@@ -864,7 +864,7 @@ def auphonic_preview_command(
             ("edit_page", edit_page or "none"),
             ("status_page", details["status_page"] or "none"),
             ("browser_opened", "yes" if browser_opened else "no"),
-            ("next", f"sd auphonic-start {session_uid}"),
+            ("next", f"pod auphonic-start {session_uid}"),
         ]
     )
     _print_auphonic_tracks(details["multi_input_files"])

@@ -1,7 +1,7 @@
 import sqlite3
 from pathlib import Path
 
-from sexdrunks_automation.db import initialize_database
+from podline.db import initialize_database
 
 
 def test_initialize_database_creates_file(tmp_path: Path) -> None:

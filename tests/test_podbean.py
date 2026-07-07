@@ -2,7 +2,7 @@ from pathlib import Path
 
 import httpx
 
-from sexdrunks_automation.config import (
+from podline.config import (
     AppConfig,
     AuphonicConfig,
     CozytrackConfig,
@@ -11,16 +11,16 @@ from sexdrunks_automation.config import (
     PodbeanConfig,
     PollingConfig,
 )
-from sexdrunks_automation.db import initialize_database
-from sexdrunks_automation.ingest import scan_and_ingest
-from sexdrunks_automation.podbean import (
+from podline.db import initialize_database
+from podline.ingest import scan_and_ingest
+from podline.podbean import (
     PodbeanClient,
     PodbeanError,
     PodbeanDraftResult,
     create_podbean_draft,
     _next_episode_number,
 )
-from sexdrunks_automation.repository import (
+from podline.repository import (
     get_episode,
     get_session,
     list_sessions,

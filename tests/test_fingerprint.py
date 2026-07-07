@@ -1,8 +1,8 @@
 from dataclasses import replace
 from pathlib import Path
 
-from sexdrunks_automation.fingerprint import build_fingerprint, build_session_uid
-from sexdrunks_automation.scanner import scan_raw_sessions
+from podline.fingerprint import build_fingerprint, build_session_uid
+from podline.scanner import scan_raw_sessions
 
 
 def test_fingerprint_is_stable_for_fixture_session(fixture_raw_root) -> None:

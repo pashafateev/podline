@@ -1,4 +1,4 @@
-from sexdrunks_automation.cozytrack.client import (
+from podline.cozytrack.client import (
     CozytrackClient,
     CozytrackError,
     CozytrackSession,

@@ -358,7 +358,7 @@ wheels = [
 ]
 
 [[package]]
-name = "sexdrunks-automation"
+name = "podline"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
