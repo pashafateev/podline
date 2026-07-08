@@ -706,6 +706,11 @@ def refresh_transcript_with_auphonic(
     )
     client = client or AuphonicClient(config)
 
+    # Unlike start_prepared_session_with_auphonic, this flow deliberately has no
+    # try/except that flips the session to FAILED. A transcript refresh is an
+    # optional, re-runnable step on an already-finished session, so on error we
+    # let the exception propagate and leave the status at ready_for_draft — the
+    # caller can fix the preset and just run transcript-refresh again.
     _log(
         logger,
         "Refreshing transcript for %s from %s",
@@ -744,6 +749,11 @@ def refresh_transcript_with_auphonic(
         timestamp=datetime.now(timezone.utc).isoformat(),
         detail=f"refreshed transcript from final master using Auphonic production {production_id}",
         transcript_path=str(transcript_path),
+        # Intentionally do NOT write auphonic_production_id here: the refresh
+        # spins up a separate, throwaway single-track production, and the session
+        # row should keep pointing at the primary production from initial
+        # processing. The refresh production id is recorded in the event detail
+        # above for traceability.
         failure_reason=None,
         failed_at_stage=None,
     )
