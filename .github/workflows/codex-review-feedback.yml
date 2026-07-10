@@ -1,0 +1,60 @@
+name: Codex review feedback
+
+on:
+  workflow_run:
+    workflows: ["Codex review"]
+    types: [completed]
+
+jobs:
+  post_feedback:
+    if: >-
+      ${{
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.repository.full_name == github.repository
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Download Codex feedback artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: codex-review-feedback
+          path: codex-review-output
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Report Codex feedback
+        uses: actions/github-script@v7
+        env:
+          CODEX_FINAL_MESSAGE_FILE: codex-review-output/final-message.md
+          CODEX_PR_NUMBER_FILE: codex-review-output/pr-number.txt
+        with:
+          script: |
+            const fs = require("node:fs");
+            const message = fs.readFileSync(process.env.CODEX_FINAL_MESSAGE_FILE, "utf8").trim();
+            if (!message) {
+              core.notice("No Codex feedback to post.");
+              return;
+            }
+
+            const prNumber = Number(fs.readFileSync(process.env.CODEX_PR_NUMBER_FILE, "utf8").trim());
+            if (!Number.isInteger(prNumber) || prNumber <= 0) {
+              core.setFailed(`Invalid Codex feedback PR number: ${prNumber}`);
+              return;
+            }
+
+            const body = [
+              "## Codex review",
+              "",
+              message,
+            ].join("\n");
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body,
+            });
