@@ -29,3 +29,4 @@ def test_initialize_database_applies_session_metadata_migrations(
     assert "source_date_folder" in columns
     assert "recorded_at" in columns
     assert "recorded_at_source" in columns
+    assert "transcript_refresh_production_id" in columns
