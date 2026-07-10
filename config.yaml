@@ -14,6 +14,7 @@ auphonic:
   poll_interval_seconds: 10
   max_poll_attempts: 180
   preset_ids:
+    transcript_refresh: ""
     speakers_2: ""
     speakers_3: ""
     speakers_4: ""

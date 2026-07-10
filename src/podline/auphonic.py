@@ -20,8 +20,11 @@ from podline.models import (
     SessionStatus,
 )
 from podline.repository import (
+    complete_transcript_refresh,
+    discard_transcript_refresh_production,
     get_session,
     list_assets_for_session,
+    record_transcript_refresh_production,
     update_session_status,
 )
 
@@ -149,7 +152,11 @@ class AuphonicClient:
             raise AuphonicError(
                 "Auphonic create response did not include a production id"
             )
-        upload_track_ids = _resolve_upload_track_ids(data_node, assets)
+        upload_track_ids = (
+            ["input_file"]
+            if len(assets) == 1
+            else _resolve_upload_track_ids(data_node, assets)
+        )
         logging.getLogger("podline").debug(
             "Auphonic create details production_id=%s status_page=%s edit_page=%s start_allowed=%s change_allowed=%s upload_track_ids=%s",
             production_id,
@@ -214,10 +221,11 @@ class AuphonicClient:
             str(self._config.auphonic.request_timeout_seconds),
         ]
         for asset, upload_track_id in zip(assets, upload_track_ids):
+            content_type = _audio_content_type_for(Path(asset.local_path))
             command.extend(
                 [
                     "-F",
-                    f"{upload_track_id}=@{asset.local_path};type=audio/wav",
+                    f"{upload_track_id}=@{asset.local_path};type={content_type}",
                 ]
             )
 
@@ -675,6 +683,133 @@ def start_prepared_session_with_auphonic(
     return updated
 
 
+def refresh_transcript_with_auphonic(
+    *,
+    config: AppConfig,
+    runtime_paths: RuntimePaths,
+    db_file: str,
+    session: SessionRecord,
+    preset_id: Optional[str] = None,
+    client: Optional[AuphonicClientProtocol] = None,
+    logger: Optional[logging.Logger] = None,
+) -> SessionRecord:
+    if session.status != SessionStatus.READY_FOR_DRAFT.value:
+        raise AuphonicError(
+            f"Session {session.session_uid} must be ready_for_draft before transcript refresh"
+        )
+    validate_auphonic_config(config)
+    client = client or AuphonicClient(config)
+    production_id = session.transcript_refresh_production_id
+
+    if production_id:
+        _log(
+            logger,
+            "Resuming Auphonic transcript refresh production %s for %s",
+            production_id,
+            session.session_uid,
+        )
+        payload = client.get_production(production_id)
+        data_node = payload.get("data", payload)
+        if _is_failed_status(data_node):
+            discard_transcript_refresh_production(
+                db_file,
+                session_uid=session.session_uid,
+                status=session.status,
+                production_id=production_id,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                detail=f"discarded failed Auphonic transcript refresh production {production_id}",
+            )
+            raise AuphonicError(
+                f"Auphonic transcript refresh production {production_id} failed; run transcript-refresh again to create a replacement"
+            )
+        if _is_done_status(data_node):
+            production = AuphonicProduction(
+                production_id=production_id,
+                output_files=_extract_output_files(data_node),
+            )
+        else:
+            if data_node.get("start_allowed"):
+                client.start_production(production_id)
+            production = client.wait_for_production(production_id)
+    else:
+        if not session.final_master_path:
+            raise AuphonicError(
+                f"Session {session.session_uid} has no final master path"
+            )
+        final_master = Path(session.final_master_path)
+        if not final_master.exists():
+            raise AuphonicError(f"Final master file not found: {final_master}")
+
+        resolved_preset_id = resolve_transcript_refresh_preset_id(config, preset_id)
+        asset = AssetRecord(
+            role="final_master",
+            filename=final_master.name,
+            file_size=final_master.stat().st_size,
+            local_path=str(final_master),
+        )
+        _log(
+            logger,
+            "Refreshing transcript for %s from %s",
+            session.session_uid,
+            final_master,
+        )
+        prepared_production = client.create_production(
+            session=session,
+            assets=[asset],
+            preset_id=resolved_preset_id,
+        )
+        production_id = prepared_production.production_id
+        _log(
+            logger,
+            "Created Auphonic transcript refresh production %s for %s",
+            production_id,
+            session.session_uid,
+        )
+        client.upload_assets(
+            production_id, [asset], prepared_production.upload_track_ids
+        )
+        _log(logger, "Uploaded final master to Auphonic production %s", production_id)
+        record_transcript_refresh_production(
+            db_file,
+            session_uid=session.session_uid,
+            status=session.status,
+            production_id=production_id,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+        client.start_production(production_id)
+        production = client.wait_for_production(production_id)
+
+    transcript_path = _download_and_copy_transcript_output(
+        client=client,
+        runtime_paths=runtime_paths,
+        deliverables_root=config.paths.deliverables_root,
+        session_uid=session.session_uid,
+        production=production,
+    )
+
+    complete_transcript_refresh(
+        db_file,
+        session_uid=session.session_uid,
+        status=session.status,
+        production_id=production_id,
+        transcript_path=str(transcript_path),
+        timestamp=datetime.now(timezone.utc).isoformat(),
+    )
+    _log(
+        logger,
+        "Stored refreshed transcript for %s transcript=%s",
+        session.session_uid,
+        transcript_path,
+    )
+
+    updated = get_session(db_file, session.session_uid)
+    if updated is None:
+        raise AuphonicError(
+            f"Transcript refreshed session disappeared: {session.session_uid}"
+        )
+    return updated
+
+
 def resolve_preset_id(config: AppConfig, speaker_count: int) -> str:
     validate_auphonic_config(config)
     key = f"speakers_{speaker_count}"
@@ -682,6 +817,22 @@ def resolve_preset_id(config: AppConfig, speaker_count: int) -> str:
     if not preset_id:
         raise AuphonicError(f"Missing Auphonic preset id for {speaker_count} speakers")
     return preset_id
+
+
+def resolve_transcript_refresh_preset_id(
+    config: AppConfig, preset_id: Optional[str] = None
+) -> str:
+    validate_auphonic_config(config)
+    if preset_id and preset_id.strip():
+        return preset_id.strip()
+
+    configured = config.auphonic.preset_ids.get("transcript_refresh", "").strip()
+    if configured:
+        return configured
+
+    raise AuphonicError(
+        "Missing Auphonic preset id for transcript refresh. Set auphonic.preset_ids.transcript_refresh or pass --preset."
+    )
 
 
 def validate_auphonic_config(config: AppConfig) -> None:
@@ -731,6 +882,34 @@ def _download_and_copy_outputs(
     transcript_target.write_bytes(staged_transcript.read_bytes())
 
     return {"master": master_target, "transcript": transcript_target}
+
+
+def _download_and_copy_transcript_output(
+    *,
+    client: AuphonicClientProtocol,
+    runtime_paths: RuntimePaths,
+    deliverables_root: Path,
+    session_uid: str,
+    production: AuphonicProduction,
+) -> Path:
+    staging_dir = Path(runtime_paths.staging_dir) / session_uid
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    transcript_output = next(
+        (item for item in production.output_files if item.extension == "vtt"),
+        None,
+    )
+    if transcript_output is None:
+        raise AuphonicError("Auphonic outputs did not include a vtt transcript")
+
+    staged_transcript = staging_dir / "transcript_refresh.vtt"
+    client.download_file(transcript_output.download_url, staged_transcript)
+
+    deliverables_transcripts_dir = deliverables_root / "transcripts"
+    deliverables_transcripts_dir.mkdir(parents=True, exist_ok=True)
+    transcript_target = deliverables_transcripts_dir / f"{session_uid}.vtt"
+    transcript_target.write_bytes(staged_transcript.read_bytes())
+    return transcript_target
 
 
 def _is_done_status(data_node: Dict) -> bool:
@@ -829,6 +1008,23 @@ def _resolve_curl_binary() -> str:
     if resolved is None:
         raise AuphonicError("curl is required for Auphonic uploads but was not found")
     return resolved
+
+
+def _audio_content_type_for(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".mp3":
+        return "audio/mpeg"
+    if suffix == ".wav":
+        return "audio/wav"
+    if suffix == ".m4a":
+        return "audio/mp4"
+    if suffix == ".webm":
+        return "audio/webm"
+    if suffix == ".opus":
+        return "audio/ogg"
+    if suffix in {".aif", ".aiff"}:
+        return "audio/aiff"
+    return "application/octet-stream"
 
 
 def inspect_production(
