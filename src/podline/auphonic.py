@@ -20,8 +20,11 @@ from podline.models import (
     SessionStatus,
 )
 from podline.repository import (
+    complete_transcript_refresh,
+    discard_transcript_refresh_production,
     get_session,
     list_assets_for_session,
+    record_transcript_refresh_production,
     update_session_status,
 )
 
@@ -149,7 +152,11 @@ class AuphonicClient:
             raise AuphonicError(
                 "Auphonic create response did not include a production id"
             )
-        upload_track_ids = _resolve_upload_track_ids(data_node, assets)
+        upload_track_ids = (
+            ["input_file"]
+            if len(assets) == 1
+            else _resolve_upload_track_ids(data_node, assets)
+        )
         logging.getLogger("podline").debug(
             "Auphonic create details production_id=%s status_page=%s edit_page=%s start_allowed=%s change_allowed=%s upload_track_ids=%s",
             production_id,
@@ -690,49 +697,88 @@ def refresh_transcript_with_auphonic(
         raise AuphonicError(
             f"Session {session.session_uid} must be ready_for_draft before transcript refresh"
         )
-    if not session.final_master_path:
-        raise AuphonicError(f"Session {session.session_uid} has no final master path")
-
-    final_master = Path(session.final_master_path)
-    if not final_master.exists():
-        raise AuphonicError(f"Final master file not found: {final_master}")
-
-    resolved_preset_id = resolve_transcript_refresh_preset_id(config, preset_id)
-    asset = AssetRecord(
-        role="final_master",
-        filename=final_master.name,
-        file_size=final_master.stat().st_size,
-        local_path=str(final_master),
-    )
+    validate_auphonic_config(config)
     client = client or AuphonicClient(config)
+    production_id = session.transcript_refresh_production_id
 
-    # Unlike start_prepared_session_with_auphonic, this flow deliberately has no
-    # try/except that flips the session to FAILED. A transcript refresh is an
-    # optional, re-runnable step on an already-finished session, so on error we
-    # let the exception propagate and leave the status at ready_for_draft — the
-    # caller can fix the preset and just run transcript-refresh again.
-    _log(
-        logger,
-        "Refreshing transcript for %s from %s",
-        session.session_uid,
-        final_master,
-    )
-    prepared_production = client.create_production(
-        session=session,
-        assets=[asset],
-        preset_id=resolved_preset_id,
-    )
-    production_id = prepared_production.production_id
-    _log(
-        logger,
-        "Created Auphonic transcript refresh production %s for %s",
-        production_id,
-        session.session_uid,
-    )
-    client.upload_assets(production_id, [asset], prepared_production.upload_track_ids)
-    _log(logger, "Uploaded final master to Auphonic production %s", production_id)
-    client.start_production(production_id)
-    production = client.wait_for_production(production_id)
+    if production_id:
+        _log(
+            logger,
+            "Resuming Auphonic transcript refresh production %s for %s",
+            production_id,
+            session.session_uid,
+        )
+        payload = client.get_production(production_id)
+        data_node = payload.get("data", payload)
+        if _is_failed_status(data_node):
+            discard_transcript_refresh_production(
+                db_file,
+                session_uid=session.session_uid,
+                status=session.status,
+                production_id=production_id,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                detail=f"discarded failed Auphonic transcript refresh production {production_id}",
+            )
+            raise AuphonicError(
+                f"Auphonic transcript refresh production {production_id} failed; run transcript-refresh again to create a replacement"
+            )
+        if _is_done_status(data_node):
+            production = AuphonicProduction(
+                production_id=production_id,
+                output_files=_extract_output_files(data_node),
+            )
+        else:
+            if data_node.get("start_allowed"):
+                client.start_production(production_id)
+            production = client.wait_for_production(production_id)
+    else:
+        if not session.final_master_path:
+            raise AuphonicError(
+                f"Session {session.session_uid} has no final master path"
+            )
+        final_master = Path(session.final_master_path)
+        if not final_master.exists():
+            raise AuphonicError(f"Final master file not found: {final_master}")
+
+        resolved_preset_id = resolve_transcript_refresh_preset_id(config, preset_id)
+        asset = AssetRecord(
+            role="final_master",
+            filename=final_master.name,
+            file_size=final_master.stat().st_size,
+            local_path=str(final_master),
+        )
+        _log(
+            logger,
+            "Refreshing transcript for %s from %s",
+            session.session_uid,
+            final_master,
+        )
+        prepared_production = client.create_production(
+            session=session,
+            assets=[asset],
+            preset_id=resolved_preset_id,
+        )
+        production_id = prepared_production.production_id
+        _log(
+            logger,
+            "Created Auphonic transcript refresh production %s for %s",
+            production_id,
+            session.session_uid,
+        )
+        client.upload_assets(
+            production_id, [asset], prepared_production.upload_track_ids
+        )
+        _log(logger, "Uploaded final master to Auphonic production %s", production_id)
+        record_transcript_refresh_production(
+            db_file,
+            session_uid=session.session_uid,
+            status=session.status,
+            production_id=production_id,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+        client.start_production(production_id)
+        production = client.wait_for_production(production_id)
+
     transcript_path = _download_and_copy_transcript_output(
         client=client,
         runtime_paths=runtime_paths,
@@ -741,21 +787,13 @@ def refresh_transcript_with_auphonic(
         production=production,
     )
 
-    update_session_status(
+    complete_transcript_refresh(
         db_file,
         session_uid=session.session_uid,
-        from_state=session.status,
-        to_state=session.status,
-        timestamp=datetime.now(timezone.utc).isoformat(),
-        detail=f"refreshed transcript from final master using Auphonic production {production_id}",
+        status=session.status,
+        production_id=production_id,
         transcript_path=str(transcript_path),
-        # Intentionally do NOT write auphonic_production_id here: the refresh
-        # spins up a separate, throwaway single-track production, and the session
-        # row should keep pointing at the primary production from initial
-        # processing. The refresh production id is recorded in the event detail
-        # above for traceability.
-        failure_reason=None,
-        failed_at_stage=None,
+        timestamp=datetime.now(timezone.utc).isoformat(),
     )
     _log(
         logger,

@@ -40,6 +40,7 @@ class SessionRecord:
     failure_reason: Optional[str]
     failed_at_stage: Optional[str]
     auphonic_production_id: Optional[str]
+    transcript_refresh_production_id: Optional[str]
     pre_edit_master_path: Optional[str]
     transcript_path: Optional[str]
     final_master_path: Optional[str]

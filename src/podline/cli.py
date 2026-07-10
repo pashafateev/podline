@@ -488,6 +488,10 @@ def status(
         "Auphonic",
         [
             ("auphonic_production_id", session.auphonic_production_id or "none"),
+            (
+                "transcript_refresh_production_id",
+                session.transcript_refresh_production_id or "none",
+            ),
             ("pre_edit_master_path", session.pre_edit_master_path or "none"),
             ("transcript_path", session.transcript_path or "none"),
             ("final_master_path", session.final_master_path or "none"),

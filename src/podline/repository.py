@@ -15,6 +15,7 @@ def list_sessions(db_file: str) -> List[SessionRecord]:
     SELECT session_uid, source_basename, source_date_folder, source_path,
            recorded_at, recorded_at_source, fingerprint, status,
            failure_reason, failed_at_stage, auphonic_production_id,
+           transcript_refresh_production_id,
            pre_edit_master_path, transcript_path, final_master_path,
            cozytrack_session_id, created_at, updated_at
     FROM sessions
@@ -30,6 +31,7 @@ def get_session(db_file: str, session_uid: str) -> Optional[SessionRecord]:
     SELECT session_uid, source_basename, source_date_folder, source_path,
            recorded_at, recorded_at_source, fingerprint, status,
            failure_reason, failed_at_stage, auphonic_production_id,
+           transcript_refresh_production_id,
            pre_edit_master_path, transcript_path, final_master_path,
            cozytrack_session_id, created_at, updated_at
     FROM sessions
@@ -62,6 +64,7 @@ def get_session_by_fingerprint(
     SELECT session_uid, source_basename, source_date_folder, source_path,
            recorded_at, recorded_at_source, fingerprint, status,
            failure_reason, failed_at_stage, auphonic_production_id,
+           transcript_refresh_production_id,
            pre_edit_master_path, transcript_path, final_master_path,
            cozytrack_session_id, created_at, updated_at
     FROM sessions
@@ -232,6 +235,121 @@ def update_session_status(
         connection.commit()
 
 
+def record_transcript_refresh_production(
+    db_file: str,
+    *,
+    session_uid: str,
+    status: str,
+    production_id: str,
+    timestamp: str,
+) -> None:
+    with connect(db_file) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE sessions
+            SET transcript_refresh_production_id = ?, updated_at = ?
+            WHERE session_uid = ? AND transcript_refresh_production_id IS NULL
+            """,
+            (production_id, timestamp, session_uid),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                f"Could not record transcript refresh production for {session_uid}"
+            )
+        connection.execute(
+            """
+            INSERT INTO events (session_uid, from_state, to_state, timestamp, detail)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                session_uid,
+                status,
+                status,
+                timestamp,
+                f"created Auphonic transcript refresh production {production_id}",
+            ),
+        )
+        connection.commit()
+
+
+def discard_transcript_refresh_production(
+    db_file: str,
+    *,
+    session_uid: str,
+    status: str,
+    production_id: str,
+    timestamp: str,
+    detail: str,
+) -> None:
+    with connect(db_file) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE sessions
+            SET transcript_refresh_production_id = NULL, updated_at = ?
+            WHERE session_uid = ? AND transcript_refresh_production_id = ?
+            """,
+            (timestamp, session_uid, production_id),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                f"Could not discard transcript refresh production for {session_uid}"
+            )
+        connection.execute(
+            """
+            INSERT INTO events (session_uid, from_state, to_state, timestamp, detail)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (session_uid, status, status, timestamp, detail),
+        )
+        connection.commit()
+
+
+def complete_transcript_refresh(
+    db_file: str,
+    *,
+    session_uid: str,
+    status: str,
+    production_id: str,
+    transcript_path: str,
+    timestamp: str,
+) -> None:
+    with connect(db_file) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE sessions
+            SET transcript_path = ?,
+                transcript_refresh_production_id = NULL,
+                updated_at = ?,
+                failure_reason = NULL,
+                failed_at_stage = NULL
+            WHERE session_uid = ? AND transcript_refresh_production_id = ?
+            """,
+            (transcript_path, timestamp, session_uid, production_id),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                f"Could not complete transcript refresh for {session_uid}"
+            )
+        connection.execute(
+            "DELETE FROM episodes WHERE session_uid = ?",
+            (session_uid,),
+        )
+        connection.execute(
+            """
+            INSERT INTO events (session_uid, from_state, to_state, timestamp, detail)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                session_uid,
+                status,
+                status,
+                timestamp,
+                f"refreshed transcript from final master using Auphonic production {production_id}; episode metadata invalidated",
+            ),
+        )
+        connection.commit()
+
+
 def _row_to_session(row) -> SessionRecord:
     return SessionRecord(
         session_uid=row["session_uid"],
@@ -245,6 +363,9 @@ def _row_to_session(row) -> SessionRecord:
         failure_reason=row["failure_reason"],
         failed_at_stage=row["failed_at_stage"],
         auphonic_production_id=row["auphonic_production_id"],
+        transcript_refresh_production_id=row[
+            "transcript_refresh_production_id"
+        ],
         pre_edit_master_path=row["pre_edit_master_path"],
         transcript_path=row["transcript_path"],
         final_master_path=row["final_master_path"],
@@ -270,6 +391,7 @@ def get_session_by_cozytrack_id(
     SELECT session_uid, source_basename, source_date_folder, source_path,
            recorded_at, recorded_at_source, fingerprint, status,
            failure_reason, failed_at_stage, auphonic_production_id,
+           transcript_refresh_production_id,
            pre_edit_master_path, transcript_path, final_master_path,
            cozytrack_session_id, created_at, updated_at
     FROM sessions

@@ -16,6 +16,33 @@ def test_initialize_database_applies_session_metadata_migrations(
     tmp_path: Path,
 ) -> None:
     db_file = tmp_path / "state" / "state.db"
+    db_file.parent.mkdir(parents=True)
+    connection = sqlite3.connect(db_file)
+    connection.execute(
+        """
+        CREATE TABLE sessions (
+            session_uid TEXT PRIMARY KEY,
+            source_basename TEXT,
+            source_date_folder TEXT,
+            source_path TEXT NOT NULL,
+            recorded_at TEXT,
+            recorded_at_source TEXT,
+            fingerprint TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL,
+            failure_reason TEXT,
+            failed_at_stage TEXT,
+            auphonic_production_id TEXT,
+            pre_edit_master_path TEXT,
+            transcript_path TEXT,
+            final_master_path TEXT,
+            cozytrack_session_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.commit()
+    connection.close()
 
     initialize_database(str(db_file))
 

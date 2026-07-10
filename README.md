@@ -109,6 +109,8 @@ pod transcript-refresh @1
 
 Notes:
 - This creates a single-track Auphonic production from `final_master_path`, downloads the new WebVTT file, and overwrites `04_deliverables/transcripts/<session_uid>.vtt`.
+- If polling or downloading is interrupted after Auphonic starts, re-running the command resumes the stored refresh production instead of creating a duplicate.
+- A successful refresh invalidates previously generated episode metadata, so run `pod episode-meta @1` again before creating the Podbean draft.
 - Run this before `pod episode-meta` and `pod podbean-draft` when the cut version differs from the original Auphonic transcript.
 
 6. Generate episode metadata using the local OpenCode command
