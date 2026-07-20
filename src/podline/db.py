@@ -53,6 +53,27 @@ CREATE TABLE IF NOT EXISTS events (
     detail TEXT,
     FOREIGN KEY(session_uid) REFERENCES sessions(session_uid)
 );
+
+CREATE TABLE IF NOT EXISTS media_artifacts (
+    id INTEGER PRIMARY KEY,
+    session_uid TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT '',
+    filename TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    byte_size INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    duration_seconds REAL,
+    s3_uri TEXT NOT NULL,
+    source_provider TEXT,
+    source_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(session_uid) REFERENCES sessions(session_uid)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_media_artifacts_session_kind_role
+    ON media_artifacts(session_uid, kind, role);
 """
 
 

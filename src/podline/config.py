@@ -50,6 +50,14 @@ class CozytrackConfig:
 
 
 @dataclass(frozen=True)
+class StorageConfig:
+    enabled: bool
+    bucket: str
+    region: str
+    key_prefix: str
+
+
+@dataclass(frozen=True)
 class AppConfig:
     runtime_home: Path
     paths: PathsConfig
@@ -58,6 +66,7 @@ class AppConfig:
     auphonic: AuphonicConfig
     podbean: PodbeanConfig
     cozytrack: CozytrackConfig
+    storage: StorageConfig
     config_file: Path
 
 
@@ -106,7 +115,21 @@ def load_config(config_path: Path) -> AppConfig:
             podcast_id=str(_require_nested(data, "podbean", "podcast_id")),
         ),
         cozytrack=_load_cozytrack_config(data),
+        storage=_load_storage_config(data),
         config_file=config_path,
+    )
+
+
+def _load_storage_config(data: Dict[str, Any]) -> StorageConfig:
+    section = data.get("storage") or {}
+    if not isinstance(section, dict):
+        section = {}
+    key_prefix = str(section.get("key_prefix", "")).strip().strip("/")
+    return StorageConfig(
+        enabled=bool(section.get("enabled", False)),
+        bucket=str(section.get("bucket", "")),
+        region=str(section.get("region", "")),
+        key_prefix=key_prefix,
     )
 
 

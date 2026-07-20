@@ -10,6 +10,7 @@ from podline.config import (
     PathsConfig,
     PodbeanConfig,
     PollingConfig,
+    StorageConfig,
 )
 from podline.db import initialize_database
 from podline.ingest import scan_and_ingest
@@ -147,6 +148,7 @@ def test_create_podbean_draft_persists_episode_and_updates_session(
             podcast_id="",
         ),
         cozytrack=_default_cozytrack_config(),
+        storage=_default_storage_config(),
         config_file=tmp_path / "config.yaml",
     )
 
@@ -190,6 +192,7 @@ def test_podbean_client_wraps_http_status_errors(tmp_path: Path) -> None:
             podcast_id="",
         ),
         cozytrack=_default_cozytrack_config(),
+        storage=_default_storage_config(),
         config_file=tmp_path / "config.yaml",
     )
     client = PodbeanClient(config)
@@ -203,3 +206,12 @@ def test_podbean_client_wraps_http_status_errors(tmp_path: Path) -> None:
         assert "unauthorized" in str(exc)
     else:
         raise AssertionError("Expected PodbeanError for wrapped HTTP failure")
+
+
+def _default_storage_config() -> StorageConfig:
+    return StorageConfig(
+        enabled=False,
+        bucket="",
+        region="",
+        key_prefix="",
+    )
