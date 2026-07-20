@@ -12,6 +12,7 @@ after checksum verification. There is no automatic eviction; `pod
 cache-clear` empties it.
 """
 
+import json
 import os
 import shutil
 from datetime import datetime, timezone
@@ -80,7 +81,7 @@ def store_artifact_file(
         source_id=source_id,
         timestamp=datetime.now(timezone.utc).isoformat(),
     )
-    _seed_cache(runtime_paths, source_path=source_path, sha256=sha256)
+    seed_cache(runtime_paths, source_path=source_path, sha256=sha256)
     return record
 
 
@@ -142,8 +143,88 @@ def materialize_artifact_record(
         raise ArtifactError(str(exc)) from exc
 
 
+def content_type_for(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".mp3":
+        return "audio/mpeg"
+    if suffix == ".wav":
+        return "audio/wav"
+    if suffix == ".m4a":
+        return "audio/mp4"
+    if suffix == ".webm":
+        return "audio/webm"
+    if suffix == ".opus":
+        return "audio/ogg"
+    if suffix in {".aif", ".aiff"}:
+        return "audio/aiff"
+    if suffix == ".vtt":
+        return "text/vtt"
+    return "application/octet-stream"
+
+
 def cache_path_for(runtime_paths: RuntimePaths, sha256: str, filename: str) -> Path:
     return Path(runtime_paths.cache_dir) / sha256 / filename
+
+
+def workspace_path_for(runtime_paths: RuntimePaths, session_uid: str) -> Path:
+    return Path(runtime_paths.workspaces_dir) / session_uid
+
+
+def create_workspace(
+    *,
+    config: AppConfig,
+    runtime_paths: RuntimePaths,
+    db_file: str,
+    session_uid: str,
+    storage: Optional[MediaStorage] = None,
+) -> Path:
+    """Materialize the current pre-edit master and transcript for editing.
+
+    Workspaces persist until removed by hand and are never subject to cache
+    clearing; re-running refreshes the copies to the current artifacts.
+    """
+    from podline.models import ArtifactKind
+
+    workspace = workspace_path_for(runtime_paths, session_uid)
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    manifest_entries = {}
+    for kind in (ArtifactKind.PRE_EDIT_MASTER.value, ArtifactKind.TRANSCRIPT.value):
+        artifact = get_media_artifact(db_file, session_uid, kind=kind)
+        if artifact is None:
+            raise ArtifactError(
+                f"No {kind} artifact registered for session {session_uid}; "
+                "run the Auphonic stage before creating a workspace"
+            )
+        cached = materialize_artifact_record(
+            config=config,
+            runtime_paths=runtime_paths,
+            artifact=artifact,
+            storage=storage,
+        )
+        target = workspace / artifact.filename
+        if not target.exists() or sha256_of_file(target) != artifact.sha256:
+            shutil.copy2(cached, target)
+        manifest_entries[kind] = {
+            "filename": artifact.filename,
+            "sha256": artifact.sha256,
+            "s3_uri": artifact.s3_uri,
+        }
+
+    manifest = workspace / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "session_uid": session_uid,
+                "artifacts": manifest_entries,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return workspace
 
 
 def cache_usage_bytes(runtime_paths: RuntimePaths) -> int:
@@ -168,7 +249,7 @@ def clear_cache(runtime_paths: RuntimePaths) -> int:
     return freed
 
 
-def _seed_cache(
+def seed_cache(
     runtime_paths: RuntimePaths, *, source_path: Path, sha256: str
 ) -> None:
     """Register a just-uploaded local file as the cache entry for its hash.

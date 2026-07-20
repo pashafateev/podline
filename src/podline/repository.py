@@ -316,21 +316,19 @@ def complete_transcript_refresh(
     session_uid: str,
     status: str,
     production_id: str,
-    transcript_path: str,
     timestamp: str,
 ) -> None:
     with connect(db_file) as connection:
         cursor = connection.execute(
             """
             UPDATE sessions
-            SET transcript_path = ?,
-                transcript_refresh_production_id = NULL,
+            SET transcript_refresh_production_id = NULL,
                 updated_at = ?,
                 failure_reason = NULL,
                 failed_at_stage = NULL
             WHERE session_uid = ? AND transcript_refresh_production_id = ?
             """,
-            (transcript_path, timestamp, session_uid, production_id),
+            (timestamp, session_uid, production_id),
         )
         if cursor.rowcount != 1:
             raise RuntimeError(
@@ -408,6 +406,58 @@ def get_session_by_cozytrack_id(
     return _row_to_session(row) if row else None
 
 
+def _insert_media_artifact(
+    connection,
+    *,
+    session_uid: str,
+    kind: str,
+    role: str,
+    filename: str,
+    content_type: str,
+    byte_size: int,
+    sha256: str,
+    duration_seconds: Optional[float],
+    s3_uri: str,
+    source_provider: Optional[str],
+    source_id: Optional[str],
+    timestamp: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO media_artifacts (
+            session_uid, kind, role, filename, content_type, byte_size,
+            sha256, duration_seconds, s3_uri, source_provider, source_id,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(session_uid, kind, role) DO UPDATE SET
+            filename = excluded.filename,
+            content_type = excluded.content_type,
+            byte_size = excluded.byte_size,
+            sha256 = excluded.sha256,
+            duration_seconds = excluded.duration_seconds,
+            s3_uri = excluded.s3_uri,
+            source_provider = excluded.source_provider,
+            source_id = excluded.source_id,
+            updated_at = excluded.updated_at
+        """,
+        (
+            session_uid,
+            kind,
+            role,
+            filename,
+            content_type,
+            byte_size,
+            sha256,
+            duration_seconds,
+            s3_uri,
+            source_provider,
+            source_id,
+            timestamp,
+            timestamp,
+        ),
+    )
+
+
 def register_media_artifact(
     db_file: str,
     *,
@@ -430,39 +480,20 @@ def register_media_artifact(
     serve as history.
     """
     with connect(db_file) as connection:
-        connection.execute(
-            """
-            INSERT INTO media_artifacts (
-                session_uid, kind, role, filename, content_type, byte_size,
-                sha256, duration_seconds, s3_uri, source_provider, source_id,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(session_uid, kind, role) DO UPDATE SET
-                filename = excluded.filename,
-                content_type = excluded.content_type,
-                byte_size = excluded.byte_size,
-                sha256 = excluded.sha256,
-                duration_seconds = excluded.duration_seconds,
-                s3_uri = excluded.s3_uri,
-                source_provider = excluded.source_provider,
-                source_id = excluded.source_id,
-                updated_at = excluded.updated_at
-            """,
-            (
-                session_uid,
-                kind,
-                role,
-                filename,
-                content_type,
-                byte_size,
-                sha256,
-                duration_seconds,
-                s3_uri,
-                source_provider,
-                source_id,
-                timestamp,
-                timestamp,
-            ),
+        _insert_media_artifact(
+            connection,
+            session_uid=session_uid,
+            kind=kind,
+            role=role,
+            filename=filename,
+            content_type=content_type,
+            byte_size=byte_size,
+            sha256=sha256,
+            duration_seconds=duration_seconds,
+            s3_uri=s3_uri,
+            source_provider=source_provider,
+            source_id=source_id,
+            timestamp=timestamp,
         )
         connection.commit()
 
@@ -472,6 +503,107 @@ def register_media_artifact(
             f"Failed to register media artifact {kind}/{role or 'default'} for {session_uid}"
         )
     return record
+
+
+def create_session_with_artifacts(
+    db_file: str,
+    *,
+    session_uid: str,
+    fingerprint: str,
+    candidate: ScanCandidate,
+    timestamp: str,
+    artifacts: List[dict],
+    cozytrack_session_id: Optional[str] = None,
+) -> SessionRecord:
+    """Create an S3-native session: session row + artifact rows, one commit.
+
+    No `assets` rows are written — S3-native sessions resolve media through
+    media_artifacts only. Each artifact dict holds the keyword arguments of
+    `_insert_media_artifact` minus session_uid/timestamp.
+    """
+    with connect(db_file) as connection:
+        connection.execute(
+            """
+            INSERT INTO sessions (
+                session_uid, source_basename, source_date_folder, source_path,
+                recorded_at, recorded_at_source, fingerprint, status,
+                failure_reason, failed_at_stage, auphonic_production_id,
+                pre_edit_master_path, transcript_path, final_master_path,
+                cozytrack_session_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_uid,
+                candidate.source_basename,
+                candidate.date_folder_name,
+                str(candidate.session_path),
+                candidate.recorded_at,
+                candidate.recorded_at_source,
+                fingerprint,
+                SessionStatus.QUEUED.value,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                cozytrack_session_id,
+                timestamp,
+                timestamp,
+            ),
+        )
+        for artifact in artifacts:
+            _insert_media_artifact(
+                connection,
+                session_uid=session_uid,
+                timestamp=timestamp,
+                **artifact,
+            )
+        connection.execute(
+            """
+            INSERT INTO events (session_uid, from_state, to_state, timestamp, detail)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                session_uid,
+                None,
+                SessionStatus.QUEUED.value,
+                timestamp,
+                f"session registered with {len(artifacts)} S3 artifacts",
+            ),
+        )
+        connection.commit()
+
+    created = get_session(db_file, session_uid)
+    if created is None:
+        raise RuntimeError(f"Failed to load created session {session_uid}")
+    return created
+
+
+def update_media_artifact_duration(
+    db_file: str,
+    *,
+    session_uid: str,
+    kind: str,
+    role: str,
+    duration_seconds: float,
+    timestamp: str,
+) -> None:
+    with connect(db_file) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE media_artifacts
+            SET duration_seconds = ?, updated_at = ?
+            WHERE session_uid = ? AND kind = ? AND role = ?
+            """,
+            (duration_seconds, timestamp, session_uid, kind, role),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                f"Could not persist duration for artifact {kind}/{role or 'default'} "
+                f"of session {session_uid}"
+            )
+        connection.commit()
 
 
 def get_media_artifact(

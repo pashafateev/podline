@@ -10,6 +10,9 @@ auphonic:
     speakers_2: "replace-me"
     speakers_3: "replace-me"
     speakers_4: "replace-me"
+  # UUID of the Amazon S3 external service registered in Auphonic
+  # (Settings -> External Services); productions attach S3 audio through it.
+  s3_service_id: "replace-me"
 
 cozytrack:
   base_url: http://localhost:3000

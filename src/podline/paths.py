@@ -15,6 +15,7 @@ def build_runtime_paths(config: AppConfig) -> RuntimePaths:
         logs_dir=str(home / "logs"),
         staging_dir=str(home / "staging"),
         cache_dir=str(home / "cache"),
+        workspaces_dir=str(home / "workspaces"),
     )
 
 
@@ -25,5 +26,6 @@ def ensure_runtime_dirs(runtime_paths: RuntimePaths) -> None:
         runtime_paths.logs_dir,
         runtime_paths.staging_dir,
         runtime_paths.cache_dir,
+        runtime_paths.workspaces_dir,
     ):
         Path(path).mkdir(parents=True, exist_ok=True)

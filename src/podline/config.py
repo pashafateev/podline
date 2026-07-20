@@ -30,6 +30,9 @@ class AuphonicConfig:
     poll_interval_seconds: int
     max_poll_attempts: int
     preset_ids: Dict[str, str]
+    # UUID of the Amazon S3 external service registered in the Auphonic
+    # account; productions attach S3 audio by key through this service.
+    s3_service_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -107,6 +110,7 @@ def load_config(config_path: Path) -> AppConfig:
                 _require_nested(data, "auphonic", "max_poll_attempts")
             ),
             preset_ids=dict(_require_nested(data, "auphonic", "preset_ids")),
+            s3_service_id=str((data.get("auphonic") or {}).get("s3_service_id", "")),
         ),
         podbean=PodbeanConfig(
             enabled=bool(_require_nested(data, "podbean", "enabled")),

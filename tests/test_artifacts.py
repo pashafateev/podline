@@ -92,6 +92,7 @@ def _build_runtime_paths(tmp_path: Path) -> RuntimePaths:
         logs_dir=str(home / "logs"),
         staging_dir=str(home / "staging"),
         cache_dir=str(home / "cache"),
+        workspaces_dir=str(home / "workspaces"),
     )
     (home / "state").mkdir(parents=True, exist_ok=True)
     (home / "cache").mkdir(parents=True, exist_ok=True)
