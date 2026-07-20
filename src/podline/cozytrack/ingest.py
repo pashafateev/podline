@@ -1,8 +1,9 @@
 import logging
 import re
-from datetime import datetime, timezone
+import shutil
+from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from podline.config import AppConfig
 from podline.cozytrack.client import (
@@ -10,14 +11,11 @@ from podline.cozytrack.client import (
     CozytrackClientProtocol,
     CozytrackSession,
 )
-from podline.fingerprint import build_fingerprint, build_session_uid
-from podline.models import SessionRecord
-from podline.repository import (
-    create_session,
-    get_session_by_cozytrack_id,
-)
+from podline.ingest import DurationProbe, register_candidate_with_storage
+from podline.models import RuntimePaths, ScanCandidate, SessionRecord, UnsupportedSession
+from podline.repository import get_session_by_cozytrack_id
 from podline.scanner import _parse_session_dir
-from podline.models import ScanCandidate, UnsupportedSession
+from podline.storage import MediaStorage
 
 
 class CozytrackIngestError(RuntimeError):
@@ -45,19 +43,28 @@ def _existing_cozytrack_ids(db_file: str) -> List[str]:
 def ingest_session(
     *,
     config: AppConfig,
+    runtime_paths: RuntimePaths,
     db_file: str,
     cozytrack_session_id: str,
     name_override: Optional[str] = None,
     client: Optional[CozytrackClientProtocol] = None,
+    storage: Optional[MediaStorage] = None,
+    duration_probe: Optional[DurationProbe] = None,
     logger: Optional[logging.Logger] = None,
 ) -> SessionRecord:
+    """Download a Cozytrack session into disposable staging and register it in S3.
+
+    Tracks land in a staging folder only long enough to classify, hash, and
+    upload; on success the staging folder is removed (the cache keeps
+    hardlinked copies). Re-running an already-ingested session is a no-op.
+    """
     existing = get_session_by_cozytrack_id(db_file, cozytrack_session_id)
     if existing is not None:
         _log(
             logger,
-            "Cozytrack session %s already ingested at %s",
+            "Cozytrack session %s already ingested as %s",
             cozytrack_session_id,
-            existing.source_path,
+            existing.session_uid,
         )
         return existing
 
@@ -68,15 +75,15 @@ def ingest_session(
             f"Cozytrack session {cozytrack_session_id} has no tracks"
         )
 
-    folder = _build_session_folder(
-        config=config,
+    folder = _build_staging_folder(
+        runtime_paths=runtime_paths,
         session=session,
         name_override=name_override,
     )
     folder.mkdir(parents=True, exist_ok=True)
     _log(
         logger,
-        "Cozytrack ingest session=%s folder=%s tracks=%s",
+        "Cozytrack ingest session=%s staging=%s tracks=%s",
         cozytrack_session_id,
         folder,
         len(session.tracks),
@@ -86,7 +93,7 @@ def ingest_session(
         session.tracks,
         key=lambda track: (track.created_at or "", track.id),
     )
-    written_paths: List[Path] = []
+    track_source_ids: Dict[str, str] = {}
     try:
         for index, track in enumerate(sorted_tracks, start=1):
             destination = folder / f"Tr{index}.webm"
@@ -98,72 +105,60 @@ def ingest_session(
                 index,
                 destination,
             )
-            written_paths.append(destination)
             client.download_to_file(url, destination)
+            track_source_ids[destination.name] = track.id
+
+        parsed = _parse_session_dir(folder, logger=logger)
+        if isinstance(parsed, UnsupportedSession):
+            raise CozytrackIngestError(
+                f"Cozytrack ingest produced an unsupported session: {parsed.reason}"
+            )
+        if not isinstance(parsed, ScanCandidate):
+            raise CozytrackIngestError(
+                f"Cozytrack ingest could not classify the downloaded session at {folder}"
+            )
+
+        record, _created = register_candidate_with_storage(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=db_file,
+            candidate=parsed,
+            source_provider="cozytrack",
+            cozytrack_session_id=cozytrack_session_id,
+            track_source_ids=track_source_ids,
+            storage=storage,
+            duration_probe=duration_probe,
+            logger=logger,
+        )
+    except CozytrackIngestError:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
     except Exception as exc:
-        for path in written_paths:
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
+        shutil.rmtree(folder, ignore_errors=True)
         raise CozytrackIngestError(
-            f"Cozytrack ingest failed downloading tracks for session {cozytrack_session_id}: {exc}"
+            f"Cozytrack ingest failed for session {cozytrack_session_id}: {exc}"
         ) from exc
 
-    parsed = _parse_session_dir(folder, logger=logger)
-    if isinstance(parsed, UnsupportedSession):
-        raise CozytrackIngestError(
-            f"Cozytrack ingest produced an unsupported session: {parsed.reason}"
-        )
-    if not isinstance(parsed, ScanCandidate):
-        raise CozytrackIngestError(
-            f"Cozytrack ingest could not classify the downloaded session at {folder}"
-        )
-
-    fingerprint = build_fingerprint(parsed)
-    session_uid = build_session_uid(fingerprint)
-    timestamp = datetime.now(timezone.utc).isoformat()
-    record = create_session(
-        db_file,
-        session_uid=session_uid,
-        fingerprint=fingerprint,
-        candidate=parsed,
-        timestamp=timestamp,
-        cozytrack_session_id=cozytrack_session_id,
-    )
+    shutil.rmtree(folder, ignore_errors=True)
     _log(
         logger,
         "Cozytrack ingest complete session=%s session_uid=%s",
         cozytrack_session_id,
-        session_uid,
+        record.session_uid,
     )
     return record
 
 
-def _build_session_folder(
+def _build_staging_folder(
     *,
-    config: AppConfig,
+    runtime_paths: RuntimePaths,
     session: CozytrackSession,
     name_override: Optional[str],
 ) -> Path:
-    raw_root = Path(config.paths.raw_root)
-    download_subdir = config.cozytrack.download_subdir.strip()
-    if download_subdir:
-        subdir_path = Path(download_subdir)
-        assert not subdir_path.is_absolute(), (
-            f"cozytrack.download_subdir must be relative: {download_subdir!r}"
-        )
-        assert ".." not in subdir_path.parts, (
-            f"cozytrack.download_subdir must not contain '..': {download_subdir!r}"
-        )
-        base_dir = raw_root / subdir_path
-    else:
-        base_dir = raw_root
-
     date_part = _format_date(session.finalized_at)
     slug = slugify(name_override or session.name or session.id)
     folder_name = f"{date_part}_{slug}" if date_part else slug
-    return base_dir / folder_name
+    return Path(runtime_paths.staging_dir) / "ct-ingest" / folder_name
 
 
 def _format_date(value: Optional[str]) -> str:

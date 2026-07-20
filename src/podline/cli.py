@@ -5,7 +5,14 @@ import webbrowser
 
 import typer
 
-from podline.artifacts import cache_usage_bytes, clear_cache
+from podline.artifacts import (
+    ArtifactError,
+    cache_path_for,
+    cache_usage_bytes,
+    clear_cache,
+    create_workspace,
+    workspace_path_for,
+)
 from podline.auphonic import (
     AuphonicError,
     inspect_production,
@@ -36,11 +43,11 @@ from podline.finalize import (
     get_episode_metadata,
 )
 from podline.health import read_health_snapshot, write_health_snapshot
-from podline.ingest import scan_and_ingest
+from podline.ingest import IngestError, import_local_folder
 from podline.logging_setup import configure_logging
 from podline.paths import build_runtime_paths, ensure_runtime_dirs
 from podline.podbean import PodbeanError, create_podbean_draft
-from podline.repository import get_session, list_sessions
+from podline.repository import get_session, list_media_artifacts, list_sessions
 
 app = typer.Typer(help="podline automation CLI.")
 
@@ -229,9 +236,16 @@ def _resolve_session_arg(runtime_paths, session_arg: str):
     return get_session(runtime_paths.db_file, session_arg)
 
 
-def _resolve_finalize_master(loaded_config, master: Optional[Path]) -> Path:
+def _resolve_finalize_master(
+    loaded_config, master: Optional[Path], *, workspace_dir: Optional[Path] = None
+) -> Path:
     masters_dir = loaded_config.paths.deliverables_root / "masters"
     allowed_suffixes = {".mp3", ".wav", ".m4a", ".aif", ".aiff"}
+    search_dirs = [
+        directory
+        for directory in (workspace_dir, masters_dir)
+        if directory is not None and directory.exists()
+    ]
 
     if master is not None:
         if not master.is_absolute() and master.parent == Path("."):
@@ -242,51 +256,56 @@ def _resolve_finalize_master(loaded_config, master: Optional[Path]) -> Path:
             episode_match = re.fullmatch(r"ep(\d+)", master.name.lower())
             if episode_match:
                 episode_number = int(episode_match.group(1))
-                candidates = (
-                    sorted(
-                        path
-                        for path in masters_dir.iterdir()
-                        if path.is_file()
-                        and path.suffix.lower() in allowed_suffixes
-                        and re.fullmatch(
-                            rf"sexdrunks_ep0*{episode_number}_master{re.escape(path.suffix)}",
-                            path.name,
-                            re.IGNORECASE,
-                        )
+                candidates = sorted(
+                    path
+                    for directory in search_dirs
+                    for path in directory.iterdir()
+                    if path.is_file()
+                    and path.suffix.lower() in allowed_suffixes
+                    and re.fullmatch(
+                        rf"sexdrunks_ep0*{episode_number}_master{re.escape(path.suffix)}",
+                        path.name,
+                        re.IGNORECASE,
                     )
-                    if masters_dir.exists()
-                    else []
                 )
                 if len(candidates) == 1:
                     return candidates[0]
                 if len(candidates) > 1:
                     raise FinalizeError(
-                        f"Multiple masters matched shortcut {master.name} in {masters_dir}. Provide --master <filename> or --master <path>."
+                        f"Multiple masters matched shortcut {master.name} in {', '.join(str(d) for d in search_dirs)}. Provide --master <filename> or --master <path>."
                     )
 
-            candidate = masters_dir / master.name
-            if candidate.exists():
-                return candidate
+            for directory in search_dirs:
+                candidate = directory / master.name
+                if candidate.exists():
+                    return candidate
         return master
 
-    if not masters_dir.exists():
+    if not search_dirs:
         raise FinalizeError(
-            f"No --master provided and expected masters directory does not exist: {masters_dir}. Provide --master <path> or export into the expected directory."
+            f"No --master provided and neither the session workspace nor {masters_dir} exists. Provide --master <path>."
         )
 
+    # The workspace also holds the downloaded pre-edit master, which must not
+    # be picked up as the exported final master.
     candidates = sorted(
         path
-        for path in masters_dir.iterdir()
-        if path.is_file() and path.suffix.lower() in allowed_suffixes
+        for directory in search_dirs
+        for path in directory.iterdir()
+        if path.is_file()
+        and path.suffix.lower() in allowed_suffixes
+        and not (directory == workspace_dir and "pre_edit" in path.name.lower())
     )
     if len(candidates) == 1:
         return candidates[0]
     if not candidates:
         raise FinalizeError(
-            f"No --master provided and no audio masters were found in {masters_dir}. Provide --master <path> or export into the expected directory."
+            "No --master provided and no exported masters were found in "
+            f"{', '.join(str(d) for d in search_dirs)}. Provide --master <path>."
         )
     raise FinalizeError(
-        f"No --master provided and multiple audio masters were found in {masters_dir}. Provide --master <filename> or --master <path>."
+        "No --master provided and multiple masters were found in "
+        f"{', '.join(str(d) for d in search_dirs)}. Provide --master <filename> or --master <path>."
     )
 
 
@@ -351,51 +370,15 @@ def refresh(
         None, "--config", help="Path to config.yaml."
     ),
 ) -> None:
-    """Reset DB, rescan recordings, and list sessions."""
-    config_path = _resolve_config_path(config)
-    loaded_config, runtime_paths = _reset_database_for_runtime(config_path)
-    logger = configure_logging(runtime_paths.logs_dir, debug=debug)
-
-    outcome = scan_and_ingest(
-        loaded_config.paths.raw_root, runtime_paths.db_file, logger=logger
+    """Retired: sessions now live in S3-backed storage."""
+    typer.secho(
+        "✖ pod refresh is retired: it rebuilt the database from drive scans, which "
+        "would discard S3-native sessions.",
+        fg=typer.colors.RED,
+        bold=True,
     )
-    snapshot = write_health_snapshot(
-        runtime_paths, loaded_config, worker_status="stopped"
-    )
-    logger.info(
-        "refresh finished discovered=%s created=%s duplicates=%s unsupported=%s",
-        outcome.discovered,
-        outcome.created,
-        outcome.duplicates,
-        len(outcome.unsupported),
-    )
-
-    _print_header("Refresh Complete")
-    _print_key_values(
-        [
-            ("database", runtime_paths.db_file),
-            ("discovered", str(outcome.discovered)),
-            ("created", str(outcome.created)),
-            ("duplicates", str(outcome.duplicates)),
-            ("unsupported", str(len(outcome.unsupported))),
-            ("queue_depth", str(snapshot.queue_depth)),
-        ]
-    )
-
-    for unsupported in outcome.unsupported:
-        typer.echo()
-        _print_header("Unsupported Session")
-        typer.echo(
-            " | ".join(
-                [
-                    f"path={unsupported.session_path}",
-                    f"reason={unsupported.reason}",
-                    f"spoken_tracks={unsupported.spoken_track_count}",
-                ]
-            )
-        )
-
-    _print_sessions(runtime_paths)
+    typer.echo("Use 'pod ct-ingest <id>' for Cozytrack or 'pod import <folder>' for local recordings.")
+    raise typer.Exit(code=1)
 
 
 @app.command()
@@ -461,6 +444,17 @@ def cache_clear(
             ("freed", _format_bytes(freed)),
         ]
     )
+
+
+def _artifact_uri(runtime_paths, session_uid: str, kind: str) -> str:
+    artifacts = [
+        artifact
+        for artifact in list_media_artifacts(runtime_paths.db_file, session_uid)
+        if artifact.kind == kind
+    ]
+    if not artifacts:
+        return "none"
+    return artifacts[0].s3_uri
 
 
 def _format_bytes(value: int) -> str:
@@ -533,11 +527,34 @@ def status(
                 "transcript_refresh_production_id",
                 session.transcript_refresh_production_id or "none",
             ),
-            ("pre_edit_master_path", session.pre_edit_master_path or "none"),
-            ("transcript_path", session.transcript_path or "none"),
-            ("final_master_path", session.final_master_path or "none"),
         ],
     )
+    artifacts = list_media_artifacts(runtime_paths.db_file, session.session_uid)
+    if artifacts:
+        workspace_dir = workspace_path_for(runtime_paths, session.session_uid)
+        rows = []
+        for artifact in artifacts:
+            label = (
+                f"{artifact.kind}:{artifact.role}" if artifact.role else artifact.kind
+            )
+            cached = cache_path_for(
+                runtime_paths, artifact.sha256, artifact.filename
+            ).exists()
+            in_workspace = (workspace_dir / artifact.filename).exists()
+            location = "cached" if cached else "s3-only"
+            if in_workspace:
+                location += "+workspace"
+            rows.append((label, f"{artifact.s3_uri}  [{location}]"))
+        _print_section("Artifacts", rows)
+    else:
+        _print_section(
+            "Legacy Paths",
+            [
+                ("pre_edit_master_path", session.pre_edit_master_path or "none"),
+                ("transcript_path", session.transcript_path or "none"),
+                ("final_master_path", session.final_master_path or "none"),
+            ],
+        )
     _print_section(
         "Metadata",
         [
@@ -584,47 +601,94 @@ def scan(
         None, "--config", help="Path to config.yaml."
     ),
 ) -> None:
-    """Scan raw recordings and ingest new sessions."""
+    """Retired: use pod import <folder> to register local recordings."""
+    typer.secho(
+        "✖ pod scan is retired: drive-scan registration would create sessions the "
+        "S3-backed pipeline cannot process.",
+        fg=typer.colors.RED,
+        bold=True,
+    )
+    typer.echo("Use 'pod import <folder>' to register a local recording folder.")
+    raise typer.Exit(code=1)
+
+
+@app.command("import")
+def import_command(
+    folder: Path = typer.Argument(..., help="Recording folder containing TrN track files."),
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
+    config: Optional[Path] = typer.Option(
+        None, "--config", help="Path to config.yaml."
+    ),
+) -> None:
+    """Register a local recording folder (e.g. Riverside) into S3 storage."""
     config_path = _resolve_config_path(config)
     loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
-    outcome = scan_and_ingest(
-        loaded_config.paths.raw_root, runtime_paths.db_file, logger=logger
-    )
-    snapshot = write_health_snapshot(
-        runtime_paths, loaded_config, worker_status="stopped"
-    )
 
-    logger.info(
-        "scan finished discovered=%s created=%s duplicates=%s unsupported=%s",
-        outcome.discovered,
-        outcome.created,
-        outcome.duplicates,
-        len(outcome.unsupported),
-    )
+    try:
+        record, created = import_local_folder(
+            config=loaded_config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            folder=folder,
+            logger=logger,
+        )
+    except IngestError as exc:
+        logger.error("Import failed for %s: %s", folder, exc)
+        typer.echo(f"Import error: {exc}")
+        raise typer.Exit(code=1)
 
-    _print_header("Scan Complete")
+    _print_header("Import Complete" if created else "Already Registered")
     _print_key_values(
         [
-            ("discovered", str(outcome.discovered)),
-            ("created", str(outcome.created)),
-            ("duplicates", str(outcome.duplicates)),
-            ("unsupported", str(len(outcome.unsupported))),
-            ("queue_depth", str(snapshot.queue_depth)),
+            ("folder", str(folder)),
+            ("session_uid", record.session_uid),
+            ("status", _format_status(record.status)),
+            ("created", "yes" if created else "no (same content already registered)"),
         ]
     )
 
-    for unsupported in outcome.unsupported:
-        typer.echo()
-        _print_header("Unsupported Session")
-        typer.echo(
-            " | ".join(
-                [
-                    f"path={unsupported.session_path}",
-                    f"reason={unsupported.reason}",
-                    f"spoken_tracks={unsupported.spoken_track_count}",
-                ]
-            )
+
+@app.command()
+def workspace(
+    session_uid: str,
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
+    config: Optional[Path] = typer.Option(
+        None, "--config", help="Path to config.yaml."
+    ),
+) -> None:
+    """Materialize the pre-edit master and transcript into a persistent editing folder."""
+    config_path = _resolve_config_path(config)
+    loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
+    session = _resolve_session_arg(runtime_paths, session_uid)
+    if session is None:
+        typer.secho(
+            f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
         )
+        raise typer.Exit(code=1)
+
+    try:
+        workspace_dir = create_workspace(
+            config=loaded_config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session_uid=session.session_uid,
+        )
+    except ArtifactError as exc:
+        logger.error("Workspace creation failed for %s: %s", session.session_uid, exc)
+        typer.echo(f"Workspace error: {exc}")
+        raise typer.Exit(code=1)
+
+    contents = sorted(
+        entry.name for entry in workspace_dir.iterdir() if entry.is_file()
+    )
+    _print_header("Workspace Ready")
+    _print_key_values(
+        [
+            ("session_uid", session.session_uid),
+            ("workspace", str(workspace_dir)),
+            ("contents", ", ".join(contents) or "empty"),
+        ]
+    )
 
 
 @app.command("finalize")
@@ -651,8 +715,12 @@ def finalize_command(
         raise typer.Exit(code=1)
 
     try:
-        resolved_master = _resolve_finalize_master(_loaded_config, master)
+        resolved_master = _resolve_finalize_master(
+            _loaded_config, master, workspace_dir=workspace_path_for(runtime_paths, session.session_uid)
+        )
         updated = finalize_session(
+            config=_loaded_config,
+            runtime_paths=runtime_paths,
             db_file=runtime_paths.db_file,
             session=session,
             master_path=resolved_master,
@@ -663,13 +731,14 @@ def finalize_command(
         raise typer.Exit(code=1)
 
     episode = get_episode_metadata(runtime_paths.db_file, updated.session_uid)
+    final_master_uri = _artifact_uri(runtime_paths, updated.session_uid, "final_master")
     _print_header("Finalize Complete")
     _print_section(
         "Overview",
         [
             ("session_uid", updated.session_uid),
             ("status", _format_status(updated.status)),
-            ("final_master_path", updated.final_master_path or "none"),
+            ("final_master", final_master_uri),
         ],
     )
     if episode is not None:
@@ -720,6 +789,7 @@ def episode_meta_command(
     try:
         episode = generate_episode_metadata_with_opencode(
             config=loaded_config,
+            runtime_paths=runtime_paths,
             db_file=runtime_paths.db_file,
             session=session,
         )
@@ -784,8 +854,8 @@ def transcript_refresh_command(
         [
             ("session_uid", updated.session_uid),
             ("status", _format_status(updated.status)),
-            ("transcript_path", updated.transcript_path or "none"),
-            ("final_master_path", updated.final_master_path or "none"),
+            ("transcript", _artifact_uri(runtime_paths, updated.session_uid, "transcript")),
+            ("final_master", _artifact_uri(runtime_paths, updated.session_uid, "final_master")),
         ],
     )
 
@@ -811,6 +881,7 @@ def podbean_draft_command(
     try:
         episode = create_podbean_draft(
             config=loaded_config,
+            runtime_paths=runtime_paths,
             db_file=runtime_paths.db_file,
             session=session,
         )
@@ -872,8 +943,9 @@ def auphonic_command(
             ("session_uid", updated.session_uid),
             ("status", _format_status(updated.status)),
             ("auphonic_production_id", updated.auphonic_production_id or "none"),
-            ("pre_edit_master_path", updated.pre_edit_master_path or "none"),
-            ("transcript_path", updated.transcript_path or "none"),
+            ("pre_edit_master", _artifact_uri(runtime_paths, updated.session_uid, "pre_edit_master")),
+            ("transcript", _artifact_uri(runtime_paths, updated.session_uid, "transcript")),
+            ("workspace", str(workspace_path_for(runtime_paths, updated.session_uid))),
         ]
     )
 
@@ -1016,8 +1088,9 @@ def auphonic_start_command(
             ("session_uid", updated.session_uid),
             ("status", _format_status(updated.status)),
             ("auphonic_production_id", updated.auphonic_production_id or "none"),
-            ("pre_edit_master_path", updated.pre_edit_master_path or "none"),
-            ("transcript_path", updated.transcript_path or "none"),
+            ("pre_edit_master", _artifact_uri(runtime_paths, updated.session_uid, "pre_edit_master")),
+            ("transcript", _artifact_uri(runtime_paths, updated.session_uid, "transcript")),
+            ("workspace", str(workspace_path_for(runtime_paths, updated.session_uid))),
         ]
     )
 
@@ -1136,6 +1209,7 @@ def auphonic_offset_command(
     try:
         result = offset_session_auphonic_production(
             config=loaded_config,
+            runtime_paths=runtime_paths,
             db_file=runtime_paths.db_file,
             session=session,
             apply=apply,
@@ -1152,7 +1226,7 @@ def auphonic_offset_command(
         [
             (
                 item.asset.filename,
-                f"{_format_seconds(item.duration_seconds)}s  {item.asset.local_path}",
+                f"{_format_seconds(item.duration_seconds)}s  role={item.asset.role}",
             )
             for item in plan.asset_durations
         ],
@@ -1254,6 +1328,7 @@ def ct_ingest_command(
     try:
         record = cozytrack_ingest_session(
             config=loaded_config,
+            runtime_paths=runtime_paths,
             db_file=runtime_paths.db_file,
             cozytrack_session_id=cozytrack_id,
             name_override=name,
@@ -1264,12 +1339,13 @@ def ct_ingest_command(
         typer.echo(f"Cozytrack error: {exc}")
         raise typer.Exit(code=1)
 
+    artifacts = list_media_artifacts(runtime_paths.db_file, record.session_uid)
     _print_header("Cozytrack Ingest Complete")
     _print_key_values(
         [
             ("cozytrack_id", cozytrack_id),
             ("session_uid", record.session_uid),
-            ("source_path", record.source_path),
+            ("artifacts", str(len(artifacts))),
             ("status", _format_status(record.status)),
         ]
     )
@@ -1326,7 +1402,7 @@ def auphonic_sync_command(
             ("session_uid", updated.session_uid),
             ("status", _format_status(updated.status)),
             ("auphonic_production_id", updated.auphonic_production_id or "none"),
-            ("pre_edit_master_path", updated.pre_edit_master_path or "none"),
-            ("transcript_path", updated.transcript_path or "none"),
+            ("pre_edit_master", _artifact_uri(runtime_paths, updated.session_uid, "pre_edit_master")),
+            ("transcript", _artifact_uri(runtime_paths, updated.session_uid, "transcript")),
         ]
     )

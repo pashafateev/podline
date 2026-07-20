@@ -12,9 +12,15 @@ from urllib.parse import quote, unquote, urlparse
 
 import httpx
 
+from podline.artifacts import (
+    create_workspace,
+    materialize_artifact_record,
+    store_artifact_file,
+)
 from podline.config import AppConfig
 from podline.models import (
-    AssetRecord,
+    ArtifactKind,
+    MediaArtifactRecord,
     RuntimePaths,
     SessionRecord,
     SessionStatus,
@@ -22,11 +28,14 @@ from podline.models import (
 from podline.repository import (
     complete_transcript_refresh,
     discard_transcript_refresh_production,
+    get_media_artifact,
     get_session,
-    list_assets_for_session,
+    list_media_artifacts,
     record_transcript_refresh_production,
+    update_media_artifact_duration,
     update_session_status,
 )
+from podline.storage import parse_s3_uri, redact_url
 
 
 class AuphonicError(RuntimeError):
@@ -62,7 +71,7 @@ class AuphonicPreview:
 
 @dataclass(frozen=True)
 class AuphonicAssetDuration:
-    asset: AssetRecord
+    asset: MediaArtifactRecord
     duration_seconds: float
 
 
@@ -70,8 +79,8 @@ class AuphonicAssetDuration:
 class AuphonicOffsetPlan:
     production_id: str
     asset_durations: List[AuphonicAssetDuration]
-    target_asset: AssetRecord
-    longer_asset: AssetRecord
+    target_asset: MediaArtifactRecord
+    longer_asset: MediaArtifactRecord
     target_track_id: str
     target_input_file: str
     offset_seconds: float
@@ -89,12 +98,16 @@ DurationProbe = Callable[[Path], float]
 
 class AuphonicClientProtocol(Protocol):
     def create_production(
-        self, *, session: SessionRecord, assets: List[AssetRecord], preset_id: str
+        self, *, title: str, track_count: int, preset_id: str
     ) -> AuphonicPreparedProduction: ...
 
-    def upload_assets(
-        self, production_id: str, assets: List[AssetRecord], upload_track_ids: List[str]
-    ) -> None: ...
+    def attach_service_input(
+        self, production_id: str, track_id: str, service_id: str, input_key: str
+    ) -> Dict: ...
+
+    def create_single_input_production(
+        self, *, title: str, preset_id: str, service_id: str, input_key: str
+    ) -> str: ...
 
     def start_production(self, production_id: str) -> None: ...
 
@@ -123,15 +136,15 @@ class AuphonicClient:
     def create_production(
         self,
         *,
-        session: SessionRecord,
-        assets: List[AssetRecord],
+        title: str,
+        track_count: int,
         preset_id: str,
     ) -> AuphonicPreparedProduction:
         payload = {
             "preset": preset_id,
-            "metadata": {"title": session.source_basename or session.session_uid},
+            "metadata": {"title": title},
         }
-        if len(assets) > 1:
+        if track_count > 1:
             payload["is_multitrack"] = True
 
         response = self._request_with_retries(
@@ -154,8 +167,8 @@ class AuphonicClient:
             )
         upload_track_ids = (
             ["input_file"]
-            if len(assets) == 1
-            else _resolve_upload_track_ids(data_node, assets)
+            if track_count == 1
+            else _resolve_preset_track_ids(data_node, track_count)
         )
         logging.getLogger("podline").debug(
             "Auphonic create details production_id=%s status_page=%s edit_page=%s start_allowed=%s change_allowed=%s upload_track_ids=%s",
@@ -173,114 +186,55 @@ class AuphonicClient:
             edit_page=data_node.get("edit_page"),
         )
 
-    def upload_assets(
-        self, production_id: str, assets: List[AssetRecord], upload_track_ids: List[str]
-    ) -> None:
-        payload = self._upload_assets_with_curl(
-            production_id=production_id,
-            assets=assets,
-            upload_track_ids=upload_track_ids,
-        )
-        data_node = payload.get("data", payload)
-        logging.getLogger("podline").debug(
-            "Auphonic upload details production_id=%s attached=%s start_allowed=%s multi_input_files=%s",
-            production_id,
-            _upload_attachment_summary(data_node),
-            data_node.get("start_allowed") if isinstance(data_node, dict) else None,
-            data_node.get("multi_input_files") if isinstance(data_node, dict) else None,
-        )
-        if isinstance(data_node, dict) and not _upload_looks_attached(
-            data_node, upload_track_ids
-        ):
-            raise AuphonicError(
-                f"Auphonic upload for production {production_id} did not attach all tracks"
-            )
-
-    def _upload_assets_with_curl(
-        self,
-        *,
-        production_id: str,
-        assets: List[AssetRecord],
-        upload_track_ids: List[str],
+    def attach_service_input(
+        self, production_id: str, track_id: str, service_id: str, input_key: str
     ) -> Dict:
-        curl_binary = _resolve_curl_binary()
-        command = [
-            curl_binary,
-            "-sS",
-            "--http1.1",
-            "--tlsv1.2",
-            "--no-alpn",
-            "--limit-rate",
-            "8M",
-            "--connect-timeout",
-            "30",
-            "-X",
+        escaped_track_id = quote(str(track_id), safe="")
+        response = self._request_with_retries(
             "POST",
-            f"{self._config.auphonic.base_url.rstrip('/')}/production/{production_id}/upload.json?bearer_token={self._config.auphonic.api_key}",
-            "--max-time",
-            str(self._config.auphonic.request_timeout_seconds),
-        ]
-        for asset, upload_track_id in zip(assets, upload_track_ids):
-            content_type = _audio_content_type_for(Path(asset.local_path))
-            command.extend(
-                [
-                    "-F",
-                    f"{upload_track_id}=@{asset.local_path};type={content_type}",
-                ]
-            )
-
-        logging.getLogger("podline").debug(
-            "Auphonic curl upload command production_id=%s curl=%s track_ids=%s",
-            production_id,
-            curl_binary,
-            upload_track_ids,
+            f"/production/{production_id}/multi_input_files/{escaped_track_id}.json",
+            json={
+                "type": "multitrack",
+                "service": service_id,
+                "input_file": input_key,
+            },
+            headers={"Content-Type": "application/json"},
         )
-        result = None
-        success_attempt = None
-        for attempt in range(3):
-            result = subprocess.run(command, capture_output=True, text=True)
-            if result.returncode == 0:
-                success_attempt = attempt + 1
-                break
-
-            stderr_preview = result.stderr[:300]
-            logging.getLogger("podline").debug(
-                "Auphonic curl upload transient failure production_id=%s attempt=%s exit_code=%s will_retry=%s stderr=%s",
-                production_id,
-                attempt + 1,
-                result.returncode,
-                attempt < 2,
-                stderr_preview,
-            )
-            if result.returncode not in {55, 56}:
-                raise AuphonicError(
-                    f"Auphonic curl upload failed with exit code {result.returncode}: {stderr_preview}"
-                )
-            if attempt < 2:
-                sleep(5)
-
-        if result is None or result.returncode != 0:
+        payload = response.json()
+        if payload.get("status_code", response.status_code) >= 400:
             raise AuphonicError(
-                f"Auphonic curl upload failed with exit code {result.returncode if result else 'unknown'}: {(result.stderr[:300] if result else 'no stderr')}"
+                f"Auphonic attach failed for track {track_id} with status {payload.get('status_code')}: {payload.get('error_message') or payload.get('form_errors') or payload}"
             )
-        if success_attempt and success_attempt > 1:
-            logging.getLogger("podline").debug(
-                "Auphonic curl upload recovered after retry production_id=%s success_attempt=%s",
-                production_id,
-                success_attempt,
-            )
-        try:
-            payload = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            raise AuphonicError(
-                f"Auphonic curl upload returned non-JSON response: {result.stdout[:300]}"
-            ) from exc
-
-        if payload.get("status_code", 200) >= 400:
-            raise AuphonicError(
-                f"Auphonic upload failed with status {payload.get('status_code')}: {payload.get('error_message') or payload.get('form_errors') or payload}"
-            )
+        logging.getLogger("podline").debug(
+            "Auphonic attach production_id=%s track_id=%s input_key=%s",
+            production_id,
+            track_id,
+            input_key,
+        )
         return payload
+
+    def create_single_input_production(
+        self, *, title: str, preset_id: str, service_id: str, input_key: str
+    ) -> str:
+        response = self._request_with_retries(
+            "POST",
+            "/productions.json",
+            json={
+                "preset": preset_id,
+                "metadata": {"title": title},
+                "service": service_id,
+                "input_file": input_key,
+            },
+            headers={"Content-Type": "application/json"},
+        )
+        payload = response.json()
+        data_node = payload.get("data", payload)
+        production_id = data_node.get("uuid") or data_node.get("id")
+        if not production_id:
+            raise AuphonicError(
+                "Auphonic single-input create response did not include a production id"
+            )
+        return str(production_id)
 
     def start_production(self, production_id: str) -> None:
         self._request_with_retries(
@@ -447,11 +401,9 @@ def prepare_session_with_auphonic(
             f"Session {session.session_uid} must be queued before Auphonic prepare"
         )
 
-    assets = list_assets_for_session(db_file, session.session_uid)
-    if not assets:
-        raise AuphonicError(f"No assets found for session {session.session_uid}")
-
-    preset_id = resolve_preset_id(config, len(assets))
+    tracks = _spoken_raw_tracks(config, db_file, session.session_uid)
+    preset_id = resolve_preset_id(config, len(tracks))
+    service_id = resolve_auphonic_service_id(config)
     client = client or AuphonicClient(config)
     timestamp = datetime.now(timezone.utc).isoformat()
     production_id = None
@@ -460,15 +412,15 @@ def prepare_session_with_auphonic(
         _log(logger, "Preparing Auphonic production for %s", session.session_uid)
         _debug_log(
             logger,
-            "Auphonic preset=%s timeout=%ss track_ids=%s asset_paths=%s",
+            "Auphonic preset=%s service=%s roles=%s keys=%s",
             preset_id,
-            config.auphonic.request_timeout_seconds,
-            [_asset_upload_key(asset) for asset in assets],
-            [asset.local_path for asset in assets],
+            service_id,
+            [artifact.role for artifact in tracks],
+            [_artifact_key(config, artifact) for artifact in tracks],
         )
         prepared_production = client.create_production(
-            session=session,
-            assets=assets,
+            title=session.source_basename or session.session_uid,
+            track_count=len(tracks),
             preset_id=preset_id,
         )
         production_id = prepared_production.production_id
@@ -478,33 +430,41 @@ def prepare_session_with_auphonic(
             production_id,
             session.session_uid,
         )
-        _debug_log(
-            logger,
-            "Using Auphonic upload track ids=%s",
-            prepared_production.upload_track_ids,
-        )
-        client.upload_assets(
-            production_id, assets, prepared_production.upload_track_ids
-        )
+        track_ids = prepared_production.upload_track_ids or [
+            artifact.role for artifact in tracks
+        ]
+        if len(track_ids) != len(tracks):
+            raise AuphonicError(
+                "Auphonic preset track count does not match the session's spoken tracks"
+            )
+        for track_id, artifact in zip(track_ids, tracks):
+            client.attach_service_input(
+                production_id,
+                track_id,
+                service_id,
+                _artifact_key(config, artifact),
+            )
         _log(
             logger,
-            "Uploaded %s assets to Auphonic production %s",
-            len(assets),
+            "Attached %s S3 tracks to Auphonic production %s",
+            len(tracks),
             production_id,
         )
-        _debug_log(
-            logger,
-            "Uploaded track ids=%s to production %s",
-            prepared_production.upload_track_ids,
-            production_id,
-        )
+        details = inspect_production(config, production_id, client=client)
+        if not _tracks_look_attached(
+            details.get("multi_input_files") or [], track_ids
+        ):
+            raise AuphonicError(
+                f"Auphonic production {production_id} did not attach all tracks; "
+                f"inspected tracks: {_format_track_choices(details.get('multi_input_files') or [])}"
+            )
         update_session_status(
             db_file,
             session_uid=session.session_uid,
             from_state=session.status,
             to_state=SessionStatus.AUPHONIC_PREPARED.value,
             timestamp=timestamp,
-            detail="created Auphonic production and uploaded assets",
+            detail="created Auphonic production and attached S3 tracks",
             auphonic_production_id=production_id,
         )
     except Exception as exc:
@@ -633,15 +593,22 @@ def start_prepared_session_with_auphonic(
         production = client.wait_for_production(production_id)
         _log(
             logger,
-            "Auphonic production %s finished; downloading outputs",
+            "Auphonic production %s finished; persisting outputs to S3",
             production_id,
         )
-        paths = _download_and_copy_outputs(
+        artifacts = _persist_outputs(
             client=client,
+            config=config,
             runtime_paths=runtime_paths,
-            deliverables_root=config.paths.deliverables_root,
+            db_file=db_file,
             session_uid=session.session_uid,
             production=production,
+        )
+        workspace = create_workspace(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=db_file,
+            session_uid=session.session_uid,
         )
 
         update_session_status(
@@ -650,17 +617,16 @@ def start_prepared_session_with_auphonic(
             from_state=SessionStatus.AUPHONIC_STARTED.value,
             to_state=SessionStatus.WAITING_FOR_FINALIZE.value,
             timestamp=datetime.now(timezone.utc).isoformat(),
-            detail="downloaded Auphonic outputs and copied deliverables",
+            detail=f"persisted Auphonic outputs to S3; workspace at {workspace}",
             auphonic_production_id=production.production_id,
-            pre_edit_master_path=str(paths["master"]),
-            transcript_path=str(paths["transcript"]),
         )
         _log(
             logger,
-            "Stored Auphonic outputs for %s master=%s transcript=%s",
+            "Stored Auphonic outputs for %s master=%s transcript=%s workspace=%s",
             session.session_uid,
-            paths["master"],
-            paths["transcript"],
+            artifacts["master"].s3_uri,
+            artifacts["transcript"].s3_uri,
+            workspace,
         )
     except Exception as exc:
         _log(logger, "Auphonic start failed for %s: %s", session.session_uid, exc)
@@ -732,43 +698,36 @@ def refresh_transcript_with_auphonic(
                 client.start_production(production_id)
             production = client.wait_for_production(production_id)
     else:
-        if not session.final_master_path:
+        final_master = get_media_artifact(
+            db_file,
+            session.session_uid,
+            kind=ArtifactKind.FINAL_MASTER.value,
+        )
+        if final_master is None:
             raise AuphonicError(
-                f"Session {session.session_uid} has no final master path"
+                f"Session {session.session_uid} has no final master artifact; run pod finalize first"
             )
-        final_master = Path(session.final_master_path)
-        if not final_master.exists():
-            raise AuphonicError(f"Final master file not found: {final_master}")
 
         resolved_preset_id = resolve_transcript_refresh_preset_id(config, preset_id)
-        asset = AssetRecord(
-            role="final_master",
-            filename=final_master.name,
-            file_size=final_master.stat().st_size,
-            local_path=str(final_master),
-        )
+        service_id = resolve_auphonic_service_id(config)
         _log(
             logger,
             "Refreshing transcript for %s from %s",
             session.session_uid,
-            final_master,
+            final_master.s3_uri,
         )
-        prepared_production = client.create_production(
-            session=session,
-            assets=[asset],
+        production_id = client.create_single_input_production(
+            title=f"{session.source_basename or session.session_uid} transcript refresh",
             preset_id=resolved_preset_id,
+            service_id=service_id,
+            input_key=_artifact_key(config, final_master),
         )
-        production_id = prepared_production.production_id
         _log(
             logger,
             "Created Auphonic transcript refresh production %s for %s",
             production_id,
             session.session_uid,
         )
-        client.upload_assets(
-            production_id, [asset], prepared_production.upload_track_ids
-        )
-        _log(logger, "Uploaded final master to Auphonic production %s", production_id)
         record_transcript_refresh_production(
             db_file,
             session_uid=session.session_uid,
@@ -779,10 +738,11 @@ def refresh_transcript_with_auphonic(
         client.start_production(production_id)
         production = client.wait_for_production(production_id)
 
-    transcript_path = _download_and_copy_transcript_output(
+    transcript_artifact = _persist_transcript_output(
         client=client,
+        config=config,
         runtime_paths=runtime_paths,
-        deliverables_root=config.paths.deliverables_root,
+        db_file=db_file,
         session_uid=session.session_uid,
         production=production,
     )
@@ -792,14 +752,13 @@ def refresh_transcript_with_auphonic(
         session_uid=session.session_uid,
         status=session.status,
         production_id=production_id,
-        transcript_path=str(transcript_path),
         timestamp=datetime.now(timezone.utc).isoformat(),
     )
     _log(
         logger,
         "Stored refreshed transcript for %s transcript=%s",
         session.session_uid,
-        transcript_path,
+        transcript_artifact.s3_uri,
     )
 
     updated = get_session(db_file, session.session_uid)
@@ -808,6 +767,46 @@ def refresh_transcript_with_auphonic(
             f"Transcript refreshed session disappeared: {session.session_uid}"
         )
     return updated
+
+
+def resolve_auphonic_service_id(config: AppConfig) -> str:
+    validate_auphonic_config(config)
+    service_id = config.auphonic.s3_service_id.strip()
+    if not service_id:
+        raise AuphonicError(
+            "Missing auphonic.s3_service_id in config. Register the Podline bucket "
+            "as an Amazon S3 external service in Auphonic and set its UUID."
+        )
+    if not config.storage.enabled:
+        raise AuphonicError(
+            "storage.enabled is false; S3-backed Auphonic attachment is unavailable"
+        )
+    return service_id
+
+
+def _spoken_raw_tracks(
+    config: AppConfig, db_file: str, session_uid: str
+) -> List[MediaArtifactRecord]:
+    artifacts = list_media_artifacts(
+        db_file, session_uid, kind=ArtifactKind.RAW_TRACK.value
+    )
+    tracks = [artifact for artifact in artifacts if artifact.role != "mix"]
+    if not tracks:
+        raise AuphonicError(
+            f"No raw track artifacts registered for session {session_uid}"
+        )
+    return tracks
+
+
+def _artifact_key(config: AppConfig, artifact: MediaArtifactRecord) -> str:
+    bucket, key = parse_s3_uri(artifact.s3_uri)
+    if bucket != config.storage.bucket:
+        raise AuphonicError(
+            f"Artifact {artifact.kind}/{artifact.role or 'default'} for session "
+            f"{artifact.session_uid} lives in s3://{bucket} but the Auphonic S3 "
+            f"service is backed by bucket {config.storage.bucket}"
+        )
+    return key
 
 
 def resolve_preset_id(config: AppConfig, speaker_count: int) -> str:
@@ -844,14 +843,15 @@ def validate_auphonic_config(config: AppConfig) -> None:
         raise AuphonicError("Auphonic base_url is missing in config.yaml")
 
 
-def _download_and_copy_outputs(
+def _persist_outputs(
     *,
     client: AuphonicClientProtocol,
+    config: AppConfig,
     runtime_paths: RuntimePaths,
-    deliverables_root: Path,
+    db_file: str,
     session_uid: str,
     production: AuphonicProduction,
-) -> Dict[str, Path]:
+) -> Dict[str, MediaArtifactRecord]:
     staging_dir = Path(runtime_paths.staging_dir) / session_uid
     staging_dir.mkdir(parents=True, exist_ok=True)
 
@@ -866,32 +866,49 @@ def _download_and_copy_outputs(
     if master_output is None or transcript_output is None:
         raise AuphonicError("Auphonic outputs did not include both mp3 and vtt files")
 
-    staged_master = staging_dir / "pre_edit_master.mp3"
-    staged_transcript = staging_dir / "transcript.vtt"
+    staged_master = staging_dir / f"{session_uid}_pre_edit.mp3"
+    staged_transcript = staging_dir / f"{session_uid}.vtt"
     client.download_file(master_output.download_url, staged_master)
     client.download_file(transcript_output.download_url, staged_transcript)
 
-    deliverables_staging_dir = deliverables_root / "staging"
-    deliverables_transcripts_dir = deliverables_root / "transcripts"
-    deliverables_staging_dir.mkdir(parents=True, exist_ok=True)
-    deliverables_transcripts_dir.mkdir(parents=True, exist_ok=True)
+    master_artifact = store_artifact_file(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=db_file,
+        session_uid=session_uid,
+        kind=ArtifactKind.PRE_EDIT_MASTER.value,
+        source_path=staged_master,
+        content_type="audio/mpeg",
+        source_provider="auphonic",
+        source_id=production.production_id,
+    )
+    transcript_artifact = store_artifact_file(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=db_file,
+        session_uid=session_uid,
+        kind=ArtifactKind.TRANSCRIPT.value,
+        source_path=staged_transcript,
+        content_type="text/vtt",
+        source_provider="auphonic",
+        source_id=production.production_id,
+    )
+    # The cache holds hardlinks to these staged files; unlink the staging
+    # names so a later re-download cannot write through the shared inode.
+    staged_master.unlink()
+    staged_transcript.unlink()
+    return {"master": master_artifact, "transcript": transcript_artifact}
 
-    master_target = deliverables_staging_dir / f"{session_uid}_pre_edit.mp3"
-    transcript_target = deliverables_transcripts_dir / f"{session_uid}.vtt"
-    master_target.write_bytes(staged_master.read_bytes())
-    transcript_target.write_bytes(staged_transcript.read_bytes())
 
-    return {"master": master_target, "transcript": transcript_target}
-
-
-def _download_and_copy_transcript_output(
+def _persist_transcript_output(
     *,
     client: AuphonicClientProtocol,
+    config: AppConfig,
     runtime_paths: RuntimePaths,
-    deliverables_root: Path,
+    db_file: str,
     session_uid: str,
     production: AuphonicProduction,
-) -> Path:
+) -> MediaArtifactRecord:
     staging_dir = Path(runtime_paths.staging_dir) / session_uid
     staging_dir.mkdir(parents=True, exist_ok=True)
 
@@ -902,14 +919,23 @@ def _download_and_copy_transcript_output(
     if transcript_output is None:
         raise AuphonicError("Auphonic outputs did not include a vtt transcript")
 
-    staged_transcript = staging_dir / "transcript_refresh.vtt"
+    staged_transcript = staging_dir / f"{session_uid}.vtt"
     client.download_file(transcript_output.download_url, staged_transcript)
 
-    deliverables_transcripts_dir = deliverables_root / "transcripts"
-    deliverables_transcripts_dir.mkdir(parents=True, exist_ok=True)
-    transcript_target = deliverables_transcripts_dir / f"{session_uid}.vtt"
-    transcript_target.write_bytes(staged_transcript.read_bytes())
-    return transcript_target
+    artifact = store_artifact_file(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=db_file,
+        session_uid=session_uid,
+        kind=ArtifactKind.TRANSCRIPT.value,
+        source_path=staged_transcript,
+        content_type="text/vtt",
+        source_provider="auphonic",
+        source_id=production.production_id,
+    )
+    # See _persist_outputs: break the staging hardlink into the cache.
+    staged_transcript.unlink()
+    return artifact
 
 
 def _is_done_status(data_node: Dict) -> bool:
@@ -961,24 +987,22 @@ def _suffix_from_url(url: Optional[str]) -> str:
     return Path(url.split("?", 1)[0]).suffix
 
 
-def _asset_upload_key(asset: AssetRecord) -> str:
-    return asset.role or Path(asset.filename).stem
+def _tracks_look_attached(
+    multi_input_files: List[Dict], expected_track_ids: List[str]
+) -> bool:
+    attached_ids = {
+        str(item.get("id")) for item in multi_input_files if item.get("input_file")
+    }
+    return set(expected_track_ids).issubset(attached_ids)
 
 
-def _upload_looks_attached(data_node: Dict, upload_track_ids: List[str]) -> bool:
-    multi_input_files = data_node.get("multi_input_files")
-    if isinstance(multi_input_files, list) and multi_input_files:
-        attached_ids = {
-            str(item.get("id")) for item in multi_input_files if item.get("input_file")
-        }
-        expected_ids = set(upload_track_ids)
-        return expected_ids.issubset(attached_ids)
+def _resolve_preset_track_ids(data_node: Dict, track_count: int) -> List[str]:
+    """Track ids defined by the preset on the fresh production, if any.
 
-    input_file = data_node.get("input_file")
-    return len(upload_track_ids) == 1 and bool(input_file)
-
-
-def _resolve_upload_track_ids(data_node: Dict, assets: List[AssetRecord]) -> List[str]:
+    Returns [] when the preset defines no tracks (caller falls back to
+    artifact roles); a preset with more tracks than the session has spoken
+    tracks is a configuration mismatch.
+    """
     multi_input_files = (
         data_node.get("multi_input_files") if isinstance(data_node, dict) else None
     )
@@ -986,45 +1010,13 @@ def _resolve_upload_track_ids(data_node: Dict, assets: List[AssetRecord]) -> Lis
         preset_track_ids = [
             str(item.get("id")) for item in multi_input_files if item.get("id")
         ]
-        if len(preset_track_ids) == len(assets):
+        if len(preset_track_ids) == track_count:
             return preset_track_ids
-        if len(preset_track_ids) > len(assets):
+        if len(preset_track_ids) > track_count:
             raise AuphonicError(
                 "Auphonic preset track count does not match the scanned speaker count"
             )
-
-    return [_asset_upload_key(asset) for asset in assets]
-
-
-def _resolve_curl_binary() -> str:
-    for candidate in (
-        "/opt/homebrew/opt/curl/bin/curl",
-        "/usr/local/opt/curl/bin/curl",
-    ):
-        if Path(candidate).exists():
-            return candidate
-
-    resolved = shutil.which("curl")
-    if resolved is None:
-        raise AuphonicError("curl is required for Auphonic uploads but was not found")
-    return resolved
-
-
-def _audio_content_type_for(path: Path) -> str:
-    suffix = path.suffix.lower()
-    if suffix == ".mp3":
-        return "audio/mpeg"
-    if suffix == ".wav":
-        return "audio/wav"
-    if suffix == ".m4a":
-        return "audio/mp4"
-    if suffix == ".webm":
-        return "audio/webm"
-    if suffix == ".opus":
-        return "audio/ogg"
-    if suffix in {".aif", ".aiff"}:
-        return "audio/aiff"
-    return "application/octet-stream"
+    return []
 
 
 def inspect_production(
@@ -1093,15 +1085,16 @@ def probe_audio_duration_from_packets(path: Path) -> float:
 def plan_session_auphonic_offset(
     *,
     config: AppConfig,
+    runtime_paths: RuntimePaths,
     db_file: str,
     session: SessionRecord,
     client: Optional[AuphonicClientProtocol] = None,
     duration_probe: DurationProbe = probe_audio_duration_from_packets,
 ) -> AuphonicOffsetPlan:
-    assets = list_assets_for_session(db_file, session.session_uid)
-    if len(assets) != 2:
+    tracks = _spoken_raw_tracks(config, db_file, session.session_uid)
+    if len(tracks) != 2:
         raise AuphonicError(
-            f"Session {session.session_uid} must have exactly 2 audio assets to compute an Auphonic offset; found {len(assets)}"
+            f"Session {session.session_uid} must have exactly 2 audio assets to compute an Auphonic offset; found {len(tracks)}"
         )
     if not session.auphonic_production_id:
         raise AuphonicError(
@@ -1110,10 +1103,16 @@ def plan_session_auphonic_offset(
 
     asset_durations = [
         AuphonicAssetDuration(
-            asset=asset,
-            duration_seconds=_probe_asset_duration(asset, duration_probe),
+            asset=artifact,
+            duration_seconds=_resolve_artifact_duration(
+                config=config,
+                runtime_paths=runtime_paths,
+                db_file=db_file,
+                artifact=artifact,
+                duration_probe=duration_probe,
+            ),
         )
-        for asset in assets
+        for artifact in tracks
     ]
     sorted_durations = sorted(asset_durations, key=lambda item: item.duration_seconds)
     shorter = sorted_durations[0]
@@ -1152,6 +1151,7 @@ def plan_session_auphonic_offset(
 def offset_session_auphonic_production(
     *,
     config: AppConfig,
+    runtime_paths: RuntimePaths,
     db_file: str,
     session: SessionRecord,
     apply: bool = False,
@@ -1161,6 +1161,7 @@ def offset_session_auphonic_production(
     client = client or AuphonicClient(config)
     plan = plan_session_auphonic_offset(
         config=config,
+        runtime_paths=runtime_paths,
         db_file=db_file,
         session=session,
         client=client,
@@ -1213,12 +1214,19 @@ def reconcile_production_to_session(
                 {"output_files": details["output_files"]}
             ),
         )
-        paths = _download_and_copy_outputs(
+        _persist_outputs(
             client=client,
+            config=config,
             runtime_paths=runtime_paths,
-            deliverables_root=config.paths.deliverables_root,
+            db_file=db_file,
             session_uid=session.session_uid,
             production=production,
+        )
+        workspace = create_workspace(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=db_file,
+            session_uid=session.session_uid,
         )
         update_session_status(
             db_file,
@@ -1226,10 +1234,8 @@ def reconcile_production_to_session(
             from_state=current_state,
             to_state=SessionStatus.WAITING_FOR_FINALIZE.value,
             timestamp=timestamp,
-            detail="reconciled completed Auphonic production and downloaded outputs",
+            detail=f"reconciled completed Auphonic production; workspace at {workspace}",
             auphonic_production_id=production_id,
-            pre_edit_master_path=str(paths["master"]),
-            transcript_path=str(paths["transcript"]),
             failure_reason=None,
             failed_at_stage=None,
         )
@@ -1325,8 +1331,32 @@ def _parse_packet_time(value) -> Optional[Decimal]:
     return parsed
 
 
-def _probe_asset_duration(asset: AssetRecord, duration_probe: DurationProbe) -> float:
-    path = Path(asset.local_path)
+def _resolve_artifact_duration(
+    *,
+    config: AppConfig,
+    runtime_paths: RuntimePaths,
+    db_file: str,
+    artifact: MediaArtifactRecord,
+    duration_probe: DurationProbe,
+) -> float:
+    """Return the stored packet-derived duration, probing and persisting once
+    for artifacts registered without one."""
+    if artifact.duration_seconds is not None:
+        return _validated_duration(
+            artifact.duration_seconds, source=artifact.filename
+        )
+
+    try:
+        path = materialize_artifact_record(
+            config=config,
+            runtime_paths=runtime_paths,
+            artifact=artifact,
+        )
+    except Exception as exc:
+        raise AuphonicError(
+            f"Could not materialize {artifact.filename} to probe its duration: {exc}"
+        ) from exc
+
     try:
         duration = duration_probe(path)
     except AuphonicError:
@@ -1334,15 +1364,28 @@ def _probe_asset_duration(asset: AssetRecord, duration_probe: DurationProbe) -> 
     except Exception as exc:
         raise AuphonicError(f"Could not compute duration for {path}: {exc}") from exc
 
+    validated = _validated_duration(duration, source=str(path))
+    update_media_artifact_duration(
+        db_file,
+        session_uid=artifact.session_uid,
+        kind=artifact.kind,
+        role=artifact.role,
+        duration_seconds=validated,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+    )
+    return validated
+
+
+def _validated_duration(duration, *, source: str) -> float:
     try:
         duration_decimal = Decimal(str(duration))
     except (InvalidOperation, ValueError) as exc:
         raise AuphonicError(
-            f"Could not compute duration for {path}: duration must be numeric"
+            f"Could not compute duration for {source}: duration must be numeric"
         ) from exc
     if not duration_decimal.is_finite() or duration_decimal <= 0:
         raise AuphonicError(
-            f"Could not compute duration for {path}: duration must be positive"
+            f"Could not compute duration for {source}: duration must be positive"
         )
     return float(duration_decimal)
 
@@ -1367,28 +1410,24 @@ def _validate_offset_production_state(details: Dict) -> None:
 
 
 def _find_multi_input_track_for_asset(
-    multi_input_files: List[Dict], asset: AssetRecord
+    multi_input_files: List[Dict], asset: MediaArtifactRecord
 ) -> Dict:
-    target_basenames = {
-        Path(asset.local_path).name.lower(),
-        asset.filename.lower(),
-    }
+    target_basename = asset.filename.lower()
     matches = [
         track
         for track in multi_input_files
-        if _input_file_basename(track.get("input_file")).lower() in target_basenames
+        if _input_file_basename(track.get("input_file")).lower() == target_basename
     ]
     if len(matches) == 1:
         return matches[0]
 
-    target_name = Path(asset.local_path).name or asset.filename
     inspected = _format_track_choices(multi_input_files)
     if not matches:
         raise AuphonicError(
-            f"Could not match Auphonic track for {target_name}; inspected tracks: {inspected}"
+            f"Could not match Auphonic track for {asset.filename}; inspected tracks: {inspected}"
         )
     raise AuphonicError(
-        f"Ambiguous Auphonic track match for {target_name}; inspected tracks: {inspected}"
+        f"Ambiguous Auphonic track match for {asset.filename}; inspected tracks: {inspected}"
     )
 
 
@@ -1413,28 +1452,12 @@ def _input_file_basename(value) -> str:
 def _format_track_choices(multi_input_files: List[Dict]) -> str:
     if not multi_input_files:
         return "none"
+    # input_file is normally a plain S3 key, but redact defensively in case a
+    # production carries URL inputs (query strings hold credentials).
     return ", ".join(
-        f"id={track.get('id') or 'none'} input_file={track.get('input_file') or 'none'}"
+        f"id={track.get('id') or 'none'} input_file={redact_url(str(track.get('input_file') or 'none'))}"
         for track in multi_input_files
     )
-
-
-def _upload_attachment_summary(data_node: Dict) -> Dict[str, object]:
-    if not isinstance(data_node, dict):
-        return {}
-
-    multi_input_files = data_node.get("multi_input_files")
-    if isinstance(multi_input_files, list):
-        return {
-            "multi_input_ids": [item.get("id") for item in multi_input_files],
-            "attached_inputs": [
-                item.get("input_file")
-                for item in multi_input_files
-                if item.get("input_file")
-            ],
-        }
-
-    return {"input_file": data_node.get("input_file")}
 
 
 def _log(logger: Optional[logging.Logger], message: str, *args) -> None:

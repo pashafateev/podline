@@ -1,36 +1,14 @@
 from pathlib import Path
 
-from podline.db import initialize_database
+import pytest
+
 from podline.episode_meta import (
+    EpisodeMetaError,
     PROJECT_ROOT,
     _parse_episode_meta_output,
     generate_episode_metadata_with_opencode,
 )
-from podline.ingest import scan_and_ingest
-from podline.repository import (
-    get_episode,
-    list_sessions,
-    update_session_status,
-)
-from podline.config import (
-    AppConfig,
-    PathsConfig,
-    PollingConfig,
-    NotificationsConfig,
-    AuphonicConfig,
-    PodbeanConfig,
-    CozytrackConfig,
-    StorageConfig,
-)
-
-
-def _default_cozytrack_config() -> CozytrackConfig:
-    return CozytrackConfig(
-        base_url="http://localhost:3000",
-        api_key="",
-        download_subdir="cozytrack",
-        request_timeout_seconds=600,
-    )
+from podline.repository import get_episode
 
 
 def test_parse_episode_meta_output() -> None:
@@ -51,41 +29,31 @@ def test_episode_meta_prompt_uses_j_initial_for_cohost() -> None:
     assert "Jonathan" not in prompt
 
 
-def test_generate_episode_metadata_with_opencode_persists_episode(
-    monkeypatch, fixture_raw_root, tmp_path: Path
+def test_generate_episode_metadata_reads_transcript_artifact(
+    monkeypatch,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path: Path,
 ) -> None:
-    db_file = tmp_path / "state.db"
-    initialize_database(str(db_file))
-    scan_and_ingest(fixture_raw_root, str(db_file))
-    session = next(
-        item
-        for item in list_sessions(str(db_file))
-        if item.source_basename == "010124_013143"
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = session_factory(
+        runtime_paths.db_file,
+        session_uid="session-meta-1",
+        status="ready_for_draft",
     )
-
     transcript = tmp_path / "transcript.vtt"
     transcript.write_text(
         "WEBVTT\n\n00:00.000 --> 00:01.000\nhello\n", encoding="utf-8"
     )
-    pre_edit = tmp_path / "pre.mp3"
-    pre_edit.write_bytes(b"pre")
-    final_master = tmp_path / "final.mp3"
-    final_master.write_bytes(b"final")
-    update_session_status(
-        str(db_file),
+    artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
         session_uid=session.session_uid,
-        from_state=session.status,
-        to_state="ready_for_draft",
-        timestamp="now",
-        detail="ready for metadata",
-        transcript_path=str(transcript),
-        pre_edit_master_path=str(pre_edit),
-        final_master_path=str(final_master),
-    )
-    session = next(
-        item
-        for item in list_sessions(str(db_file))
-        if item.session_uid == session.session_uid
+        kind="transcript",
+        path=transcript,
     )
 
     monkeypatch.setattr(
@@ -93,58 +61,47 @@ def test_generate_episode_metadata_with_opencode_persists_episode(
         lambda: "/opt/homebrew/bin/opencode",
     )
     seen = {}
-    monkeypatch.setattr(
-        "podline.episode_meta._run_opencode_episode_meta",
-        lambda opencode_binary, project_dir, transcript_text: (
-            seen.update({"project_dir": project_dir})
-            or "**Title:** Boba Boom\n\n**Description:**\nPasha and J. debate boba tea and trends."
-        ),
-    )
 
-    config = AppConfig(
-        runtime_home=tmp_path,
-        paths=PathsConfig(
-            raw_root=tmp_path / "raw", deliverables_root=tmp_path / "deliverables"
-        ),
-        polling=PollingConfig(interval_seconds=30),
-        notifications=NotificationsConfig(enabled=False),
-        auphonic=AuphonicConfig(
-            enabled=False,
-            api_key="",
-            base_url="",
-            request_timeout_seconds=600,
-            poll_interval_seconds=1,
-            max_poll_attempts=1,
-            preset_ids={},
-        ),
-        podbean=PodbeanConfig(
-            enabled=False,
-            client_id="",
-            client_secret="",
-            base_url="https://api.podbean.example/v1",
-            podcast_id="",
-        ),
-        cozytrack=_default_cozytrack_config(),
-        storage=_default_storage_config(),
-        config_file=tmp_path / "config.yaml",
+    def fake_run(opencode_binary, project_dir, transcript_text):
+        seen["project_dir"] = project_dir
+        seen["transcript_text"] = transcript_text
+        return "**Title:** Boba Boom\n\n**Description:**\nPasha and J. debate boba tea and trends."
+
+    monkeypatch.setattr(
+        "podline.episode_meta._run_opencode_episode_meta", fake_run
     )
 
     episode = generate_episode_metadata_with_opencode(
-        config=config, db_file=str(db_file), session=session
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
     )
 
     assert episode.title == "Boba Boom"
     assert "boba tea" in episode.description
     assert seen["project_dir"] == PROJECT_ROOT
-    saved = get_episode(str(db_file), session.session_uid)
+    assert "hello" in seen["transcript_text"]
+    saved = get_episode(runtime_paths.db_file, session.session_uid)
     assert saved is not None
     assert saved.title == "Boba Boom"
 
 
-def _default_storage_config() -> StorageConfig:
-    return StorageConfig(
-        enabled=False,
-        bucket="",
-        region="",
-        key_prefix="",
+def test_generate_episode_metadata_requires_transcript_artifact(
+    app_config_factory, runtime_factory, session_factory, tmp_path: Path
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = session_factory(
+        runtime_paths.db_file,
+        session_uid="session-meta-2",
+        status="ready_for_draft",
     )
+
+    with pytest.raises(EpisodeMetaError, match="No transcript artifact"):
+        generate_episode_metadata_with_opencode(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=session,
+        )
