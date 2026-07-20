@@ -27,3 +27,6 @@ storage:
   region: us-west-2
   # Optional key prefix inside the bucket; usually empty.
   key_prefix: ""
+  # AWS named profile with long-term keys (scripts/setup_iam_users.sh
+  # creates the scoped 'podline' user). Empty uses the default chain.
+  profile: podline

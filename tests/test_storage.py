@@ -236,13 +236,25 @@ def test_presigned_get_url_is_signed_and_redactable(tmp_path: Path) -> None:
     assert redact_url(url).endswith("?<redacted>")
 
 
+def test_media_storage_wraps_missing_profile_in_storage_error() -> None:
+    config = StorageConfig(
+        enabled=True,
+        bucket=BUCKET,
+        region="us-east-1",
+        key_prefix="",
+        profile="podline-test-profile-that-does-not-exist-7f3a",
+    )
+    with pytest.raises(StorageError, match="Could not create S3 client"):
+        MediaStorage(config)
+
+
 def test_storage_health_wraps_client_construction_failures(monkeypatch) -> None:
     from botocore.exceptions import BotoCoreError
 
-    def _broken_client(*_args, **_kwargs):
+    def _broken_session(*_args, **_kwargs):
         raise BotoCoreError()
 
-    monkeypatch.setattr("podline.storage.boto3.client", _broken_client)
+    monkeypatch.setattr("podline.storage.boto3.session.Session", _broken_session)
     status = storage_health(_storage_config())
     assert status.startswith("error: Could not create S3 client")
 

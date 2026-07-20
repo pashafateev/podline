@@ -84,9 +84,12 @@ class MediaStorage:
             # Client construction resolves credentials, so provider problems
             # (missing profile, expired login, absent optional deps) surface
             # here rather than at the first request.
-            self._client = boto3.client(
-                "s3",
+            session = boto3.session.Session(
+                profile_name=config.profile.strip() or None,
                 region_name=config.region.strip() or None,
+            )
+            self._client = session.client(
+                "s3",
                 config=BotoConfig(retries={"max_attempts": 5, "mode": "standard"}),
             )
         except (BotoCoreError, ClientError) as exc:

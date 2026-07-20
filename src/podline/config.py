@@ -55,6 +55,7 @@ class StorageConfig:
     bucket: str
     region: str
     key_prefix: str
+    profile: str = ""
 
 
 @dataclass(frozen=True)
@@ -130,6 +131,7 @@ def _load_storage_config(data: Dict[str, Any]) -> StorageConfig:
         bucket=str(section.get("bucket", "")),
         region=str(section.get("region", "")),
         key_prefix=key_prefix,
+        profile=str(section.get("profile", "")),
     )
 
 

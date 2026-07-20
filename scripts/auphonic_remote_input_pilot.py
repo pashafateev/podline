@@ -1,27 +1,28 @@
 """Auphonic remote-input pilot.
 
-Answers the load-bearing design question for S3-backed Auphonic attachment:
-does Auphonic fetch HTTP inputs when they are ATTACHED to a saved multitrack
-production, or only when the production is STARTED?
+Validates how a saved, unstarted Auphonic multitrack production can read
+audio from Podline's S3 bucket. Two transports:
 
-The answer decides whether `pod auphonic-start` must re-sign and re-attach
-presigned URLs before starting (the prepare → human preview → start gap is
-unbounded, so URLs signed at prepare time can expire before start).
+External-service mode (--service <uuid>) — the selected design: the bucket
+is registered once in Auphonic (Settings → External Services, backed by the
+read-only podline-auphonic IAM user) and tracks attach by short key path.
+No presigning, no expiry, no URL-length ceiling. This mode validates
+attach, WebM handling, and start → done end to end.
 
-What it does:
-  1. Generates a tiny WebM/Opus test tone (ffmpeg) unless --input-file is given.
-  2. Uploads two copies to s3://<bucket>/pilot/<run-id>/ via podline's MediaStorage.
-  3. Creates (does NOT start) an Auphonic multitrack production whose
-     multi_input_files point at presigned URLs with a short expiry.
-  4. Inspects the production before and after the URLs expire.
-  5. Starts the production with the URLs expired and reports the outcome.
-  6. If start fails, re-signs fresh URLs, re-attaches them per track, and
-     retries — validating the re-attach design PR 2 would need.
+Presigned-URL mode (default, kept for reference) — run 1 finding: Auphonic's
+input_file column is varchar(512); URLs signed with session credentials are
+~1,400 chars and get rejected with a 500. Only long-term IAM-user keys
+produce URLs that fit (~240 chars). This mode attaches short-expiry URLs,
+starts after they expire, and on failure validates re-sign + re-attach.
+
+Use --list-services to print registered Auphonic services and their UUIDs.
 
 Costs a few seconds of Auphonic processing credit at most. Presigned URLs
 are never printed; output shows redacted forms only.
 
 Usage:
+    python scripts/auphonic_remote_input_pilot.py --list-services
+    python scripts/auphonic_remote_input_pilot.py --bucket podline-media --service <uuid>
     python scripts/auphonic_remote_input_pilot.py --bucket <bucket> [--region us-west-2]
         [--expiry-seconds 120] [--skip-start] [--keep] [--config ~/podline/config.yaml]
 """
@@ -54,32 +55,65 @@ def main() -> int:
         print("auphonic.api_key is missing in config; cannot run pilot")
         return 2
 
-    storage = MediaStorage(
-        StorageConfig(
-            enabled=True, bucket=args.bucket, region=args.region, key_prefix=""
-        )
-    )
-    run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
-    print(f"pilot run {run_id}: bucket={args.bucket} expiry={args.expiry_seconds}s")
-
-    source = args.input_file or _generate_test_tone()
-    keys = []
-    signed_urls = []
-    for track in ("tr1", "tr2"):
-        key = f"pilot/{run_id}/{track}.webm"
-        storage.upload_file(local_path=source, key=key, content_type="audio/webm")
-        url = storage.presigned_get_url(key=key, expires_seconds=args.expiry_seconds)
-        keys.append(key)
-        signed_urls.append(url)
-        print(f"uploaded {storage.s3_uri(key)}")
-        print(f"signed   {redact_url(url)}")
-
     auphonic = _AuphonicApi(
         base_url=config.auphonic.base_url,
         api_key=config.auphonic.api_key,
     )
-    signed_at = time.monotonic()
 
+    if args.list_services:
+        services = auphonic.list_services()
+        if not services:
+            print("no external services registered in this Auphonic account")
+        for service in services:
+            print(
+                f"{service.get('uuid')}  type={service.get('type')}  "
+                f"name={service.get('display_name')}"
+            )
+        return 0
+
+    if not args.bucket:
+        print("--bucket is required unless --list-services is given")
+        return 2
+
+    storage = MediaStorage(
+        StorageConfig(
+            enabled=True,
+            bucket=args.bucket,
+            region=args.region,
+            key_prefix="",
+            profile=args.profile,
+        )
+    )
+    run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+    mode = "external-service" if args.service else "presigned-url"
+    print(f"pilot run {run_id}: bucket={args.bucket} mode={mode}")
+
+    source = args.input_file or _generate_test_tone()
+    keys = []
+    track_refs = []
+    for track in ("tr1", "tr2"):
+        key = f"pilot/{run_id}/{track}.webm"
+        storage.upload_file(local_path=source, key=key, content_type="audio/webm")
+        keys.append(key)
+        print(f"uploaded {storage.s3_uri(key)}")
+        if args.service:
+            track_refs.append(
+                {
+                    "type": "multitrack",
+                    "id": track,
+                    "service": args.service,
+                    "input_file": key,
+                }
+            )
+            print(f"attach   service={args.service} input_file={key}")
+        else:
+            url = storage.presigned_get_url(
+                key=key, expires_seconds=args.expiry_seconds
+            )
+            track_refs.append({"type": "multitrack", "id": track, "input_file": url})
+            print(f"signed   {redact_url(url)}")
+
+    signed_at = time.monotonic()
     production = auphonic.create_production(
         {
             "metadata": {
@@ -87,10 +121,7 @@ def main() -> int:
             },
             "is_multitrack": True,
             "output_files": [{"format": "mp3"}],
-            "multi_input_files": [
-                {"type": "multitrack", "id": "tr1", "input_file": signed_urls[0]},
-                {"type": "multitrack", "id": "tr2", "input_file": signed_urls[1]},
-            ],
+            "multi_input_files": track_refs,
         }
     )
     production_id = production.get("uuid") or production.get("id")
@@ -102,18 +133,41 @@ def main() -> int:
     print(f"status page: {production.get('status_page') or 'n/a'}")
     _print_inspection("immediately after attach", auphonic.get_production(production_id))
 
-    wait_seconds = max(0, args.expiry_seconds - int(time.monotonic() - signed_at)) + 45
-    print(f"\nwaiting {wait_seconds}s for the signed URLs to expire...")
-    time.sleep(wait_seconds)
-    _print_inspection("after URL expiry", auphonic.get_production(production_id))
+    if not args.service:
+        wait_seconds = (
+            max(0, args.expiry_seconds - int(time.monotonic() - signed_at)) + 45
+        )
+        print(f"\nwaiting {wait_seconds}s for the signed URLs to expire...")
+        time.sleep(wait_seconds)
+        _print_inspection("after URL expiry", auphonic.get_production(production_id))
 
     if args.skip_start:
         print("\n--skip-start given; leaving production unstarted.")
         _cleanup(storage, keys, keep=args.keep)
         return 0
 
-    print("\nstarting production with expired input URLs...")
     verdict_lines = []
+    if args.service:
+        print("\nstarting production with external-service inputs...")
+        outcome = _start_and_wait(auphonic, production_id, args.poll_minutes)
+        if outcome == "done":
+            verdict_lines.append(
+                "VERDICT: external-service attach works end to end — tracks attached "
+                "by key path, WebM accepted, production processed to done."
+            )
+        else:
+            verdict_lines.append(
+                f"VERDICT: external-service run did not complete (outcome={outcome}); "
+                "inspect the production before building on this design."
+            )
+        _print_inspection("final state", auphonic.get_production(production_id))
+        print()
+        for line in verdict_lines:
+            print(line)
+        _cleanup(storage, keys, keep=args.keep)
+        return 0 if outcome == "done" else 1
+
+    print("\nstarting production with expired input URLs...")
     outcome = _start_and_wait(auphonic, production_id, args.poll_minutes)
     if outcome == "done":
         verdict_lines.append(
@@ -180,6 +234,12 @@ class _AuphonicApi:
 
     def get_production(self, production_id: str) -> Dict:
         return self._data(self._client.get(f"/production/{production_id}.json"))
+
+    def list_services(self) -> List[Dict]:
+        data = self._data(self._client.get("/services.json"))
+        if isinstance(data, list):
+            return data
+        return data.get("data", []) if isinstance(data, dict) else []
 
     def start_production(self, production_id: str) -> Dict:
         return self._data(self._client.post(f"/production/{production_id}/start.json"))
@@ -290,16 +350,34 @@ def _cleanup(storage: MediaStorage, keys: List[str], *, keep: bool) -> None:
     if keep:
         print("\n--keep given; pilot objects left in the bucket.")
         return
-    client = boto3.client("s3")
-    for key in keys:
-        client.delete_object(Bucket=storage.bucket, Key=key)
-    print(f"\ndeleted {len(keys)} pilot objects from s3://{storage.bucket}/pilot/")
+    # Deletion needs broader credentials than the no-delete podline profile;
+    # use the default chain and shrug if it lacks permission.
+    try:
+        client = boto3.client("s3")
+        for key in keys:
+            client.delete_object(Bucket=storage.bucket, Key=key)
+        print(f"\ndeleted {len(keys)} pilot objects from s3://{storage.bucket}/pilot/")
+    except Exception as exc:
+        print(
+            f"\ncleanup skipped ({exc}); remove s3://{storage.bucket}/pilot/ manually"
+        )
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bucket", required=True)
+    parser.add_argument("--bucket", default="")
     parser.add_argument("--region", default="")
+    parser.add_argument("--profile", default="", help="AWS profile for S3 access.")
+    parser.add_argument(
+        "--service",
+        default="",
+        help="Auphonic external service UUID; attaches tracks by key path.",
+    )
+    parser.add_argument(
+        "--list-services",
+        action="store_true",
+        help="Print registered Auphonic external services and exit.",
+    )
     parser.add_argument("--expiry-seconds", type=int, default=120)
     parser.add_argument("--poll-minutes", type=int, default=5)
     parser.add_argument(
