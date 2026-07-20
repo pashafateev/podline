@@ -57,7 +57,10 @@ def store_artifact_file(
     )
     try:
         s3_uri = storage.upload_file(
-            local_path=source_path, key=key, content_type=content_type
+            local_path=source_path,
+            key=key,
+            content_type=content_type,
+            sha256=sha256,
         )
     except StorageError as exc:
         raise ArtifactError(str(exc)) from exc
@@ -119,7 +122,15 @@ def materialize_artifact_record(
         cached.unlink()
 
     storage = storage or MediaStorage(config.storage)
-    _bucket, key = parse_s3_uri(artifact.s3_uri)
+    bucket, key = parse_s3_uri(artifact.s3_uri)
+    if bucket != storage.bucket:
+        # v1 is deliberately single-bucket: a mismatch means config.local.yaml
+        # points somewhere other than where this artifact durably lives.
+        raise ArtifactError(
+            f"Artifact {artifact.kind}/{artifact.role or 'default'} for session "
+            f"{artifact.session_uid} lives in s3://{bucket} but storage is "
+            f"configured for bucket {storage.bucket}"
+        )
     try:
         return storage.download_to_path(
             key=key,

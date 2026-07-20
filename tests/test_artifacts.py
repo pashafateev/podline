@@ -271,6 +271,37 @@ def test_materialize_artifact_replaces_corrupt_cache_entry(tmp_path: Path) -> No
 
 
 @mock_aws
+def test_materialize_artifact_rejects_bucket_mismatch(tmp_path: Path) -> None:
+    from podline.repository import register_media_artifact
+
+    config, runtime_paths, _source = _setup(tmp_path)
+    register_media_artifact(
+        runtime_paths.db_file,
+        session_uid="session-1",
+        kind=ArtifactKind.TRANSCRIPT.value,
+        role="",
+        filename="t.vtt",
+        content_type="text/vtt",
+        byte_size=9,
+        sha256="a" * 64,
+        duration_seconds=None,
+        s3_uri="s3://some-other-bucket/sessions/session-1/transcript/aa/t.vtt",
+        source_provider=None,
+        source_id=None,
+        timestamp="2026-07-20T00:00:00+00:00",
+    )
+
+    with pytest.raises(ArtifactError, match="configured for bucket"):
+        materialize_artifact(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session_uid="session-1",
+            kind=ArtifactKind.TRANSCRIPT.value,
+        )
+
+
+@mock_aws
 def test_materialize_artifact_without_row_raises_clear_error(tmp_path: Path) -> None:
     config, runtime_paths, _source = _setup(tmp_path)
 

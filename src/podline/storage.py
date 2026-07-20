@@ -15,8 +15,14 @@ from typing import Dict, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 import boto3
+from boto3.exceptions import Boto3Error
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import BotoCoreError, ClientError
+
+# ClientError and the boto3 transfer-layer errors (S3UploadFailedError,
+# S3TransferFailedError) do NOT inherit from BotoCoreError; every S3 call
+# must catch all three families or errors escape unwrapped.
+_S3_ERRORS = (BotoCoreError, ClientError, Boto3Error)
 
 from podline.config import StorageConfig
 
@@ -92,7 +98,7 @@ class MediaStorage:
                 "s3",
                 config=BotoConfig(retries={"max_attempts": 5, "mode": "standard"}),
             )
-        except (BotoCoreError, ClientError) as exc:
+        except _S3_ERRORS as exc:
             raise StorageError(f"Could not create S3 client: {exc}") from exc
 
     @property
@@ -118,23 +124,29 @@ class MediaStorage:
             if _client_error_code(exc) in {"404", "NoSuchKey", "NotFound"}:
                 return None
             raise StorageError(f"S3 head_object failed for {key}: {exc}") from exc
-        except BotoCoreError as exc:
+        except (BotoCoreError, Boto3Error) as exc:
             raise StorageError(f"S3 head_object failed for {key}: {exc}") from exc
         return {
             "byte_size": int(response["ContentLength"]),
             "content_type": response.get("ContentType", ""),
+            "sha256": response.get("Metadata", {}).get("sha256", ""),
         }
 
     def object_exists(self, key: str) -> bool:
         return self.head_object(key) is not None
 
-    def upload_file(self, *, local_path: Path, key: str, content_type: str) -> str:
-        """Upload a file and verify it landed. Idempotent for same-size objects.
+    def upload_file(
+        self, *, local_path: Path, key: str, content_type: str, sha256: str
+    ) -> str:
+        """Upload a file and verify it landed. Idempotent for identical content.
 
-        Keys are content-addressed, so an existing object with the expected
-        size is the same content and the upload is skipped. An existing
-        object with a different size means corruption or a hash collision in
-        key construction; fail loudly rather than overwrite.
+        The file's SHA-256 is stamped as object metadata. An existing object
+        at the key is accepted only when both its size and its recorded
+        checksum match the local file (multipart ETags are not content
+        hashes, so metadata is the only reliable identity); anything else —
+        wrong size, wrong hash, or an object some other writer created
+        without our metadata — fails loudly rather than being reused or
+        overwritten.
         """
         if not local_path.exists():
             raise StorageError(f"Cannot upload missing file: {local_path}")
@@ -147,6 +159,12 @@ class MediaStorage:
                     f"S3 object {key} already exists with size {existing['byte_size']} "
                     f"but local file is {local_size} bytes; refusing to overwrite"
                 )
+            if existing["sha256"] != sha256:
+                raise StorageError(
+                    f"S3 object {key} already exists with checksum "
+                    f"{existing['sha256'] or 'missing'} but local file is {sha256}; "
+                    "refusing to reuse or overwrite it"
+                )
             return self.s3_uri(key)
 
         try:
@@ -154,9 +172,12 @@ class MediaStorage:
                 str(local_path),
                 self._config.bucket,
                 key,
-                ExtraArgs={"ContentType": content_type},
+                ExtraArgs={
+                    "ContentType": content_type,
+                    "Metadata": {"sha256": sha256},
+                },
             )
-        except (BotoCoreError, ClientError) as exc:
+        except _S3_ERRORS as exc:
             raise StorageError(f"S3 upload failed for {key}: {exc}") from exc
 
         uploaded = self.head_object(key)
@@ -195,7 +216,7 @@ class MediaStorage:
                     f"S3 download checksum mismatch for {key}: expected {expected_sha256}, got {actual_sha256}"
                 )
             os.replace(partial, destination)
-        except (BotoCoreError, ClientError) as exc:
+        except _S3_ERRORS as exc:
             raise StorageError(f"S3 download failed for {key}: {exc}") from exc
         finally:
             if partial.exists():
@@ -209,13 +230,13 @@ class MediaStorage:
                 Params={"Bucket": self._config.bucket, "Key": key},
                 ExpiresIn=expires_seconds,
             )
-        except (BotoCoreError, ClientError) as exc:
+        except _S3_ERRORS as exc:
             raise StorageError(f"S3 presign failed for {key}: {exc}") from exc
 
     def check_access(self) -> None:
         try:
             self._client.head_bucket(Bucket=self._config.bucket)
-        except (BotoCoreError, ClientError) as exc:
+        except _S3_ERRORS as exc:
             raise StorageError(
                 f"S3 access check failed for bucket {self._config.bucket}: {exc}"
             ) from exc

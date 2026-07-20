@@ -43,7 +43,7 @@ import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from podline.config import StorageConfig, load_config  # noqa: E402
-from podline.storage import MediaStorage, redact_url  # noqa: E402
+from podline.storage import MediaStorage, redact_url, sha256_of_file  # noqa: E402
 
 POLL_INTERVAL_SECONDS = 10
 
@@ -93,7 +93,12 @@ def main() -> int:
     track_refs = []
     for track in ("tr1", "tr2"):
         key = f"pilot/{run_id}/{track}.webm"
-        storage.upload_file(local_path=source, key=key, content_type="audio/webm")
+        storage.upload_file(
+            local_path=source,
+            key=key,
+            content_type="audio/webm",
+            sha256=sha256_of_file(source),
+        )
         keys.append(key)
         print(f"uploaded {storage.s3_uri(key)}")
         if args.service:
