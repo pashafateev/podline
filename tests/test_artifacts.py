@@ -316,6 +316,99 @@ def test_materialize_artifact_without_row_raises_clear_error(tmp_path: Path) -> 
         )
 
 
+def test_workspace_cleanup_respects_status_and_retention_window(
+    session_factory, tmp_path: Path
+) -> None:
+    import os
+    import time as time_module
+
+    from podline.artifacts import (
+        apply_workspace_cleanup,
+        plan_workspace_cleanup,
+        workspace_path_for,
+    )
+
+    runtime_paths = _build_runtime_paths(tmp_path)
+    now = time_module.time()
+    old = now - 20 * 86400
+    recent = now - 2 * 86400
+
+    def _make_workspace(session_uid: str, mtime: float) -> Path:
+        workspace = workspace_path_for(runtime_paths, session_uid)
+        workspace.mkdir(parents=True)
+        project = workspace / "edit.cpr"
+        project.write_bytes(b"cubase-project")
+        os.utime(project, (mtime, mtime))
+        os.utime(workspace, (mtime, mtime))
+        return workspace
+
+    session_factory(
+        runtime_paths.db_file, session_uid="released-old", status="draft_created"
+    )
+    session_factory(
+        runtime_paths.db_file, session_uid="released-fresh", status="draft_created"
+    )
+    session_factory(
+        runtime_paths.db_file, session_uid="mid-pipeline", status="waiting_for_finalize"
+    )
+    released_old = _make_workspace("released-old", old)
+    released_fresh = _make_workspace("released-fresh", recent)
+    mid_pipeline = _make_workspace("mid-pipeline", old)
+    unknown = _make_workspace("no-session-row", old)
+
+    candidates = plan_workspace_cleanup(
+        runtime_paths, runtime_paths.db_file, older_than_days=14, now=now
+    )
+    by_uid = {candidate.session_uid: candidate for candidate in candidates}
+
+    assert by_uid["released-old"].eligible is True
+    assert by_uid["released-fresh"].eligible is False
+    assert "< 14d" in by_uid["released-fresh"].reason
+    assert by_uid["mid-pipeline"].eligible is False
+    assert "waiting_for_finalize" in by_uid["mid-pipeline"].reason
+    assert by_uid["no-session-row"].eligible is False
+
+    freed = apply_workspace_cleanup(candidates)
+
+    assert freed == len(b"cubase-project")
+    assert not released_old.exists()
+    assert released_fresh.exists()
+    assert mid_pipeline.exists()
+    assert unknown.exists()
+
+
+def test_workspace_cleanup_uses_newest_file_mtime(
+    session_factory, tmp_path: Path
+) -> None:
+    import os
+    import time as time_module
+
+    from podline.artifacts import plan_workspace_cleanup, workspace_path_for
+
+    runtime_paths = _build_runtime_paths(tmp_path)
+    now = time_module.time()
+    session_factory(
+        runtime_paths.db_file, session_uid="touched-lately", status="draft_created"
+    )
+    workspace = workspace_path_for(runtime_paths, "touched-lately")
+    workspace.mkdir(parents=True)
+    old_file = workspace / "old.mp3"
+    old_file.write_bytes(b"old")
+    os.utime(old_file, (now - 30 * 86400, now - 30 * 86400))
+    fresh_file = workspace / "edit.cpr"
+    fresh_file.write_bytes(b"fresh")
+    os.utime(fresh_file, (now - 1 * 86400, now - 1 * 86400))
+    os.utime(workspace, (now - 30 * 86400, now - 30 * 86400))
+
+    candidates = plan_workspace_cleanup(
+        runtime_paths, runtime_paths.db_file, older_than_days=14, now=now
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].eligible is False
+    assert "1.0d ago" in candidates[0].reason
+
+
 @mock_aws
 def test_get_media_artifact_distinguishes_roles(tmp_path: Path) -> None:
     config, runtime_paths, source = _setup(tmp_path)

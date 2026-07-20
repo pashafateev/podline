@@ -7,10 +7,12 @@ import typer
 
 from podline.artifacts import (
     ArtifactError,
+    apply_workspace_cleanup,
     cache_path_for,
     cache_usage_bytes,
     clear_cache,
     create_workspace,
+    plan_workspace_cleanup,
     workspace_path_for,
 )
 from podline.auphonic import (
@@ -441,6 +443,72 @@ def cache_clear(
     _print_key_values(
         [
             ("cache_dir", runtime_paths.cache_dir),
+            ("freed", _format_bytes(freed)),
+        ]
+    )
+
+
+@app.command("workspace-clean")
+def workspace_clean(
+    older_than_days: float = typer.Option(
+        14,
+        "--older-than-days",
+        help="Only remove workspaces untouched for at least this many days.",
+    ),
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="Actually delete eligible workspaces (dry run without it).",
+    ),
+    config: Optional[Path] = typer.Option(
+        None, "--config", help="Path to config.yaml."
+    ),
+) -> None:
+    """Remove editing workspaces for released episodes after a retention window.
+
+    Only sessions that reached draft_created are eligible, and only once
+    nothing in the workspace has been modified for the retention window.
+    Media re-materializes from S3 (pod workspace <session>); a Cubase project
+    saved in the workspace is deleted with it.
+    """
+    config_path = _resolve_config_path(config)
+    _loaded_config, runtime_paths, _logger = _bootstrap(config_path)
+    candidates = plan_workspace_cleanup(
+        runtime_paths,
+        runtime_paths.db_file,
+        older_than_days=older_than_days,
+    )
+
+    _print_header("Workspace Cleanup" if apply else "Workspace Cleanup (dry run)")
+    if not candidates:
+        typer.echo("No workspaces found.")
+        return
+
+    for candidate in candidates:
+        marker = (
+            _styled("✖ removing" if apply else "✖ would remove", fg=typer.colors.RED, bold=True)
+            if candidate.eligible
+            else _styled("✓ keeping", fg=typer.colors.GREEN, bold=True)
+        )
+        typer.echo(
+            f"{marker}  {candidate.session_uid}  "
+            f"{_format_bytes(candidate.size_bytes)}  {candidate.reason}"
+        )
+
+    eligible = [candidate for candidate in candidates if candidate.eligible]
+    if not eligible:
+        typer.echo("Nothing eligible to remove.")
+        return
+    if not apply:
+        typer.echo(
+            f"{len(eligible)} workspace(s) eligible; re-run with --apply to delete."
+        )
+        return
+
+    freed = apply_workspace_cleanup(candidates)
+    _print_key_values(
+        [
+            ("removed", str(len(eligible))),
             ("freed", _format_bytes(freed)),
         ]
     )

@@ -29,7 +29,7 @@ S3 media storage
 - A private Podline S3 bucket is the authoritative store for session media; `src/podline/storage.py` and `src/podline/artifacts.py` hold the storage layer (content-addressed keys `sessions/{session_uid}/{kind}/{sha256}/{filename}`, checksum-verified downloads, replace-in-place `media_artifacts` rows).
 - Configure it under `storage.*` in `config.local.yaml` (`enabled`, `bucket`, `region`, optional `key_prefix`, optional `profile` for a dedicated AWS credentials profile). Setting `enabled: false` pauses new ingests without affecting anything else.
 - Auphonic reads S3 audio through an Amazon S3 external service registered in the Auphonic account (read-only IAM user); set its UUID as `auphonic.s3_service_id`. `scripts/setup_iam_users.sh` provisions the IAM users.
-- `pod health` reports storage access and cache usage; `pod cache-clear` empties the local cache (entries re-download on demand). Workspaces under `~/podline/workspaces/` persist until removed by hand and are never touched by cache clearing.
+- `pod health` reports storage access and cache usage; `pod cache-clear` empties the local cache (entries re-download on demand). Workspaces under `~/podline/workspaces/` are never touched by cache clearing; retire them with `pod workspace-clean` once episodes are out (dry run by default, `--apply` deletes workspaces of `draft_created` sessions untouched for 14+ days, `--older-than-days` to tune).
 
 Getting started
 ```bash
@@ -132,5 +132,5 @@ pod status @1
 
 Cleanup status
 - Source media and generated artifacts are authoritative in S3; the local cache under `~/podline/cache/` is a replaceable copy (`pod cache-clear`).
-- Workspaces under `~/podline/workspaces/` persist until removed by hand.
+- Workspaces under `~/podline/workspaces/` persist through editing and release, then get retired with `pod workspace-clean --apply` after the retention window (default 14 days untouched, `draft_created` sessions only). Everything except a Cubase project saved in the workspace re-materializes from S3.
 - Auphonic staging files under `~/podline/staging/` are transient; a retention policy is still a follow-up item.

@@ -15,18 +15,31 @@ cache-clear` empties it.
 import json
 import os
 import shutil
+import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from podline.config import AppConfig
 from podline.models import MediaArtifactRecord, RuntimePaths
-from podline.repository import get_media_artifact, register_media_artifact
+from podline.repository import get_media_artifact, get_session, register_media_artifact
 from podline.storage import MediaStorage, StorageError, parse_s3_uri, sha256_of_file
 
 
 class ArtifactError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class WorkspaceCleanupCandidate:
+    session_uid: str
+    path: Path
+    status: Optional[str]
+    age_days: float
+    size_bytes: int
+    eligible: bool
+    reason: str
 
 
 def store_artifact_file(
@@ -225,6 +238,79 @@ def create_workspace(
         encoding="utf-8",
     )
     return workspace
+
+
+def plan_workspace_cleanup(
+    runtime_paths: RuntimePaths,
+    db_file: str,
+    *,
+    older_than_days: float,
+    now: Optional[float] = None,
+) -> List[WorkspaceCleanupCandidate]:
+    """Decide which workspaces are safe to remove.
+
+    A workspace is eligible only when its session reached draft_created AND
+    nothing inside it was modified for older_than_days. Sessions mid-pipeline,
+    recently touched workspaces, and directories without a session record are
+    kept. Media re-materializes from S3; the only unrecoverable content is a
+    Cubase project saved inside the workspace, which the age window guards.
+    """
+    now = time.time() if now is None else now
+    workspaces_root = Path(runtime_paths.workspaces_dir)
+    if not workspaces_root.exists():
+        return []
+
+    candidates = []
+    for entry in sorted(workspaces_root.iterdir()):
+        if not entry.is_dir():
+            continue
+        session = get_session(db_file, entry.name)
+        newest_mtime = max(
+            [entry.stat().st_mtime]
+            + [path.stat().st_mtime for path in entry.rglob("*")],
+        )
+        age_days = max(0.0, (now - newest_mtime) / 86400)
+        size_bytes = sum(
+            path.stat().st_size for path in entry.rglob("*") if path.is_file()
+        )
+
+        if session is None:
+            eligible, reason = False, "no session record; remove by hand if unwanted"
+        elif session.status != "draft_created":
+            eligible, reason = False, f"session is {session.status}, not draft_created"
+        elif age_days < older_than_days:
+            eligible, reason = (
+                False,
+                f"modified {age_days:.1f}d ago (< {older_than_days:g}d)",
+            )
+        else:
+            eligible, reason = True, f"draft created; untouched for {age_days:.1f}d"
+
+        candidates.append(
+            WorkspaceCleanupCandidate(
+                session_uid=entry.name,
+                path=entry,
+                status=session.status if session else None,
+                age_days=age_days,
+                size_bytes=size_bytes,
+                eligible=eligible,
+                reason=reason,
+            )
+        )
+    return candidates
+
+
+def apply_workspace_cleanup(
+    candidates: List[WorkspaceCleanupCandidate],
+) -> int:
+    """Remove eligible workspaces; returns bytes freed."""
+    freed = 0
+    for candidate in candidates:
+        if not candidate.eligible:
+            continue
+        shutil.rmtree(candidate.path)
+        freed += candidate.size_bytes
+    return freed
 
 
 def cache_usage_bytes(runtime_paths: RuntimePaths) -> int:
