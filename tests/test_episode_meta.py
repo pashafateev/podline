@@ -20,6 +20,7 @@ from podline.config import (
     AuphonicConfig,
     PodbeanConfig,
     CozytrackConfig,
+    StorageConfig,
 )
 
 
@@ -124,6 +125,7 @@ def test_generate_episode_metadata_with_opencode_persists_episode(
             podcast_id="",
         ),
         cozytrack=_default_cozytrack_config(),
+        storage=_default_storage_config(),
         config_file=tmp_path / "config.yaml",
     )
 
@@ -137,3 +139,12 @@ def test_generate_episode_metadata_with_opencode_persists_episode(
     saved = get_episode(str(db_file), session.session_uid)
     assert saved is not None
     assert saved.title == "Boba Boom"
+
+
+def _default_storage_config() -> StorageConfig:
+    return StorageConfig(
+        enabled=False,
+        bucket="",
+        region="",
+        key_prefix="",
+    )

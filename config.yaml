@@ -29,3 +29,8 @@ cozytrack:
   api_key: ""
   download_subdir: cozytrack
   request_timeout_seconds: 600
+storage:
+  enabled: false
+  bucket: ""
+  region: ""
+  key_prefix: ""

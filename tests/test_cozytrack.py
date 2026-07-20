@@ -12,6 +12,7 @@ from podline.config import (
     PathsConfig,
     PodbeanConfig,
     PollingConfig,
+    StorageConfig,
 )
 from podline.cozytrack.client import (
     CozytrackClient,
@@ -64,6 +65,7 @@ def _build_config(tmp_path: Path, *, api_key: str = "test-key") -> AppConfig:
             download_subdir="cozytrack",
             request_timeout_seconds=60,
         ),
+        storage=_default_storage_config(),
         config_file=tmp_path / "config.yaml",
     )
 
@@ -379,3 +381,12 @@ def test_slugify_handles_unicode_and_punctuation() -> None:
     assert slugify("Hello, World!") == "hello-world"
     assert slugify("   ") == "session"
     assert slugify("ep07: Boba & Beats") == "ep07-boba-beats"
+
+
+def _default_storage_config() -> StorageConfig:
+    return StorageConfig(
+        enabled=False,
+        bucket="",
+        region="",
+        key_prefix="",
+    )

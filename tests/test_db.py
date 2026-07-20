@@ -57,3 +57,38 @@ def test_initialize_database_applies_session_metadata_migrations(
     assert "recorded_at" in columns
     assert "recorded_at_source" in columns
     assert "transcript_refresh_production_id" in columns
+
+
+def test_initialize_database_creates_media_artifacts_table(tmp_path: Path) -> None:
+    db_file = tmp_path / "state" / "state.db"
+
+    initialize_database(str(db_file))
+
+    connection = sqlite3.connect(db_file)
+    columns = {
+        row[1]
+        for row in connection.execute(
+            "PRAGMA table_info(media_artifacts)"
+        ).fetchall()
+    }
+    indexes = {
+        row[1] for row in connection.execute("PRAGMA index_list(media_artifacts)")
+    }
+    connection.close()
+
+    assert {
+        "session_uid",
+        "kind",
+        "role",
+        "filename",
+        "content_type",
+        "byte_size",
+        "sha256",
+        "duration_seconds",
+        "s3_uri",
+        "source_provider",
+        "source_id",
+        "created_at",
+        "updated_at",
+    } <= columns
+    assert "idx_media_artifacts_session_kind_role" in indexes

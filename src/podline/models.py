@@ -16,6 +16,30 @@ class SessionStatus(str, Enum):
     FAILED = "failed"
 
 
+class ArtifactKind(str, Enum):
+    RAW_TRACK = "raw_track"
+    PRE_EDIT_MASTER = "pre_edit_master"
+    TRANSCRIPT = "transcript"
+    FINAL_MASTER = "final_master"
+
+
+@dataclass(frozen=True)
+class MediaArtifactRecord:
+    session_uid: str
+    kind: str
+    role: str
+    filename: str
+    content_type: str
+    byte_size: int
+    sha256: str
+    duration_seconds: Optional[float]
+    s3_uri: str
+    source_provider: Optional[str]
+    source_id: Optional[str]
+    created_at: str
+    updated_at: str
+
+
 @dataclass(frozen=True)
 class RuntimePaths:
     home: str
@@ -25,6 +49,7 @@ class RuntimePaths:
     health_file: str
     logs_dir: str
     staging_dir: str
+    cache_dir: str
 
 
 @dataclass(frozen=True)

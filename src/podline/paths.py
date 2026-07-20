@@ -14,6 +14,7 @@ def build_runtime_paths(config: AppConfig) -> RuntimePaths:
         health_file=str(home / "state" / "health.json"),
         logs_dir=str(home / "logs"),
         staging_dir=str(home / "staging"),
+        cache_dir=str(home / "cache"),
     )
 
 
@@ -23,5 +24,6 @@ def ensure_runtime_dirs(runtime_paths: RuntimePaths) -> None:
         runtime_paths.state_dir,
         runtime_paths.logs_dir,
         runtime_paths.staging_dir,
+        runtime_paths.cache_dir,
     ):
         Path(path).mkdir(parents=True, exist_ok=True)

@@ -33,6 +33,7 @@ from podline.config import (
     PathsConfig,
     PodbeanConfig,
     PollingConfig,
+    StorageConfig,
 )
 from podline.db import connect, initialize_database
 from podline.ingest import scan_and_ingest
@@ -903,6 +904,7 @@ def _build_config(tmp_path: Path, enabled: bool = True) -> AppConfig:
             podcast_id="",
         ),
         cozytrack=_default_cozytrack_config(),
+        storage=_default_storage_config(),
         config_file=runtime_home / "config.yaml",
     )
 
@@ -962,3 +964,12 @@ def _duration_probe(durations):
         return durations[path.name]
 
     return probe
+
+
+def _default_storage_config() -> StorageConfig:
+    return StorageConfig(
+        enabled=False,
+        bucket="",
+        region="",
+        key_prefix="",
+    )

@@ -4,10 +4,16 @@ from podline.db import connect
 from podline.models import (
     AssetRecord,
     EpisodeRecord,
+    MediaArtifactRecord,
     ScanCandidate,
     SessionRecord,
     SessionStatus,
 )
+
+_MEDIA_ARTIFACT_COLUMNS = """
+    session_uid, kind, role, filename, content_type, byte_size, sha256,
+    duration_seconds, s3_uri, source_provider, source_id, created_at, updated_at
+"""
 
 
 def list_sessions(db_file: str) -> List[SessionRecord]:
@@ -400,6 +406,128 @@ def get_session_by_cozytrack_id(
     with connect(db_file) as connection:
         row = connection.execute(query, (cozytrack_session_id,)).fetchone()
     return _row_to_session(row) if row else None
+
+
+def register_media_artifact(
+    db_file: str,
+    *,
+    session_uid: str,
+    kind: str,
+    role: str,
+    filename: str,
+    content_type: str,
+    byte_size: int,
+    sha256: str,
+    duration_seconds: Optional[float],
+    s3_uri: str,
+    source_provider: Optional[str],
+    source_id: Optional[str],
+    timestamp: str,
+) -> MediaArtifactRecord:
+    """Register the current artifact for (session, kind, role), replacing any prior row.
+
+    Rows are replace-in-place; superseded S3 objects stay in the bucket and
+    serve as history.
+    """
+    with connect(db_file) as connection:
+        connection.execute(
+            """
+            INSERT INTO media_artifacts (
+                session_uid, kind, role, filename, content_type, byte_size,
+                sha256, duration_seconds, s3_uri, source_provider, source_id,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_uid, kind, role) DO UPDATE SET
+                filename = excluded.filename,
+                content_type = excluded.content_type,
+                byte_size = excluded.byte_size,
+                sha256 = excluded.sha256,
+                duration_seconds = excluded.duration_seconds,
+                s3_uri = excluded.s3_uri,
+                source_provider = excluded.source_provider,
+                source_id = excluded.source_id,
+                updated_at = excluded.updated_at
+            """,
+            (
+                session_uid,
+                kind,
+                role,
+                filename,
+                content_type,
+                byte_size,
+                sha256,
+                duration_seconds,
+                s3_uri,
+                source_provider,
+                source_id,
+                timestamp,
+                timestamp,
+            ),
+        )
+        connection.commit()
+
+    record = get_media_artifact(db_file, session_uid, kind=kind, role=role)
+    if record is None:
+        raise RuntimeError(
+            f"Failed to register media artifact {kind}/{role or 'default'} for {session_uid}"
+        )
+    return record
+
+
+def get_media_artifact(
+    db_file: str,
+    session_uid: str,
+    *,
+    kind: str,
+    role: str = "",
+) -> Optional[MediaArtifactRecord]:
+    query = f"""
+    SELECT {_MEDIA_ARTIFACT_COLUMNS}
+    FROM media_artifacts
+    WHERE session_uid = ? AND kind = ? AND role = ?
+    """
+    with connect(db_file) as connection:
+        row = connection.execute(query, (session_uid, kind, role)).fetchone()
+    return _row_to_media_artifact(row) if row else None
+
+
+def list_media_artifacts(
+    db_file: str,
+    session_uid: str,
+    *,
+    kind: Optional[str] = None,
+) -> List[MediaArtifactRecord]:
+    query = f"""
+    SELECT {_MEDIA_ARTIFACT_COLUMNS}
+    FROM media_artifacts
+    WHERE session_uid = ?
+    """
+    params = [session_uid]
+    if kind is not None:
+        query += " AND kind = ?"
+        params.append(kind)
+    query += " ORDER BY kind ASC, role ASC"
+    with connect(db_file) as connection:
+        rows = connection.execute(query, params).fetchall()
+    return [_row_to_media_artifact(row) for row in rows]
+
+
+def _row_to_media_artifact(row) -> MediaArtifactRecord:
+    return MediaArtifactRecord(
+        session_uid=row["session_uid"],
+        kind=row["kind"],
+        role=row["role"],
+        filename=row["filename"],
+        content_type=row["content_type"],
+        byte_size=row["byte_size"],
+        sha256=row["sha256"],
+        duration_seconds=row["duration_seconds"],
+        s3_uri=row["s3_uri"],
+        source_provider=row["source_provider"],
+        source_id=row["source_id"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
 
 
 def upsert_episode_metadata(

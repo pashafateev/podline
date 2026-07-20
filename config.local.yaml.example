@@ -17,3 +17,16 @@ cozytrack:
   download_subdir: cozytrack
   # HTTP timeout (seconds) for Cozytrack API calls and S3 downloads.
   request_timeout_seconds: 600
+
+storage:
+  enabled: true
+  # Private Podline media bucket. Credentials come from the standard AWS
+  # chain (env vars, ~/.aws profile, or an IAM role when hosted).
+  bucket: "replace-me"
+  # Leave empty to use the AWS default region for the active profile.
+  region: us-west-2
+  # Optional key prefix inside the bucket; usually empty.
+  key_prefix: ""
+  # AWS named profile with long-term keys (scripts/setup_iam_users.sh
+  # creates the scoped 'podline' user). Empty uses the default chain.
+  profile: podline
