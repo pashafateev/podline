@@ -20,9 +20,17 @@ Current scope
 Project layout
 - `src/podline/`: application code
 - `tests/`: unit tests
+- `scripts/`: one-off operational scripts (e.g. the Auphonic remote-input pilot)
 - `state/`: SQLite DB and health file
 - `logs/`: local logs
 - `staging/`: temporary working area for future pipeline phases
+- `cache/`: checksum-keyed local copies of S3 artifacts (safe to clear with `pod cache-clear`)
+
+S3 media storage (foundation)
+- A private Podline S3 bucket is becoming the authoritative store for session media; `src/podline/storage.py` and `src/podline/artifacts.py` hold the storage layer (content-addressed keys `sessions/{session_uid}/{kind}/{sha256}/{filename}`, checksum-verified downloads, replace-in-place `media_artifacts` rows).
+- Configure it under `storage.*` in `config.local.yaml` (`enabled`, `bucket`, `region`, optional `key_prefix`). Credentials come from the standard AWS chain.
+- `pod health` reports storage access and cache usage; `pod cache-clear` empties the local cache (entries re-download on demand).
+- Pipeline integration (S3-native ingest, remote Auphonic inputs, workspaces) lands in the next change; until then ingest and processing keep using local paths.
 
 Getting started
 ```bash

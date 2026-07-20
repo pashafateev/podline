@@ -5,6 +5,7 @@ import webbrowser
 
 import typer
 
+from podline.artifacts import cache_usage_bytes, clear_cache
 from podline.auphonic import (
     AuphonicError,
     inspect_production,
@@ -17,6 +18,7 @@ from podline.auphonic import (
     start_prepared_session_with_auphonic,
 )
 from podline.config import load_config
+from podline.storage import storage_health
 from podline.cozytrack.client import CozytrackError
 from podline.cozytrack.ingest import (
     CozytrackIngestError,
@@ -407,6 +409,7 @@ def health(
     config_path = _resolve_config_path(config)
     loaded_config, runtime_paths, _logger = _bootstrap(config_path, debug=debug)
     snapshot = read_health_snapshot(runtime_paths, loaded_config)
+    storage_status = storage_health(loaded_config.storage)
 
     _print_header("Health")
     _print_key_values(
@@ -424,11 +427,49 @@ def health(
                 if snapshot.external_drive_mounted
                 else _styled("✖ no", fg=typer.colors.RED, bold=True),
             ),
+            (
+                "storage",
+                _styled(storage_status, fg=typer.colors.GREEN, bold=True)
+                if storage_status.startswith("ok")
+                else _styled(storage_status, fg=typer.colors.RED, bold=True)
+                if storage_status.startswith("error")
+                else storage_status,
+            ),
+            ("cache_usage", _format_bytes(cache_usage_bytes(runtime_paths))),
             ("queue_depth", str(snapshot.queue_depth)),
             ("session_count", str(snapshot.session_count)),
             ("last_error", snapshot.last_error or "none"),
         ]
     )
+
+
+@app.command("cache-clear")
+def cache_clear(
+    config: Optional[Path] = typer.Option(
+        None, "--config", help="Path to config.yaml."
+    ),
+) -> None:
+    """Empty the local artifact cache. Cached files re-download from S3 on demand."""
+    config_path = _resolve_config_path(config)
+    _loaded_config, runtime_paths, _logger = _bootstrap(config_path)
+    freed = clear_cache(runtime_paths)
+
+    _print_header("Cache Cleared")
+    _print_key_values(
+        [
+            ("cache_dir", runtime_paths.cache_dir),
+            ("freed", _format_bytes(freed)),
+        ]
+    )
+
+
+def _format_bytes(value: int) -> str:
+    size = float(value)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{size:.1f} GB"
 
 
 @app.command("list")
