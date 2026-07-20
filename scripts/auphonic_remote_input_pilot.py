@@ -85,6 +85,11 @@ def main() -> int:
         )
     )
     run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+    if args.preset:
+        if not args.service:
+            print("--preset requires --service")
+            return 2
+        return _run_preset_verification(args, config, auphonic, storage, run_id)
     mode = "external-service" if args.service else "presigned-url"
     print(f"pilot run {run_id}: bucket={args.bucket} mode={mode}")
 
@@ -221,6 +226,88 @@ def main() -> int:
     return 0
 
 
+def _run_preset_verification(args, config, auphonic, storage, run_id) -> int:
+    """Verify the pipeline's exact prepare flow against a real preset.
+
+    Creates an unstarted production FROM the preset, resolves the preset's
+    track ids, attaches each S3 track via per-track update, verifies the
+    attachment, and deletes the production. Never starts processing.
+    """
+    preset_id = config.auphonic.preset_ids.get(args.preset, "").strip() or args.preset
+    print(f"pilot run {run_id}: preset-attach verification preset={preset_id}")
+
+    source = args.input_file or _generate_test_tone()
+    keys = []
+    for track in ("tr1", "tr2"):
+        key = f"pilot/{run_id}/{track}.webm"
+        storage.upload_file(
+            local_path=source,
+            key=key,
+            content_type="audio/webm",
+            sha256=sha256_of_file(source),
+        )
+        keys.append(key)
+        print(f"uploaded {storage.s3_uri(key)}")
+
+    production = auphonic.create_production(
+        {
+            "preset": preset_id,
+            "metadata": {
+                "title": f"podline preset pilot {run_id} — safe to delete"
+            },
+            "is_multitrack": True,
+        }
+    )
+    production_id = production.get("uuid") or production.get("id")
+    if not production_id:
+        print("FAIL: preset create response had no production id")
+        return 1
+    print(f"created unstarted production {production_id} from preset")
+
+    preset_tracks = [
+        str(item.get("id"))
+        for item in (production.get("multi_input_files") or [])
+        if item.get("id")
+    ]
+    print(f"preset-defined track ids: {preset_tracks or 'none'}")
+    track_ids = preset_tracks if len(preset_tracks) == len(keys) else ["tr1", "tr2"]
+
+    try:
+        for track_id, key in zip(track_ids, keys):
+            auphonic.update_track_input(
+                production_id, track_id, key, service_id=args.service
+            )
+            print(f"attached track_id={track_id} input_file={key}")
+
+        data = auphonic.get_production(production_id)
+        _print_inspection("after preset attach", data)
+        attached = {
+            str(item.get("id"))
+            for item in (data.get("multi_input_files") or [])
+            if item.get("input_file")
+        }
+        if set(track_ids).issubset(attached):
+            print(
+                "\nVERDICT: preset track ids resolved and service attach via "
+                "per-track update works — the pipeline prepare flow is valid."
+            )
+            outcome = 0
+        else:
+            print(
+                f"\nVERDICT: attach mismatch — expected {sorted(track_ids)}, "
+                f"attached {sorted(attached)}. Inspect before relying on prepare."
+            )
+            outcome = 1
+    finally:
+        if args.keep:
+            print("--keep given; leaving the production and pilot objects in place.")
+        else:
+            auphonic.delete_production(production_id)
+            print(f"deleted production {production_id}")
+            _cleanup(storage, keys, keep=False)
+    return outcome
+
+
 class _AuphonicApi:
     def __init__(self, *, base_url: str, api_key: str) -> None:
         self._client = httpx.Client(
@@ -250,14 +337,28 @@ class _AuphonicApi:
         return self._data(self._client.post(f"/production/{production_id}/start.json"))
 
     def update_track_input(
-        self, production_id: str, track_id: str, input_url: str
+        self,
+        production_id: str,
+        track_id: str,
+        input_ref: str,
+        service_id: str = "",
     ) -> Dict:
+        payload = {"type": "multitrack", "input_file": input_ref}
+        if service_id:
+            payload["service"] = service_id
         response = self._client.post(
             f"/production/{production_id}/multi_input_files/{track_id}.json",
-            json={"type": "multitrack", "input_file": input_url},
+            json=payload,
             headers={"Content-Type": "application/json"},
         )
         return self._data(response)
+
+    def delete_production(self, production_id: str) -> None:
+        response = self._client.delete(f"/production/{production_id}.json")
+        if response.status_code >= 400:
+            raise httpx.HTTPError(
+                f"Auphonic delete failed status={response.status_code}"
+            )
 
     def _data(self, response: httpx.Response) -> Dict:
         try:
@@ -382,6 +483,15 @@ def _parse_args() -> argparse.Namespace:
         "--list-services",
         action="store_true",
         help="Print registered Auphonic external services and exit.",
+    )
+    parser.add_argument(
+        "--preset",
+        default="",
+        help=(
+            "Verify preset-based attach: create an unstarted production from this "
+            "preset (id or a preset_ids key like speakers_2), attach via the "
+            "service, inspect, and delete. Requires --service; never starts."
+        ),
     )
     parser.add_argument("--expiry-seconds", type=int, default=120)
     parser.add_argument("--poll-minutes", type=int, default=5)
