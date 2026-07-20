@@ -236,6 +236,17 @@ def test_presigned_get_url_is_signed_and_redactable(tmp_path: Path) -> None:
     assert redact_url(url).endswith("?<redacted>")
 
 
+def test_storage_health_wraps_client_construction_failures(monkeypatch) -> None:
+    from botocore.exceptions import BotoCoreError
+
+    def _broken_client(*_args, **_kwargs):
+        raise BotoCoreError()
+
+    monkeypatch.setattr("podline.storage.boto3.client", _broken_client)
+    status = storage_health(_storage_config())
+    assert status.startswith("error: Could not create S3 client")
+
+
 @mock_aws
 def test_storage_health_reports_ok_and_errors() -> None:
     assert (

@@ -80,11 +80,17 @@ class MediaStorage:
     def __init__(self, config: StorageConfig) -> None:
         validate_storage_config(config)
         self._config = config
-        self._client = boto3.client(
-            "s3",
-            region_name=config.region.strip() or None,
-            config=BotoConfig(retries={"max_attempts": 5, "mode": "standard"}),
-        )
+        try:
+            # Client construction resolves credentials, so provider problems
+            # (missing profile, expired login, absent optional deps) surface
+            # here rather than at the first request.
+            self._client = boto3.client(
+                "s3",
+                region_name=config.region.strip() or None,
+                config=BotoConfig(retries={"max_attempts": 5, "mode": "standard"}),
+            )
+        except (BotoCoreError, ClientError) as exc:
+            raise StorageError(f"Could not create S3 client: {exc}") from exc
 
     @property
     def bucket(self) -> str:
