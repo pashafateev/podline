@@ -91,6 +91,59 @@ def test_import_local_folder_is_idempotent_for_same_content(
     assert count_sessions(runtime_paths.db_file) == 1
 
 
+def test_register_backfills_cozytrack_id_on_content_dedup(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    from podline.ingest import register_candidate_with_storage
+    from podline.repository import get_session_by_cozytrack_id
+    from podline.scanner import _parse_session_dir
+
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    folder = _make_session_folder(tmp_path)
+
+    imported, _created = import_local_folder(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        folder=folder,
+        duration_probe=_fixed_probe,
+    )
+    assert imported.cozytrack_session_id is None
+
+    candidate = _parse_session_dir(folder)
+    deduped, created = register_candidate_with_storage(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        candidate=candidate,
+        source_provider="cozytrack",
+        cozytrack_session_id="ct-77",
+        duration_probe=_fixed_probe,
+    )
+
+    assert created is False
+    assert deduped.session_uid == imported.session_uid
+    assert deduped.cozytrack_session_id == "ct-77"
+    assert (
+        get_session_by_cozytrack_id(runtime_paths.db_file, "ct-77").session_uid
+        == imported.session_uid
+    )
+
+    # Same content under a second, different Cozytrack session must fail
+    # loudly rather than silently re-listing forever.
+    with pytest.raises(IngestError, match="refusing to also associate"):
+        register_candidate_with_storage(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            candidate=candidate,
+            source_provider="cozytrack",
+            cozytrack_session_id="ct-88",
+            duration_probe=_fixed_probe,
+        )
+
+
 def test_import_refuses_when_storage_disabled(
     app_config_factory, runtime_factory, tmp_path: Path
 ) -> None:

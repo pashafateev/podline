@@ -255,6 +255,12 @@ def plan_workspace_cleanup(
     kept. Media re-materializes from S3; the only unrecoverable content is a
     Cubase project saved inside the workspace, which the age window guards.
     """
+    if older_than_days < 0:
+        # A negative window would make every released workspace — including
+        # one saved minutes ago — instantly eligible.
+        raise ArtifactError(
+            f"Workspace retention must be at least 0 days, got {older_than_days:g}"
+        )
     now = time.time() if now is None else now
     workspaces_root = Path(runtime_paths.workspaces_dir)
     if not workspaces_root.exists():

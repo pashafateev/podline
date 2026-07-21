@@ -4,10 +4,11 @@ from decimal import Decimal, InvalidOperation
 import json
 import logging
 from pathlib import Path
+import re
 import shutil
 import subprocess
 from time import sleep
-from typing import Callable, Dict, Iterable, List, Optional, Protocol
+from typing import Callable, Dict, Iterable, List, Optional, Protocol, Tuple
 from urllib.parse import quote, unquote, urlparse
 
 import httpx
@@ -433,11 +434,15 @@ def prepare_session_with_auphonic(
         track_ids = prepared_production.upload_track_ids or [
             artifact.role for artifact in tracks
         ]
-        if len(track_ids) != len(tracks):
-            raise AuphonicError(
-                "Auphonic preset track count does not match the session's spoken tracks"
+        pairs = _pair_tracks_with_preset_ids(track_ids, tracks)
+        for track_id, artifact in pairs:
+            _log(
+                logger,
+                "Attaching %s (role %s) to Auphonic track '%s'",
+                artifact.filename,
+                artifact.role,
+                track_id,
             )
-        for track_id, artifact in zip(track_ids, tracks):
             client.attach_service_input(
                 production_id,
                 track_id,
@@ -777,10 +782,6 @@ def resolve_auphonic_service_id(config: AppConfig) -> str:
             "Missing auphonic.s3_service_id in config. Register the Podline bucket "
             "as an Amazon S3 external service in Auphonic and set its UUID."
         )
-    if not config.storage.enabled:
-        raise AuphonicError(
-            "storage.enabled is false; S3-backed Auphonic attachment is unavailable"
-        )
     return service_id
 
 
@@ -985,6 +986,38 @@ def _suffix_from_url(url: Optional[str]) -> str:
     if not url:
         return ""
     return Path(url.split("?", 1)[0]).suffix
+
+
+def _pair_tracks_with_preset_ids(
+    track_ids: List[str], tracks: List["MediaArtifactRecord"]
+) -> List[Tuple[str, "MediaArtifactRecord"]]:
+    """Decide which artifact attaches to which preset track.
+
+    Preset tracks are named and carry per-track settings, but there is no
+    server-side link between a preset track id and a session role. When the
+    preset's track ids match the artifact roles exactly (case-insensitive),
+    pair by name; otherwise fall back to position — preset order against
+    roles in natural sort order, so host10 follows host2 instead of host1.
+    """
+    if len(track_ids) != len(tracks):
+        raise AuphonicError(
+            "Auphonic preset track count does not match the session's spoken tracks"
+        )
+    by_role = {artifact.role.lower(): artifact for artifact in tracks}
+    if len(by_role) == len(tracks) and {
+        track_id.lower() for track_id in track_ids
+    } == set(by_role):
+        return [(track_id, by_role[track_id.lower()]) for track_id in track_ids]
+
+    ordered = sorted(tracks, key=lambda artifact: _natural_role_key(artifact.role))
+    return list(zip(track_ids, ordered))
+
+
+def _natural_role_key(role: str) -> Tuple[str, int, str]:
+    match = re.fullmatch(r"(.*?)(\d+)", role)
+    if match:
+        return (match.group(1).lower(), int(match.group(2)), role.lower())
+    return (role.lower(), -1, role.lower())
 
 
 def _tracks_look_attached(

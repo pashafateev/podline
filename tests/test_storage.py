@@ -95,11 +95,12 @@ def test_redact_url_strips_query_credentials() -> None:
     assert redact_url("https://example.com/plain") == "https://example.com/plain"
 
 
-def test_validate_storage_config_requires_enabled_and_bucket() -> None:
-    with pytest.raises(StorageError):
-        validate_storage_config(
-            StorageConfig(enabled=False, bucket="b", region="", key_prefix="")
-        )
+def test_validate_storage_config_requires_bucket_but_not_enabled() -> None:
+    # enabled=false pauses ingest only; a configured bucket stays usable for
+    # sessions that are already S3-native.
+    validate_storage_config(
+        StorageConfig(enabled=False, bucket="b", region="", key_prefix="")
+    )
     with pytest.raises(StorageError):
         validate_storage_config(
             StorageConfig(enabled=True, bucket="  ", region="", key_prefix="")
@@ -382,7 +383,7 @@ def test_storage_health_reports_ok_and_errors() -> None:
         storage_health(
             StorageConfig(enabled=False, bucket="", region="", key_prefix="")
         )
-        == "disabled"
+        == "not configured"
     )
 
     boto3.client("s3", region_name="us-east-1").create_bucket(Bucket=BUCKET)
@@ -390,3 +391,33 @@ def test_storage_health_reports_ok_and_errors() -> None:
     assert storage_health(_storage_config(bucket="missing-bucket")).startswith(
         "error"
     )
+
+    paused = StorageConfig(
+        enabled=False, bucket=BUCKET, region="us-east-1", key_prefix=""
+    )
+    assert storage_health(paused) == f"ok (bucket {BUCKET}, ingest paused)"
+
+
+@mock_aws
+def test_media_storage_stays_usable_while_ingest_is_paused(tmp_path: Path) -> None:
+    boto3.client("s3", region_name="us-east-1").create_bucket(Bucket=BUCKET)
+    paused = MediaStorage(
+        StorageConfig(enabled=False, bucket=BUCKET, region="us-east-1", key_prefix="")
+    )
+    source = tmp_path / "track.webm"
+    source.write_bytes(b"opus-bytes")
+    key = "sessions/s1/raw_track/aaa/track.webm"
+
+    paused.upload_file(
+        local_path=source,
+        key=key,
+        content_type="audio/webm",
+        sha256=sha256_of_file(source),
+    )
+    destination = tmp_path / "downloads" / "track.webm"
+    paused.download_to_path(
+        key=key,
+        destination=destination,
+        expected_sha256=sha256_of_file(source),
+    )
+    assert destination.read_bytes() == b"opus-bytes"

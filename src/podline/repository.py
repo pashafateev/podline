@@ -388,6 +388,47 @@ def list_cozytrack_session_ids(db_file: str) -> List[str]:
     return [row["cozytrack_session_id"] for row in rows]
 
 
+def set_cozytrack_session_id(
+    db_file: str,
+    *,
+    session_uid: str,
+    cozytrack_session_id: str,
+    status: str,
+    timestamp: str,
+) -> bool:
+    """Associate a Cozytrack session with an existing unassociated session.
+
+    Guarded so an already-associated session is never rewritten; returns
+    False in that case.
+    """
+    with connect(db_file) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE sessions
+            SET cozytrack_session_id = ?, updated_at = ?
+            WHERE session_uid = ? AND cozytrack_session_id IS NULL
+            """,
+            (cozytrack_session_id, timestamp, session_uid),
+        )
+        if cursor.rowcount != 1:
+            return False
+        connection.execute(
+            """
+            INSERT INTO events (session_uid, from_state, to_state, timestamp, detail)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                session_uid,
+                status,
+                status,
+                timestamp,
+                f"associated Cozytrack session {cozytrack_session_id} with existing content",
+            ),
+        )
+        connection.commit()
+    return True
+
+
 def get_session_by_cozytrack_id(
     db_file: str, cozytrack_session_id: str
 ) -> Optional[SessionRecord]:

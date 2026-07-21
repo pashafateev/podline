@@ -377,6 +377,16 @@ def test_workspace_cleanup_respects_status_and_retention_window(
     assert unknown.exists()
 
 
+def test_workspace_cleanup_rejects_negative_retention(tmp_path: Path) -> None:
+    from podline.artifacts import plan_workspace_cleanup
+
+    runtime_paths = _build_runtime_paths(tmp_path)
+    with pytest.raises(ArtifactError, match="at least 0 days"):
+        plan_workspace_cleanup(
+            runtime_paths, runtime_paths.db_file, older_than_days=-1
+        )
+
+
 def test_workspace_cleanup_uses_newest_file_mtime(
     session_factory, tmp_path: Path
 ) -> None:

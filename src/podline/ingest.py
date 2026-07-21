@@ -27,6 +27,7 @@ from podline.models import (
 from podline.repository import (
     create_session_with_artifacts,
     get_session_by_fingerprint,
+    set_cozytrack_session_id,
 )
 from podline.scanner import _parse_session_dir
 from podline.storage import MediaStorage, StorageError, sha256_of_file
@@ -73,6 +74,35 @@ def register_candidate_with_storage(
     fingerprint = build_fingerprint(candidate)
     existing = get_session_by_fingerprint(db_file, fingerprint)
     if existing is not None:
+        if cozytrack_session_id and existing.cozytrack_session_id is None:
+            # Same content was registered without a Cozytrack association
+            # (e.g. via pod import). Backfill it so ct-list stops offering
+            # the session and re-ingest short-circuits before downloading.
+            set_cozytrack_session_id(
+                db_file,
+                session_uid=existing.session_uid,
+                cozytrack_session_id=cozytrack_session_id,
+                status=existing.status,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            )
+            _log(
+                logger,
+                "Associated Cozytrack session %s with existing session %s",
+                cozytrack_session_id,
+                existing.session_uid,
+            )
+            refreshed = get_session_by_fingerprint(db_file, fingerprint)
+            return (refreshed or existing), False
+        if (
+            cozytrack_session_id
+            and existing.cozytrack_session_id is not None
+            and existing.cozytrack_session_id != cozytrack_session_id
+        ):
+            raise IngestError(
+                f"Session content already registered as {existing.session_uid} "
+                f"from Cozytrack session {existing.cozytrack_session_id}; "
+                f"refusing to also associate it with {cozytrack_session_id}"
+            )
         _log(
             logger,
             "Session content already registered as %s; skipping",

@@ -288,9 +288,70 @@ def test_resolve_auphonic_service_id_requires_configuration(
     with pytest.raises(AuphonicError, match="s3_service_id"):
         resolve_auphonic_service_id(config)
 
+
+def test_resolve_auphonic_service_id_works_while_ingest_is_paused(
+    app_config_factory, tmp_path
+) -> None:
     config = app_config_factory(tmp_path, storage_enabled=False)
-    with pytest.raises(AuphonicError, match="storage.enabled"):
-        resolve_auphonic_service_id(config)
+    assert resolve_auphonic_service_id(config)
+
+
+def _raw_track(role: str, filename: str):
+    from podline.models import MediaArtifactRecord
+
+    return MediaArtifactRecord(
+        session_uid="s1",
+        kind="raw_track",
+        role=role,
+        filename=filename,
+        content_type="audio/webm",
+        byte_size=1,
+        sha256="a" * 64,
+        duration_seconds=1.0,
+        s3_uri=f"s3://bucket/sessions/s1/raw_track/{'a' * 64}/{filename}",
+        source_provider=None,
+        source_id=None,
+        created_at="t",
+        updated_at="t",
+    )
+
+
+def test_pair_tracks_matches_preset_ids_by_name_when_possible() -> None:
+    from podline.auphonic import _pair_tracks_with_preset_ids
+
+    tracks = [_raw_track("host1", "Tr1.webm"), _raw_track("host2", "Tr2.webm")]
+    pairs = _pair_tracks_with_preset_ids(["Host2", "Host1"], tracks)
+
+    assert [(track_id, artifact.role) for track_id, artifact in pairs] == [
+        ("Host2", "host2"),
+        ("Host1", "host1"),
+    ]
+
+
+def test_pair_tracks_falls_back_to_natural_role_order() -> None:
+    from podline.auphonic import _pair_tracks_with_preset_ids
+
+    tracks = [
+        _raw_track("host1", "Tr1.webm"),
+        _raw_track("host10", "Tr10.webm"),
+        _raw_track("host2", "Tr2.webm"),
+    ]
+    pairs = _pair_tracks_with_preset_ids(["Pasha", "Sam", "Guest"], tracks)
+
+    # host10 must sort after host2, not between host1 and host2.
+    assert [(track_id, artifact.role) for track_id, artifact in pairs] == [
+        ("Pasha", "host1"),
+        ("Sam", "host2"),
+        ("Guest", "host10"),
+    ]
+
+
+def test_pair_tracks_rejects_count_mismatch() -> None:
+    from podline.auphonic import _pair_tracks_with_preset_ids
+
+    tracks = [_raw_track("host1", "Tr1.webm")]
+    with pytest.raises(AuphonicError, match="track count"):
+        _pair_tracks_with_preset_ids(["a", "b"], tracks)
 
 
 def test_prepare_attaches_s3_tracks_through_service(

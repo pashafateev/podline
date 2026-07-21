@@ -76,8 +76,9 @@ def redact_url(url: str) -> str:
 
 
 def validate_storage_config(config: StorageConfig) -> None:
-    if not config.enabled:
-        raise StorageError("Storage is disabled in config.yaml (set storage.enabled)")
+    # storage.enabled is deliberately NOT checked here: it is an ingest-only
+    # pause switch (enforced in podline.ingest). Sessions already registered
+    # in S3 must stay readable and processable while intake is paused.
     if not config.bucket.strip():
         raise StorageError("storage.bucket is missing in config.yaml")
 
@@ -244,13 +245,14 @@ class MediaStorage:
 
 def storage_health(config: StorageConfig) -> str:
     """One-line storage status for `pod health`."""
-    if not config.enabled:
-        return "disabled"
+    if not config.bucket.strip():
+        return "not configured"
     try:
         MediaStorage(config).check_access()
     except StorageError as exc:
         return f"error: {exc}"
-    return f"ok (bucket {config.bucket})"
+    suffix = "" if config.enabled else ", ingest paused"
+    return f"ok (bucket {config.bucket}{suffix})"
 
 
 def _client_error_code(exc: ClientError) -> str:

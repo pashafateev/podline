@@ -27,7 +27,7 @@ from podline.auphonic import (
     start_prepared_session_with_auphonic,
 )
 from podline.config import load_config
-from podline.storage import storage_health
+from podline.storage import redact_url, storage_health
 from podline.cozytrack.client import CozytrackError
 from podline.cozytrack.ingest import (
     CozytrackIngestError,
@@ -453,6 +453,7 @@ def workspace_clean(
     older_than_days: float = typer.Option(
         14,
         "--older-than-days",
+        min=0,
         help="Only remove workspaces untouched for at least this many days.",
     ),
     apply: bool = typer.Option(
@@ -1058,6 +1059,21 @@ def auphonic_prepare_command(
             ("next", f"pod auphonic-preview {session_uid}"),
         ]
     )
+    # Show which file landed on which named preset track so a wrong pairing
+    # is visible before anything starts.
+    details = inspect_production(loaded_config, updated.auphonic_production_id)
+    attached = details.get("multi_input_files") or []
+    if attached:
+        _print_section(
+            "Attached Tracks",
+            [
+                (
+                    str(track.get("id") or "?"),
+                    redact_url(str(track.get("input_file") or "none")),
+                )
+                for track in attached
+            ],
+        )
 
 
 @app.command("auphonic-preview")
