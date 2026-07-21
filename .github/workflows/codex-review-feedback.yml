@@ -11,4 +11,4 @@ jobs:
       actions: read
       issues: write
       pull-requests: write
-    uses: pashafateev/codex-workflows/.github/workflows/codex-review-feedback.yml@v1
+    uses: pashafateev/codex-workflows/.github/workflows/codex-review-feedback.yml@2e17d40cd2716d8bf41d1ccef292de74e6b63511 # v1.0.0
