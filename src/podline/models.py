@@ -50,6 +50,7 @@ class RuntimePaths:
     logs_dir: str
     staging_dir: str
     cache_dir: str
+    workspaces_dir: str
 
 
 @dataclass(frozen=True)

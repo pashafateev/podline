@@ -3,8 +3,15 @@ import re
 import shutil
 import subprocess
 
+from podline.artifacts import ArtifactError, materialize_artifact
 from podline.config import AppConfig
-from podline.models import EpisodeRecord, SessionRecord, SessionStatus
+from podline.models import (
+    ArtifactKind,
+    EpisodeRecord,
+    RuntimePaths,
+    SessionRecord,
+    SessionStatus,
+)
 from podline.repository import upsert_episode_metadata
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -17,6 +24,7 @@ class EpisodeMetaError(RuntimeError):
 def generate_episode_metadata_with_opencode(
     *,
     config: AppConfig,
+    runtime_paths: RuntimePaths,
     db_file: str,
     session: SessionRecord,
 ) -> EpisodeRecord:
@@ -27,12 +35,17 @@ def generate_episode_metadata_with_opencode(
         raise EpisodeMetaError(
             f"Session {session.session_uid} must be ready_for_draft before generating episode metadata"
         )
-    if not session.transcript_path:
-        raise EpisodeMetaError(f"Session {session.session_uid} has no transcript path")
 
-    transcript_path = Path(session.transcript_path)
-    if not transcript_path.exists():
-        raise EpisodeMetaError(f"Transcript file not found: {transcript_path}")
+    try:
+        transcript_path = materialize_artifact(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=db_file,
+            session_uid=session.session_uid,
+            kind=ArtifactKind.TRANSCRIPT.value,
+        )
+    except ArtifactError as exc:
+        raise EpisodeMetaError(str(exc)) from exc
 
     opencode_binary = _resolve_opencode_binary()
     project_dir = PROJECT_ROOT

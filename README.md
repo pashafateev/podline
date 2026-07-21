@@ -6,16 +6,15 @@ Environment note
 - This scaffold currently targets Python 3.9+ so it runs on the machine as-is.
 
 Current scope
-- The working manual-assisted path is implemented end to end through Podbean draft creation.
-- Core inspection commands are available: `pod init`, `pod health`, `pod list`, `pod status`.
-- Ingest commands are available: `pod scan`, `pod refresh`, `pod ct-list`, `pod ct-ingest`.
-- Auphonic commands are available: `pod auphonic-prepare`, `pod auphonic-preview`, `pod auphonic-offset`, `pod auphonic-start`, `pod auphonic-inspect`, `pod auphonic-sync`.
-- Post-edit commands are available: `pod finalize`, `pod episode-meta`, `pod podbean-draft`.
+- The working manual-assisted path is implemented end to end through Podbean draft creation, with a Podline-owned S3 bucket as the authoritative store for all new session media.
+- Core inspection commands: `pod init`, `pod health`, `pod list`, `pod status`, `pod cache-clear`.
+- Ingest commands: `pod ct-list`, `pod ct-ingest` (Cozytrack) and `pod import <folder>` (Riverside/local). `pod scan` and `pod refresh` are retired — they registered drive-path sessions the S3 pipeline cannot process.
+- Auphonic commands: `pod auphonic-prepare`, `pod auphonic-preview`, `pod auphonic-offset`, `pod auphonic-start`, `pod auphonic-inspect`, `pod auphonic-sync`. Productions read audio directly from S3 through the Auphonic external service — there are no local uploads.
+- Editing and post-edit commands: `pod workspace`, `pod finalize`, `pod transcript-refresh`, `pod episode-meta`, `pod podbean-draft`.
+- The external drive is no longer required for the pipeline; it remains readable history for pre-S3 sessions. File-touching commands on those old sessions fail with a clear "no artifacts registered" error.
 - `recorded_at` is best-effort metadata. The recorder date is not always reliable, so this value may reflect filesystem timing rather than a true recording timestamp.
-- Silent extra spoken tracks are ignored during scan, so sessions with empty `Tr3`/`Tr4` files can still classify correctly as 2-speaker sessions.
+- Silent extra spoken tracks are ignored during classification, so sessions with empty `Tr3`/`Tr4` files can still classify correctly as 2-speaker sessions.
 - Add `--debug` to CLI commands when you want verbose request-level logging in `logs/automation.log`.
-- `auphonic.request_timeout_seconds` controls how long large uploads can run before the client gives up.
-- If direct local uploads keep failing, the fallback plan is to upload WAVs to an external service first and point Auphonic `multi_input_files` at those remote files instead of streaming them from this machine.
 
 Project layout
 - `src/podline/`: application code
@@ -26,11 +25,11 @@ Project layout
 - `staging/`: temporary working area for future pipeline phases
 - `cache/`: checksum-keyed local copies of S3 artifacts (safe to clear with `pod cache-clear`)
 
-S3 media storage (foundation)
-- A private Podline S3 bucket is becoming the authoritative store for session media; `src/podline/storage.py` and `src/podline/artifacts.py` hold the storage layer (content-addressed keys `sessions/{session_uid}/{kind}/{sha256}/{filename}`, checksum-verified downloads, replace-in-place `media_artifacts` rows).
-- Configure it under `storage.*` in `config.local.yaml` (`enabled`, `bucket`, `region`, optional `key_prefix`). Credentials come from the standard AWS chain.
-- `pod health` reports storage access and cache usage; `pod cache-clear` empties the local cache (entries re-download on demand).
-- Pipeline integration (S3-native ingest, remote Auphonic inputs, workspaces) lands in the next change; until then ingest and processing keep using local paths.
+S3 media storage
+- A private Podline S3 bucket is the authoritative store for session media; `src/podline/storage.py` and `src/podline/artifacts.py` hold the storage layer (content-addressed keys `sessions/{session_uid}/{kind}/{sha256}/{filename}`, checksum-verified downloads, replace-in-place `media_artifacts` rows).
+- Configure it under `storage.*` in `config.local.yaml` (`enabled`, `bucket`, `region`, optional `key_prefix`, optional `profile` for a dedicated AWS credentials profile). Setting `enabled: false` pauses new ingests without affecting anything else.
+- Auphonic reads S3 audio through an Amazon S3 external service registered in the Auphonic account (read-only IAM user); set its UUID as `auphonic.s3_service_id`. `scripts/setup_iam_users.sh` provisions the IAM users.
+- `pod health` reports storage access and cache usage; `pod cache-clear` empties the local cache (entries re-download on demand). Workspaces under `~/podline/workspaces/` are never touched by cache clearing; retire them with `pod workspace-clean` once episodes are out (dry run by default, `--apply` deletes workspaces of `draft_created` sessions untouched for 14+ days, `--older-than-days` to tune).
 
 Getting started
 ```bash
@@ -61,39 +60,36 @@ Planned next steps
 - evaluate whether external-service inputs are worth formalizing into the workflow; see `docs/open-issues.md`
 
 Current workflow
-1. Scan and pick the session
+1. Ingest the session
+
+For Cozytrack (remote stems):
+```bash
+pod ct-list                    # show ready Cozytrack sessions, excludes already-ingested
+pod ct-ingest <cozytrack-id>   # download, classify, upload tracks to S3, register
+pod list
+```
 
 For Riverside (local files):
 ```bash
-cd ~/podline
-source .venv/bin/activate
-pod refresh
+pod import <folder>            # classify, upload tracks to S3, register
 pod list
 ```
 
-For Cozytrack (remote stems via S3):
-```bash
-pod ct-list                    # show ready Cozytrack sessions, excludes already-ingested
-pod ct-ingest <cozytrack-id>   # download stems to 02_recordings/cozytrack/<YYYY-MM-DD>_<slug>/
-pod list
-```
+Notes on ingest:
+- Tracks are hashed and uploaded to `s3://<bucket>/sessions/<uid>/raw_track/...`; packet-derived durations are stored for the offset step. Nothing is written to the external drive.
+- Cozytrack downloads land in a disposable staging folder that is removed after registration; re-running `pod ct-ingest <id>` is a no-op, and re-importing an identical folder is detected by content fingerprint.
+- WebM/Opus stems are passed through to Auphonic as-is via the S3 service reference.
 
-Notes on Cozytrack ingest:
-- Tracks land as `Tr1.webm`, `Tr2.webm`, … in the session folder, in `createdAt` order.
-- The session is registered in podline's DB tagged with `cozytrack_session_id` and is then handled by the existing pipeline (`pod auphonic-prepare` → `pod podbean-draft`).
-- Re-running `pod ct-ingest <id>` is a no-op once the session is already ingested — it just prints the existing folder path.
-- WebM/Opus stems are passed through to Auphonic as-is. Auphonic's docs list Opus/WebM as supported `multi_input_files`. If a real run rejects them in practice, the planned follow-up is an inline `ffmpeg` transcode step during ingest (see issue #19).
-
-2. Upload to Auphonic without starting yet
+2. Prepare the Auphonic production without starting it
 ```bash
-pod auphonic-prepare @1 --debug
-pod auphonic-offset @1          # dry run; computes duration delta from registered assets
-pod auphonic-offset @1 --apply  # apply the positive offset to the shorter Auphonic track
+pod auphonic-prepare @1 --debug   # creates the production and attaches S3 tracks
+pod auphonic-offset @1            # dry run; uses durations stored at ingest
+pod auphonic-offset @1 --apply    # apply the positive offset to the shorter track
 pod auphonic-preview @1
 pod auphonic-inspect --session @1
 ```
 
-For two-track Cozytrack sessions, run `pod auphonic-offset` before preview/start. Browser WebM files may not report format duration, so this command derives each track duration from audio packet timing and updates the prepared Auphonic production with a per-track `offset`; it does not start processing.
+For two-track Cozytrack sessions, run `pod auphonic-offset` before preview/start. Durations come from audio packet timing recorded at ingest; the command updates the prepared production with a per-track `offset` and does not start processing.
 
 3. Start Auphonic after previewing the edit page
 ```bash
@@ -101,14 +97,16 @@ pod auphonic-start @1 --debug
 pod status @1
 ```
 
-4. Edit in Cubase, export the final master, then attach it
+The pre-edit master and transcript are persisted to S3 and a workspace is created automatically at `~/podline/workspaces/<session_uid>/` with both files. `pod workspace @1` recreates or refreshes it at any time.
+
+4. Edit in Cubase from the workspace, export the final master, then attach it
 ```bash
 pod finalize @1 --master ep16
 ```
 
 Notes:
-- `--master ep16` resolves to `04_deliverables/masters/sexdrunks_ep16_master.*` in the expected masters directory.
-- You can also pass a full path or a filename.
+- `--master ep16` resolves against the session workspace first, then `04_deliverables/masters/` when the drive is mounted. Full paths and bare filenames also work.
+- Finalize uploads the edited master to S3 as the session's `final_master` artifact.
 
 5. Refresh the transcript from the edited final master
 ```bash
@@ -116,10 +114,9 @@ pod transcript-refresh @1
 ```
 
 Notes:
-- This creates a single-track Auphonic production from `final_master_path`, downloads the new WebVTT file, and overwrites `04_deliverables/transcripts/<session_uid>.vtt`.
+- This creates a single-track Auphonic production reading the final master from S3, downloads the new WebVTT file, and stores it as the session's current transcript artifact (the previous object stays in the bucket as history).
 - If polling or downloading is interrupted after Auphonic starts, re-running the command resumes the stored refresh production instead of creating a duplicate.
 - A successful refresh invalidates previously generated episode metadata, so run `pod episode-meta @1` again before creating the Podbean draft.
-- Run this before `pod episode-meta` and `pod podbean-draft` when the cut version differs from the original Auphonic transcript.
 
 6. Generate episode metadata using the local OpenCode command
 ```bash
@@ -134,6 +131,6 @@ pod status @1
 ```
 
 Cleanup status
-- There is currently no automatic cleanup after Podbean draft creation.
-- The app keeps the local DB state, logs, Auphonic staging files under `~/podline/staging/`, and deliverable copies in `04_deliverables/`.
-- Cleanup/retention policy is still a follow-up item rather than an implemented step.
+- Source media and generated artifacts are authoritative in S3; the local cache under `~/podline/cache/` is a replaceable copy (`pod cache-clear`).
+- Workspaces under `~/podline/workspaces/` persist through editing and release, then get retired with `pod workspace-clean --apply` after the retention window (default 14 days untouched, `draft_created` sessions only). Everything except a Cubase project saved in the workspace re-materializes from S3.
+- Auphonic staging files under `~/podline/staging/` are transient; a retention policy is still a follow-up item.

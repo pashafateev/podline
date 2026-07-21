@@ -5,8 +5,15 @@ from typing import Dict, List, Optional, Protocol
 
 import httpx
 
+from podline.artifacts import ArtifactError, materialize_artifact
 from podline.config import AppConfig
-from podline.models import EpisodeRecord, SessionRecord, SessionStatus
+from podline.models import (
+    ArtifactKind,
+    EpisodeRecord,
+    RuntimePaths,
+    SessionRecord,
+    SessionStatus,
+)
 from podline.repository import get_episode, update_session_status
 
 
@@ -150,6 +157,7 @@ class PodbeanClient:
 def create_podbean_draft(
     *,
     config: AppConfig,
+    runtime_paths: RuntimePaths,
     db_file: str,
     session: SessionRecord,
     client: Optional[PodbeanClientProtocol] = None,
@@ -159,12 +167,6 @@ def create_podbean_draft(
         raise PodbeanError(
             f"Session {session.session_uid} must be ready_for_draft before creating a Podbean draft"
         )
-    if not session.final_master_path:
-        raise PodbeanError(f"Session {session.session_uid} has no final master path")
-    if not Path(session.final_master_path).exists():
-        raise PodbeanError(f"Final master file not found: {session.final_master_path}")
-    if not session.transcript_path or not Path(session.transcript_path).exists():
-        raise PodbeanError(f"Transcript file not found: {session.transcript_path}")
 
     episode = get_episode(db_file, session.session_uid)
     if episode is None or not episode.title or not episode.description:
@@ -172,12 +174,27 @@ def create_podbean_draft(
             f"Session {session.session_uid} does not have saved episode metadata. Run pod episode-meta first."
         )
 
+    try:
+        final_master = materialize_artifact(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=db_file,
+            session_uid=session.session_uid,
+            kind=ArtifactKind.FINAL_MASTER.value,
+        )
+        transcript = materialize_artifact(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=db_file,
+            session_uid=session.session_uid,
+            kind=ArtifactKind.TRANSCRIPT.value,
+        )
+    except ArtifactError as exc:
+        raise PodbeanError(str(exc)) from exc
+
     client = client or PodbeanClient(config)
     access_token = client.get_access_token()
     next_episode_number = _next_episode_number(client.list_episodes(access_token))
-
-    final_master = Path(session.final_master_path)
-    transcript = Path(session.transcript_path)
     media_auth = client.authorize_upload(
         access_token, final_master, _content_type_for(final_master)
     )

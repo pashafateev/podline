@@ -4,16 +4,7 @@ from typing import List, Optional
 import httpx
 import pytest
 
-from podline.config import (
-    AppConfig,
-    AuphonicConfig,
-    CozytrackConfig,
-    NotificationsConfig,
-    PathsConfig,
-    PodbeanConfig,
-    PollingConfig,
-    StorageConfig,
-)
+from podline.artifacts import cache_path_for
 from podline.cozytrack.client import (
     CozytrackClient,
     CozytrackError,
@@ -26,48 +17,12 @@ from podline.cozytrack.ingest import (
     list_ready_sessions_for_ingest,
     slugify,
 )
-from podline.db import initialize_database
 from podline.repository import (
     get_session_by_cozytrack_id,
     list_cozytrack_session_ids,
+    list_media_artifacts,
 )
 from podline.scanner import scan_raw_sessions
-
-
-def _build_config(tmp_path: Path, *, api_key: str = "test-key") -> AppConfig:
-    return AppConfig(
-        runtime_home=tmp_path / "runtime",
-        paths=PathsConfig(
-            raw_root=tmp_path / "raw",
-            deliverables_root=tmp_path / "deliverables",
-        ),
-        polling=PollingConfig(interval_seconds=30),
-        notifications=NotificationsConfig(enabled=False),
-        auphonic=AuphonicConfig(
-            enabled=False,
-            api_key="",
-            base_url="",
-            request_timeout_seconds=600,
-            poll_interval_seconds=1,
-            max_poll_attempts=1,
-            preset_ids={},
-        ),
-        podbean=PodbeanConfig(
-            enabled=False,
-            client_id="",
-            client_secret="",
-            base_url="",
-            podcast_id="",
-        ),
-        cozytrack=CozytrackConfig(
-            base_url="https://cozytrack.test",
-            api_key=api_key,
-            download_subdir="cozytrack",
-            request_timeout_seconds=60,
-        ),
-        storage=_default_storage_config(),
-        config_file=tmp_path / "config.yaml",
-    )
 
 
 class FakeCozytrackClient:
@@ -103,7 +58,9 @@ class FakeCozytrackClient:
             destination.write_bytes(b"partial-bytes")
             raise CozytrackError(f"simulated download failure for {track_id}")
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(self.downloads.get(track_id, b"audio-data"))
+        destination.write_bytes(
+            self.downloads.get(track_id, f"audio-data-{track_id}".encode("utf-8"))
+        )
         self.downloaded_paths.append(destination)
 
 
@@ -132,8 +89,14 @@ def _make_session(
     )
 
 
-def test_client_list_ready_sessions_uses_api_key_header(tmp_path: Path) -> None:
-    config = _build_config(tmp_path)
+def _probe(path: Path) -> float:
+    return 60.0
+
+
+def test_client_list_ready_sessions_uses_api_key_header(
+    app_config_factory, tmp_path: Path
+) -> None:
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -177,8 +140,10 @@ def test_client_list_ready_sessions_uses_api_key_header(tmp_path: Path) -> None:
     assert sessions[0].tracks[0].participant_name == "Pasha"
 
 
-def test_client_get_track_download_url_returns_presigned_url(tmp_path: Path) -> None:
-    config = _build_config(tmp_path)
+def test_client_get_track_download_url_returns_presigned_url(
+    app_config_factory, tmp_path: Path
+) -> None:
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/ingest/tracks/track-1/download"
@@ -195,8 +160,10 @@ def test_client_get_track_download_url_returns_presigned_url(tmp_path: Path) -> 
     assert url == "https://s3.example/presigned"
 
 
-def test_client_raises_typed_error_with_response_body(tmp_path: Path) -> None:
-    config = _build_config(tmp_path)
+def test_client_raises_typed_error_with_response_body(
+    app_config_factory, tmp_path: Path
+) -> None:
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, text="unauthorized")
@@ -215,16 +182,17 @@ def test_client_raises_typed_error_with_response_body(tmp_path: Path) -> None:
     assert "unauthorized" in str(excinfo.value)
 
 
-def test_client_requires_api_key(tmp_path: Path) -> None:
-    config = _build_config(tmp_path, api_key="")
+def test_client_requires_api_key(app_config_factory, tmp_path: Path) -> None:
+    config = app_config_factory(tmp_path, cozytrack_api_key="")
     with pytest.raises(CozytrackError):
         CozytrackClient(config)
 
 
-def test_list_ready_sessions_filters_already_ingested(tmp_path: Path) -> None:
-    config = _build_config(tmp_path)
-    db_file = tmp_path / "state.db"
-    initialize_database(str(db_file))
+def test_list_ready_sessions_filters_already_ingested(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
 
     fake = FakeCozytrackClient(
         sessions=[
@@ -233,28 +201,30 @@ def test_list_ready_sessions_filters_already_ingested(tmp_path: Path) -> None:
         ]
     )
 
-    # Pre-ingest sess-old
     ingest_session(
         config=config,
-        db_file=str(db_file),
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
         cozytrack_session_id="sess-old",
         client=fake,
+        duration_probe=_probe,
     )
 
     visible = list_ready_sessions_for_ingest(
         config=config,
-        db_file=str(db_file),
+        db_file=runtime_paths.db_file,
         client=fake,
     )
 
     assert [session.id for session in visible] == ["sess-new"]
-    assert "sess-old" in list_cozytrack_session_ids(str(db_file))
+    assert "sess-old" in list_cozytrack_session_ids(runtime_paths.db_file)
 
 
-def test_ingest_session_happy_path(tmp_path: Path) -> None:
-    config = _build_config(tmp_path)
-    db_file = tmp_path / "state.db"
-    initialize_database(str(db_file))
+def test_ingest_session_uploads_artifacts_and_cleans_staging(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
 
     fake = FakeCozytrackClient(
         sessions=[_make_session(session_id="sess-1", name="Boba Boom")]
@@ -262,25 +232,41 @@ def test_ingest_session_happy_path(tmp_path: Path) -> None:
 
     record = ingest_session(
         config=config,
-        db_file=str(db_file),
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
         cozytrack_session_id="sess-1",
         client=fake,
+        duration_probe=_probe,
     )
 
     assert record.cozytrack_session_id == "sess-1"
-    folder = Path(record.source_path)
-    assert folder.exists()
-    assert folder.parent.name == "cozytrack"
-    assert folder.name == "2026-04-24_boba-boom"
-    assert (folder / "Tr1.webm").exists()
-    assert (folder / "Tr2.webm").exists()
+    assert record.source_basename == "2026-04-24_boba-boom"
     assert fake.requested_track_ids == ["track-a", "track-b"]
 
+    artifacts = list_media_artifacts(runtime_paths.db_file, record.session_uid)
+    assert [(a.kind, a.role, a.filename) for a in artifacts] == [
+        ("raw_track", "host1", "Tr1.webm"),
+        ("raw_track", "host2", "Tr2.webm"),
+    ]
+    assert [a.source_id for a in artifacts] == ["track-a", "track-b"]
+    assert all(a.source_provider == "cozytrack" for a in artifacts)
+    assert all(a.duration_seconds == 60.0 for a in artifacts)
 
-def test_ingest_session_is_idempotent(tmp_path: Path) -> None:
-    config = _build_config(tmp_path)
-    db_file = tmp_path / "state.db"
-    initialize_database(str(db_file))
+    # Staging folder is disposable and removed after registration; the cache
+    # keeps the content.
+    staging = Path(runtime_paths.staging_dir) / "ct-ingest" / "2026-04-24_boba-boom"
+    assert not staging.exists()
+    for artifact in artifacts:
+        assert cache_path_for(
+            runtime_paths, artifact.sha256, artifact.filename
+        ).exists()
+
+
+def test_ingest_session_is_idempotent(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
 
     fake = FakeCozytrackClient(
         sessions=[_make_session(session_id="sess-1", name="Repeat")]
@@ -288,29 +274,33 @@ def test_ingest_session_is_idempotent(tmp_path: Path) -> None:
 
     first = ingest_session(
         config=config,
-        db_file=str(db_file),
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
         cozytrack_session_id="sess-1",
         client=fake,
+        duration_probe=_probe,
     )
     track_calls_after_first = list(fake.requested_track_ids)
 
     second = ingest_session(
         config=config,
-        db_file=str(db_file),
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
         cozytrack_session_id="sess-1",
         client=fake,
+        duration_probe=_probe,
     )
 
     assert first.session_uid == second.session_uid
-    assert second.source_path == first.source_path
     # No new download requests on the second call
     assert fake.requested_track_ids == track_calls_after_first
 
 
-def test_ingest_session_cleans_up_partial_downloads_on_failure(tmp_path: Path) -> None:
-    config = _build_config(tmp_path)
-    db_file = tmp_path / "state.db"
-    initialize_database(str(db_file))
+def test_ingest_session_cleans_up_staging_on_failure(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
 
     fake = FakeCozytrackClient(
         sessions=[
@@ -326,24 +316,23 @@ def test_ingest_session_cleans_up_partial_downloads_on_failure(tmp_path: Path) -
     with pytest.raises(CozytrackIngestError):
         ingest_session(
             config=config,
-            db_file=str(db_file),
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
             cozytrack_session_id="sess-fail",
             client=fake,
+            duration_probe=_probe,
         )
 
-    folder = config.paths.raw_root / "cozytrack" / "2026-04-24_boom"
-    assert folder.exists()
-    # Both written files (the successful download AND the partial broken file)
-    # must have been removed so the next attempt starts clean.
-    assert list(folder.iterdir()) == []
-    # The DB row must NOT have been created since ingest failed.
-    assert get_session_by_cozytrack_id(str(db_file), "sess-fail") is None
+    staging = Path(runtime_paths.staging_dir) / "ct-ingest" / "2026-04-24_boom"
+    assert not staging.exists()
+    assert get_session_by_cozytrack_id(runtime_paths.db_file, "sess-fail") is None
 
 
-def test_ingest_session_uses_name_override_for_slug(tmp_path: Path) -> None:
-    config = _build_config(tmp_path)
-    db_file = tmp_path / "state.db"
-    initialize_database(str(db_file))
+def test_ingest_session_uses_name_override_for_slug(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
 
     fake = FakeCozytrackClient(
         sessions=[_make_session(session_id="sess-1", name="Original Name")]
@@ -351,14 +340,15 @@ def test_ingest_session_uses_name_override_for_slug(tmp_path: Path) -> None:
 
     record = ingest_session(
         config=config,
-        db_file=str(db_file),
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
         cozytrack_session_id="sess-1",
         name_override="Custom Title!",
         client=fake,
+        duration_probe=_probe,
     )
 
-    folder = Path(record.source_path)
-    assert folder.name == "2026-04-24_custom-title"
+    assert record.source_basename == "2026-04-24_custom-title"
 
 
 def test_classifier_handles_two_track_webm_session(tmp_path: Path) -> None:
@@ -383,10 +373,70 @@ def test_slugify_handles_unicode_and_punctuation() -> None:
     assert slugify("ep07: Boba & Beats") == "ep07-boba-beats"
 
 
-def _default_storage_config() -> StorageConfig:
-    return StorageConfig(
-        enabled=False,
-        bucket="",
-        region="",
-        key_prefix="",
+def test_deduplicated_ingest_backfills_cozytrack_identity(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    """Same audio imported locally first, then ingested from Cozytrack.
+
+    Dedup must not create a second session, and the surviving session must
+    take over the Cozytrack identity so ct-list stops advertising it and
+    later ingests stop re-downloading the tracks.
+    """
+    from podline.ingest import import_local_folder
+    from podline.repository import get_session_by_cozytrack_id, list_sessions
+
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+
+    tr1_bytes = b"webm-track-1-data" * 32
+    tr2_bytes = b"webm-track-2-data" * 32
+    import_dir = tmp_path / "riverside" / "2026-04-24_demo"
+    import_dir.mkdir(parents=True)
+    (import_dir / "Tr1.webm").write_bytes(tr1_bytes)
+    (import_dir / "Tr2.webm").write_bytes(tr2_bytes)
+    imported, created = import_local_folder(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        folder=import_dir,
+        duration_probe=_probe,
     )
+    assert created is True
+    assert imported.cozytrack_session_id is None
+
+    fake = FakeCozytrackClient(
+        sessions=[_make_session(session_id="sess-dup")],
+        downloads={"track-a": tr1_bytes, "track-b": tr2_bytes},
+    )
+    record = ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-dup",
+        client=fake,
+        duration_probe=_probe,
+    )
+
+    assert record.session_uid == imported.session_uid
+    assert len(list_sessions(runtime_paths.db_file)) == 1
+    assert record.cozytrack_session_id == "sess-dup"
+    linked = get_session_by_cozytrack_id(runtime_paths.db_file, "sess-dup")
+    assert linked is not None
+    assert linked.session_uid == imported.session_uid
+
+    ready = list_ready_sessions_for_ingest(
+        config=config, db_file=runtime_paths.db_file, client=fake
+    )
+    assert [session.id for session in ready] == []
+
+    downloads_before_rerun = len(fake.downloaded_paths)
+    rerun = ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-dup",
+        client=fake,
+        duration_probe=_probe,
+    )
+    assert rerun.session_uid == imported.session_uid
+    assert len(fake.downloaded_paths) == downloads_before_rerun

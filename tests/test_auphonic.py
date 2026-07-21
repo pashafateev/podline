@@ -1,10 +1,10 @@
 from pathlib import Path
 import json
-from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from podline.artifacts import workspace_path_for
 from podline.auphonic import (
     AuphonicClient,
     AuphonicError,
@@ -22,28 +22,14 @@ from podline.auphonic import (
     process_session_with_auphonic,
     reconcile_production_to_session,
     refresh_transcript_with_auphonic,
+    resolve_auphonic_service_id,
     resolve_preset_id,
     start_prepared_session_with_auphonic,
 )
-from podline.config import (
-    AppConfig,
-    AuphonicConfig,
-    CozytrackConfig,
-    NotificationsConfig,
-    PathsConfig,
-    PodbeanConfig,
-    PollingConfig,
-    StorageConfig,
-)
-from podline.db import connect, initialize_database
-from podline.ingest import scan_and_ingest
-from podline.models import AssetRecord
-from podline.paths import build_runtime_paths, ensure_runtime_dirs
 from podline.repository import (
     get_episode,
+    get_media_artifact,
     get_session,
-    list_sessions,
-    update_session_status,
     upsert_episode_metadata,
 )
 
@@ -51,23 +37,39 @@ from podline.repository import (
 class FakeAuphonicClient:
     def __init__(self) -> None:
         self.created = []
-        self.uploaded = []
+        self.attached = []
+        self.single_created = []
         self.started = []
         self.downloads = []
+        self.tracks = []
+        self._status = 10
+        self._status_string = "Production Not Started Yet"
 
     def create_production(
-        self, *, session, assets, preset_id: str
+        self, *, title: str, track_count: int, preset_id: str
     ) -> AuphonicPreparedProduction:
-        self.created.append((session.session_uid, len(assets), preset_id))
+        self.created.append((title, track_count, preset_id))
         return AuphonicPreparedProduction(
             production_id="prod-123",
-            upload_track_ids=["Jonathan", "Pasha"][: len(assets)],
+            upload_track_ids=["Jonathan", "Pasha"][:track_count],
             status_page="https://example.test/status/prod-123",
             edit_page="https://example.test/edit/prod-123",
         )
 
-    def upload_assets(self, production_id: str, assets, upload_track_ids) -> None:
-        self.uploaded.append((production_id, len(assets), list(upload_track_ids)))
+    def attach_service_input(
+        self, production_id: str, track_id: str, service_id: str, input_key: str
+    ):
+        self.attached.append((production_id, track_id, service_id, input_key))
+        self.tracks.append(
+            {"id": track_id, "type": "multitrack", "input_file": input_key}
+        )
+        return {"status_code": 200}
+
+    def create_single_input_production(
+        self, *, title: str, preset_id: str, service_id: str, input_key: str
+    ) -> str:
+        self.single_created.append((title, preset_id, service_id, input_key))
+        return "prod-refresh"
 
     def start_production(self, production_id: str) -> None:
         self.started.append(production_id)
@@ -105,8 +107,8 @@ class FakeAuphonicClient:
             "error_message": "",
             "data": {
                 "uuid": production_id,
-                "status": 10,
-                "status_string": "Production Not Started Yet",
+                "status": self._status,
+                "status_string": self._status_string,
                 "start_allowed": True,
                 "change_allowed": True,
                 "edit_page": f"https://example.test/edit/{production_id}",
@@ -124,10 +126,7 @@ class FakeAuphonicClient:
                         "ending": "vtt",
                     },
                 ],
-                "multi_input_files": [
-                    {"id": "Jonathan", "type": "multitrack", "input_file": "Tr1.WAV"},
-                    {"id": "Pasha", "type": "multitrack", "input_file": "Tr2.WAV"},
-                ],
+                "multi_input_files": [dict(track) for track in self.tracks],
             },
         }
 
@@ -151,8 +150,8 @@ class FakeOffsetAuphonicClient:
         self.change_allowed = change_allowed
         self.start_allowed = start_allowed
         self.tracks = tracks or [
-            {"id": "Jonathan", "type": "multitrack", "input_file": "Tr1.webm"},
-            {"id": "Pasha", "type": "multitrack", "input_file": "Tr2.webm"},
+            {"id": "Jonathan", "type": "multitrack", "input_file": "sessions/s/raw_track/aaa/Tr1.webm"},
+            {"id": "Pasha", "type": "multitrack", "input_file": "sessions/s/raw_track/bbb/Tr2.webm"},
         ]
         self.offset_updates = []
 
@@ -185,17 +184,6 @@ class FakeOffsetAuphonicClient:
 
 
 class FakeTranscriptRefreshClient(FakeAuphonicClient):
-    def create_production(
-        self, *, session, assets, preset_id: str
-    ) -> AuphonicPreparedProduction:
-        self.created.append((session.session_uid, assets, preset_id))
-        return AuphonicPreparedProduction(
-            production_id="prod-refresh",
-            upload_track_ids=["input_file"],
-            status_page="https://example.test/status/prod-refresh",
-            edit_page="https://example.test/edit/prod-refresh",
-        )
-
     def wait_for_production(self, production_id: str) -> AuphonicProduction:
         assert production_id == "prod-refresh"
         return AuphonicProduction(
@@ -250,67 +238,312 @@ class FakeResumableTranscriptRefreshClient(FakeTranscriptRefreshClient):
         }
 
 
-def test_resolve_preset_id_validates_config() -> None:
-    config = _build_config(Path("/tmp/runtime"), enabled=False)
-
-    try:
-        resolve_preset_id(config, 2)
-    except AuphonicError as exc:
-        assert "disabled" in str(exc)
-    else:
-        raise AssertionError("Expected AuphonicError when config is disabled")
-
-
-def test_single_track_production_uses_input_file_upload_field(
-    tmp_path: Path, monkeypatch
-) -> None:
-    config = _build_config(tmp_path)
-    client = AuphonicClient(config)
-    final_master = tmp_path / "final-master.mp3"
-    final_master.write_bytes(b"final-master")
-    asset = AssetRecord(
-        role="final_master",
-        filename=final_master.name,
-        file_size=final_master.stat().st_size,
-        local_path=str(final_master),
-    )
-    session = SimpleNamespace(
-        session_uid="session-refresh-upload",
-        source_basename="episode-refresh-upload",
-    )
-
-    monkeypatch.setattr(
-        client,
-        "_request_with_retries",
-        lambda *args, **kwargs: httpx.Response(
-            200,
-            json={"data": {"uuid": "prod-refresh"}},
+def _queued_session_with_tracks(
+    tmp_path, runtime_paths, session_factory, artifact_registrar, *, status="queued"
+):
+    session = session_factory(
+        runtime_paths.db_file,
+        session_uid="session-auphonic-1",
+        status=status,
+        auphonic_production_id=(
+            "prod-123" if status not in {"queued"} else None
         ),
     )
+    tr1 = tmp_path / "Tr1.webm"
+    tr1.write_bytes(b"track-one-bytes")
+    tr2 = tmp_path / "Tr2.webm"
+    tr2.write_bytes(b"track-two-bytes!")
+    artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid=session.session_uid,
+        kind="raw_track",
+        role="host1",
+        path=tr1,
+        duration_seconds=101.234,
+    )
+    artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid=session.session_uid,
+        kind="raw_track",
+        role="host2",
+        path=tr2,
+        duration_seconds=99.433,
+    )
+    return session
 
-    prepared = client.create_production(
-        session=session,
-        assets=[asset],
-        preset_id="transcript-preset",
+
+def test_resolve_preset_id_validates_config(app_config_factory, tmp_path) -> None:
+    config = app_config_factory(tmp_path, auphonic_enabled=False)
+
+    with pytest.raises(AuphonicError, match="disabled"):
+        resolve_preset_id(config, 2)
+
+
+def test_resolve_auphonic_service_id_requires_configuration(
+    app_config_factory, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path, s3_service_id="")
+    with pytest.raises(AuphonicError, match="s3_service_id"):
+        resolve_auphonic_service_id(config)
+
+
+def test_resolve_auphonic_service_id_works_while_ingest_is_paused(
+    app_config_factory, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path, storage_enabled=False)
+    assert resolve_auphonic_service_id(config)
+
+
+def _raw_track(role: str, filename: str):
+    from podline.models import MediaArtifactRecord
+
+    return MediaArtifactRecord(
+        session_uid="s1",
+        kind="raw_track",
+        role=role,
+        filename=filename,
+        content_type="audio/webm",
+        byte_size=1,
+        sha256="a" * 64,
+        duration_seconds=1.0,
+        s3_uri=f"s3://bucket/sessions/s1/raw_track/{'a' * 64}/{filename}",
+        source_provider=None,
+        source_id=None,
+        created_at="t",
+        updated_at="t",
     )
 
-    assert prepared.upload_track_ids == ["input_file"]
+
+def test_pair_tracks_matches_preset_ids_by_name_when_possible() -> None:
+    from podline.auphonic import _pair_tracks_with_preset_ids
+
+    tracks = [_raw_track("host1", "Tr1.webm"), _raw_track("host2", "Tr2.webm")]
+    pairs = _pair_tracks_with_preset_ids(["Host2", "Host1"], tracks)
+
+    assert [(track_id, artifact.role) for track_id, artifact in pairs] == [
+        ("Host2", "host2"),
+        ("Host1", "host1"),
+    ]
 
 
-def test_process_session_with_auphonic_downloads_outputs(
-    fixture_raw_root, tmp_path: Path
+def test_pair_tracks_falls_back_to_natural_role_order() -> None:
+    from podline.auphonic import _pair_tracks_with_preset_ids
+
+    tracks = [
+        _raw_track("host1", "Tr1.webm"),
+        _raw_track("host10", "Tr10.webm"),
+        _raw_track("host2", "Tr2.webm"),
+    ]
+    pairs = _pair_tracks_with_preset_ids(["Pasha", "Sam", "Guest"], tracks)
+
+    # host10 must sort after host2, not between host1 and host2.
+    assert [(track_id, artifact.role) for track_id, artifact in pairs] == [
+        ("Pasha", "host1"),
+        ("Sam", "host2"),
+        ("Guest", "host10"),
+    ]
+
+
+def test_pair_tracks_rejects_count_mismatch() -> None:
+    from podline.auphonic import _pair_tracks_with_preset_ids
+
+    tracks = [_raw_track("host1", "Tr1.webm")]
+    with pytest.raises(AuphonicError, match="track count"):
+        _pair_tracks_with_preset_ids(["a", "b"], tracks)
+
+
+def test_prepare_attaches_s3_tracks_through_service(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
 ) -> None:
-    config = _build_config(tmp_path)
-    runtime_paths = build_runtime_paths(config)
-    ensure_runtime_dirs(runtime_paths)
-    initialize_database(runtime_paths.db_file)
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _queued_session_with_tracks(
+        tmp_path, runtime_paths, session_factory, artifact_registrar
+    )
+    client = FakeAuphonicClient()
 
-    outcome = scan_and_ingest(fixture_raw_root, runtime_paths.db_file)
-    assert outcome.created == 2
-    session = next(
-        item
-        for item in list_sessions(runtime_paths.db_file)
-        if item.source_basename == "010124_013143"
+    prepared = prepare_session_with_auphonic(
+        config=config,
+        db_file=runtime_paths.db_file,
+        session=session,
+        client=client,
+    )
+
+    assert prepared.status == "auphonic_prepared"
+    assert prepared.auphonic_production_id == "prod-123"
+    assert client.created == [("010124_013143", 2, "preset-2")]
+    assert [
+        (track_id, service_id) for _pid, track_id, service_id, _key in client.attached
+    ] == [("Jonathan", "svc-podline"), ("Pasha", "svc-podline")]
+    attached_keys = [key for _pid, _tid, _svc, key in client.attached]
+    assert attached_keys[0].endswith("/Tr1.webm")
+    assert attached_keys[1].endswith("/Tr2.webm")
+    assert all(key.startswith("sessions/") for key in attached_keys)
+    assert client.started == []
+    assert client.downloads == []
+
+
+def test_prepare_fails_when_artifact_lives_in_wrong_bucket(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = session_factory(runtime_paths.db_file, status="queued")
+    tr1 = tmp_path / "Tr1.webm"
+    tr1.write_bytes(b"track-one")
+    tr2 = tmp_path / "Tr2.webm"
+    tr2.write_bytes(b"track-two")
+    artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid=session.session_uid,
+        kind="raw_track",
+        role="host1",
+        path=tr1,
+        duration_seconds=10.0,
+        bucket="some-other-bucket",
+    )
+    artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid=session.session_uid,
+        kind="raw_track",
+        role="host2",
+        path=tr2,
+        duration_seconds=11.0,
+        bucket="some-other-bucket",
+    )
+
+    with pytest.raises(AuphonicError, match="backed by bucket"):
+        prepare_session_with_auphonic(
+            config=config,
+            db_file=runtime_paths.db_file,
+            session=session,
+            client=FakeAuphonicClient(),
+        )
+
+
+def test_prepare_preview_then_start_splits_the_auphonic_flow(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _queued_session_with_tracks(
+        tmp_path, runtime_paths, session_factory, artifact_registrar
+    )
+    client = FakeAuphonicClient()
+
+    prepared = prepare_session_with_auphonic(
+        config=config,
+        db_file=runtime_paths.db_file,
+        session=session,
+        client=client,
+    )
+    assert prepared.status == "auphonic_prepared"
+    assert client.started == []
+
+    preview = preview_prepared_session_with_auphonic(
+        config=config,
+        db_file=runtime_paths.db_file,
+        session=prepared,
+        client=client,
+    )
+    assert preview.session.status == "auphonic_previewed"
+    assert preview.details["edit_page"] == "https://example.test/edit/prod-123"
+    assert client.started == []
+
+    started = start_prepared_session_with_auphonic(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=preview.session,
+        client=client,
+    )
+
+    assert started.status == "waiting_for_finalize"
+    assert client.started == ["prod-123"]
+    assert len(client.downloads) == 2
+
+    master = get_media_artifact(
+        runtime_paths.db_file, session.session_uid, kind="pre_edit_master"
+    )
+    transcript = get_media_artifact(
+        runtime_paths.db_file, session.session_uid, kind="transcript"
+    )
+    assert master is not None and master.source_id == "prod-123"
+    assert transcript is not None and transcript.source_provider == "auphonic"
+
+    workspace = workspace_path_for(runtime_paths, session.session_uid)
+    assert (workspace / master.filename).exists()
+    assert (workspace / transcript.filename).exists()
+    assert (workspace / "manifest.json").exists()
+
+
+def test_split_start_requires_preview_first(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _queued_session_with_tracks(
+        tmp_path, runtime_paths, session_factory, artifact_registrar
+    )
+    client = FakeAuphonicClient()
+    prepared = prepare_session_with_auphonic(
+        config=config,
+        db_file=runtime_paths.db_file,
+        session=session,
+        client=client,
+    )
+
+    with pytest.raises(AuphonicError, match="auphonic_previewed"):
+        start_prepared_session_with_auphonic(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=prepared,
+            client=client,
+        )
+
+    assert client.started == []
+    reloaded = get_session(runtime_paths.db_file, session.session_uid)
+    assert reloaded is not None
+    assert reloaded.status == "auphonic_prepared"
+
+
+def test_process_session_with_auphonic_runs_end_to_end(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _queued_session_with_tracks(
+        tmp_path, runtime_paths, session_factory, artifact_registrar
     )
     client = FakeDoneAuphonicClient()
 
@@ -324,201 +557,19 @@ def test_process_session_with_auphonic_downloads_outputs(
 
     assert updated.status == "waiting_for_finalize"
     assert updated.auphonic_production_id == "prod-123"
-    assert updated.pre_edit_master_path is not None
-    assert updated.transcript_path is not None
-    assert Path(updated.pre_edit_master_path).exists()
-    assert Path(updated.transcript_path).exists()
-    assert client.created[0][1] == 2
-    assert client.created[0][2] == "preset-2"
-    assert client.uploaded[0][1] == 2
-    assert client.uploaded[0][2] == ["Jonathan", "Pasha"]
     assert client.started == ["prod-123"]
-
-    reloaded = get_session(runtime_paths.db_file, session.session_uid)
-    assert reloaded is not None
-    assert reloaded.status == "waiting_for_finalize"
+    workspace = workspace_path_for(runtime_paths, session.session_uid)
+    assert workspace.exists()
 
 
-def test_prepare_preview_then_start_splits_the_auphonic_flow(
-    fixture_raw_root, tmp_path: Path
+def test_inspect_production_returns_verification_details(
+    app_config_factory, tmp_path
 ) -> None:
-    config = _build_config(tmp_path)
-    runtime_paths = build_runtime_paths(config)
-    ensure_runtime_dirs(runtime_paths)
-    initialize_database(runtime_paths.db_file)
-
-    scan_and_ingest(fixture_raw_root, runtime_paths.db_file)
-    session = next(
-        item
-        for item in list_sessions(runtime_paths.db_file)
-        if item.source_basename == "010124_013143"
-    )
-    client = FakeAuphonicClient()
-
-    prepared = prepare_session_with_auphonic(
-        config=config,
-        db_file=runtime_paths.db_file,
-        session=session,
-        client=client,
-    )
-
-    assert prepared.status == "auphonic_prepared"
-    assert prepared.auphonic_production_id == "prod-123"
-    assert prepared.pre_edit_master_path is None
-    assert prepared.transcript_path is None
-    assert client.started == []
-    assert client.downloads == []
-    assert client.uploaded[0][2] == ["Jonathan", "Pasha"]
-
-    preview = preview_prepared_session_with_auphonic(
-        config=config,
-        db_file=runtime_paths.db_file,
-        session=prepared,
-        client=client,
-    )
-
-    assert preview.session.status == "auphonic_previewed"
-    assert preview.details["edit_page"] == "https://example.test/edit/prod-123"
-    assert client.started == []
-
-    started = start_prepared_session_with_auphonic(
-        config=config,
-        runtime_paths=runtime_paths,
-        db_file=runtime_paths.db_file,
-        session=preview.session,
-        client=client,
-    )
-
-    assert started.status == "waiting_for_finalize"
-    assert client.started == ["prod-123"]
-    assert len(client.downloads) == 2
-
-
-def test_split_start_requires_preview_first(
-    fixture_raw_root, tmp_path: Path
-) -> None:
-    config = _build_config(tmp_path)
-    runtime_paths = build_runtime_paths(config)
-    ensure_runtime_dirs(runtime_paths)
-    initialize_database(runtime_paths.db_file)
-
-    scan_and_ingest(fixture_raw_root, runtime_paths.db_file)
-    session = next(
-        item
-        for item in list_sessions(runtime_paths.db_file)
-        if item.source_basename == "010124_013143"
-    )
-    client = FakeAuphonicClient()
-    prepared = prepare_session_with_auphonic(
-        config=config,
-        db_file=runtime_paths.db_file,
-        session=session,
-        client=client,
-    )
-
-    try:
-        start_prepared_session_with_auphonic(
-            config=config,
-            runtime_paths=runtime_paths,
-            db_file=runtime_paths.db_file,
-            session=prepared,
-            client=client,
-        )
-    except AuphonicError as exc:
-        assert "auphonic_previewed" in str(exc)
-    else:
-        raise AssertionError("Expected AuphonicError before preview")
-
-    assert client.started == []
-    reloaded = get_session(runtime_paths.db_file, session.session_uid)
-    assert reloaded is not None
-    assert reloaded.status == "auphonic_prepared"
-
-
-def test_preview_prepared_session_marks_session_previewed(
-    fixture_raw_root, tmp_path: Path
-) -> None:
-    config = _build_config(tmp_path)
-    runtime_paths = build_runtime_paths(config)
-    ensure_runtime_dirs(runtime_paths)
-    initialize_database(runtime_paths.db_file)
-
-    scan_and_ingest(fixture_raw_root, runtime_paths.db_file)
-    session = next(
-        item
-        for item in list_sessions(runtime_paths.db_file)
-        if item.source_basename == "010124_013143"
-    )
-    client = FakeAuphonicClient()
-    prepared = prepare_session_with_auphonic(
-        config=config,
-        db_file=runtime_paths.db_file,
-        session=session,
-        client=client,
-    )
-
-    preview = preview_prepared_session_with_auphonic(
-        config=config,
-        db_file=runtime_paths.db_file,
-        session=prepared,
-        client=client,
-    )
-
-    assert preview.session.status == "auphonic_previewed"
-    assert preview.session.auphonic_production_id == "prod-123"
-    assert preview.details["edit_page"] == "https://example.test/edit/prod-123"
-    assert client.started == []
-    assert client.downloads == []
-
-    reloaded = get_session(runtime_paths.db_file, session.session_uid)
-    assert reloaded is not None
-    assert reloaded.status == "auphonic_previewed"
-
-
-def test_start_accepts_previewed_auphonic_session(
-    fixture_raw_root, tmp_path: Path
-) -> None:
-    config = _build_config(tmp_path)
-    runtime_paths = build_runtime_paths(config)
-    ensure_runtime_dirs(runtime_paths)
-    initialize_database(runtime_paths.db_file)
-
-    scan_and_ingest(fixture_raw_root, runtime_paths.db_file)
-    session = next(
-        item
-        for item in list_sessions(runtime_paths.db_file)
-        if item.source_basename == "010124_013143"
-    )
-    client = FakeAuphonicClient()
-    prepared = prepare_session_with_auphonic(
-        config=config,
-        db_file=runtime_paths.db_file,
-        session=session,
-        client=client,
-    )
-    preview = preview_prepared_session_with_auphonic(
-        config=config,
-        db_file=runtime_paths.db_file,
-        session=prepared,
-        client=client,
-    )
-
-    started = start_prepared_session_with_auphonic(
-        config=config,
-        runtime_paths=runtime_paths,
-        db_file=runtime_paths.db_file,
-        session=preview.session,
-        client=client,
-    )
-
-    assert started.status == "waiting_for_finalize"
-    assert client.started == ["prod-123"]
-    assert len(client.downloads) == 2
-
-
-def test_inspect_production_returns_verification_details(tmp_path: Path) -> None:
-    config = _build_config(tmp_path)
+    config = app_config_factory(tmp_path)
     client = FakeDoneAuphonicClient()
+    client.tracks = [
+        {"id": "Jonathan", "type": "multitrack", "input_file": "sessions/x/Tr1.webm"}
+    ]
 
     details = inspect_production(config, "prod-123", client=client)
 
@@ -541,8 +592,10 @@ def test_duration_from_ffprobe_packet_json_uses_last_packet() -> None:
     assert duration == pytest.approx(12.323)
 
 
-def test_auphonic_client_updates_multi_input_file_offset(tmp_path: Path) -> None:
-    config = _build_config(tmp_path)
+def test_auphonic_client_updates_multi_input_file_offset(
+    app_config_factory, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path)
     seen = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -568,36 +621,187 @@ def test_auphonic_client_updates_multi_input_file_offset(tmp_path: Path) -> None
     assert seen["body"] == {"type": "multitrack", "offset": 1.801}
 
 
-def test_session_offset_plan_targets_shorter_asset(tmp_path: Path) -> None:
-    config, runtime_paths, session = _build_offset_session(tmp_path)
+def test_auphonic_client_attaches_service_inputs(
+    app_config_factory, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path)
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(200, json={"status_code": 200, "data": {}})
+
+    client = AuphonicClient(config)
+    client._client = httpx.Client(
+        base_url=config.auphonic.base_url.rstrip("/"),
+        headers={"Authorization": f"Bearer {config.auphonic.api_key}"},
+        transport=httpx.MockTransport(handler),
+    )
+
+    client.attach_service_input(
+        "prod-123", "Jonathan", "svc-podline", "sessions/s/raw_track/aaa/Tr1.webm"
+    )
+
+    assert seen["url"].endswith("/production/prod-123/multi_input_files/Jonathan.json")
+    assert seen["body"] == {
+        "type": "multitrack",
+        "service": "svc-podline",
+        "input_file": "sessions/s/raw_track/aaa/Tr1.webm",
+    }
+
+
+def test_auphonic_client_creates_single_input_production(
+    app_config_factory, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path)
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(200, json={"data": {"uuid": "prod-refresh"}})
+
+    client = AuphonicClient(config)
+    client._client = httpx.Client(
+        base_url=config.auphonic.base_url.rstrip("/"),
+        headers={"Authorization": f"Bearer {config.auphonic.api_key}"},
+        transport=httpx.MockTransport(handler),
+    )
+
+    production_id = client.create_single_input_production(
+        title="refresh",
+        preset_id="transcript-preset",
+        service_id="svc-podline",
+        input_key="sessions/s/final_master/ccc/final.mp3",
+    )
+
+    assert production_id == "prod-refresh"
+    assert seen["url"].endswith("/productions.json")
+    assert seen["body"] == {
+        "preset": "transcript-preset",
+        "metadata": {"title": "refresh"},
+        "service": "svc-podline",
+        "input_file": "sessions/s/final_master/ccc/final.mp3",
+    }
+
+
+def _offset_session(
+    tmp_path, runtime_paths, session_factory, artifact_registrar, *, durations=True
+):
+    session = session_factory(
+        runtime_paths.db_file,
+        session_uid="session-offset-1",
+        status="auphonic_prepared",
+        auphonic_production_id="prod-123",
+    )
+    tr1 = tmp_path / "Tr1.webm"
+    tr1.write_bytes(b"track-one")
+    tr2 = tmp_path / "Tr2.webm"
+    tr2.write_bytes(b"track-two")
+    artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid=session.session_uid,
+        kind="raw_track",
+        role="host1",
+        path=tr1,
+        duration_seconds=101.234 if durations else None,
+    )
+    artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid=session.session_uid,
+        kind="raw_track",
+        role="host2",
+        path=tr2,
+        duration_seconds=99.433 if durations else None,
+    )
+    return session
+
+
+def test_session_offset_plan_uses_stored_durations(
+    app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _offset_session(
+        tmp_path, runtime_paths, session_factory, artifact_registrar
+    )
     client = FakeOffsetAuphonicClient()
+
+    def exploding_probe(path: Path) -> float:
+        raise AssertionError("stored durations must be used without probing")
 
     plan = plan_session_auphonic_offset(
         config=config,
+        runtime_paths=runtime_paths,
         db_file=runtime_paths.db_file,
         session=session,
         client=client,
-        duration_probe=_duration_probe({"Tr1.webm": 101.234, "Tr2.webm": 99.433}),
+        duration_probe=exploding_probe,
     )
 
     assert plan.target_asset.filename == "Tr2.webm"
     assert plan.longer_asset.filename == "Tr1.webm"
     assert plan.target_track_id == "Pasha"
-    assert plan.target_input_file == "Tr2.webm"
     assert plan.offset_seconds == pytest.approx(1.801)
 
 
-def test_session_offset_dry_run_does_not_update_auphonic(tmp_path: Path) -> None:
-    config, runtime_paths, session = _build_offset_session(tmp_path)
+def test_session_offset_probes_and_persists_missing_durations(
+    app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _offset_session(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        durations=False,
+    )
+    client = FakeOffsetAuphonicClient()
+    probed = []
+
+    def probe(path: Path) -> float:
+        probed.append(path.name)
+        return {"Tr1.webm": 101.234, "Tr2.webm": 99.433}[path.name]
+
+    plan = plan_session_auphonic_offset(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        client=client,
+        duration_probe=probe,
+    )
+
+    assert sorted(probed) == ["Tr1.webm", "Tr2.webm"]
+    assert plan.offset_seconds == pytest.approx(1.801)
+    persisted = get_media_artifact(
+        runtime_paths.db_file, session.session_uid, kind="raw_track", role="host1"
+    )
+    assert persisted is not None
+    assert persisted.duration_seconds == pytest.approx(101.234)
+
+
+def test_session_offset_dry_run_does_not_update_auphonic(
+    app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _offset_session(
+        tmp_path, runtime_paths, session_factory, artifact_registrar
+    )
     client = FakeOffsetAuphonicClient()
 
     result = offset_session_auphonic_production(
         config=config,
+        runtime_paths=runtime_paths,
         db_file=runtime_paths.db_file,
         session=session,
         apply=False,
         client=client,
-        duration_probe=_duration_probe({"Tr1.webm": 101.234, "Tr2.webm": 99.433}),
     )
 
     assert result.applied is False
@@ -605,17 +809,23 @@ def test_session_offset_dry_run_does_not_update_auphonic(tmp_path: Path) -> None
     assert client.offset_updates == []
 
 
-def test_session_offset_apply_updates_matched_track_id(tmp_path: Path) -> None:
-    config, runtime_paths, session = _build_offset_session(tmp_path)
+def test_session_offset_apply_updates_matched_track_id(
+    app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _offset_session(
+        tmp_path, runtime_paths, session_factory, artifact_registrar
+    )
     client = FakeOffsetAuphonicClient()
 
     result = offset_session_auphonic_production(
         config=config,
+        runtime_paths=runtime_paths,
         db_file=runtime_paths.db_file,
         session=session,
         apply=True,
         client=client,
-        duration_probe=_duration_probe({"Tr1.webm": 101.234, "Tr2.webm": 99.433}),
     )
 
     assert result.applied is True
@@ -626,25 +836,33 @@ def test_session_offset_apply_updates_matched_track_id(tmp_path: Path) -> None:
 
 
 def test_session_offset_fails_when_production_is_not_change_allowed(
-    tmp_path: Path,
+    app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
 ) -> None:
-    config, runtime_paths, session = _build_offset_session(tmp_path)
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _offset_session(
+        tmp_path, runtime_paths, session_factory, artifact_registrar
+    )
     client = FakeOffsetAuphonicClient(change_allowed=False)
 
     with pytest.raises(AuphonicError, match="change_allowed"):
         plan_session_auphonic_offset(
             config=config,
+            runtime_paths=runtime_paths,
             db_file=runtime_paths.db_file,
             session=session,
             client=client,
-            duration_probe=_duration_probe({"Tr1.webm": 101.234, "Tr2.webm": 99.433}),
         )
 
 
 def test_session_offset_fails_when_track_matching_is_ambiguous(
-    tmp_path: Path,
+    app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
 ) -> None:
-    config, runtime_paths, session = _build_offset_session(tmp_path)
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _offset_session(
+        tmp_path, runtime_paths, session_factory, artifact_registrar
+    )
     client = FakeOffsetAuphonicClient(
         tracks=[
             {"id": "Pasha-a", "type": "multitrack", "input_file": "Tr2.webm"},
@@ -655,10 +873,10 @@ def test_session_offset_fails_when_track_matching_is_ambiguous(
     with pytest.raises(AuphonicError) as exc_info:
         plan_session_auphonic_offset(
             config=config,
+            runtime_paths=runtime_paths,
             db_file=runtime_paths.db_file,
             session=session,
             client=client,
-            duration_probe=_duration_probe({"Tr1.webm": 101.234, "Tr2.webm": 99.433}),
         )
 
     assert "Ambiguous" in str(exc_info.value)
@@ -686,18 +904,18 @@ def test_error_status_is_treated_as_failed() -> None:
     assert _is_failed_status(data_node) is True
 
 
-def test_reconcile_done_production_downloads_outputs(
-    fixture_raw_root, tmp_path: Path
+def test_reconcile_done_production_persists_outputs(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
 ) -> None:
-    config = _build_config(tmp_path)
-    runtime_paths = build_runtime_paths(config)
-    ensure_runtime_dirs(runtime_paths)
-    initialize_database(runtime_paths.db_file)
-    scan_and_ingest(fixture_raw_root, runtime_paths.db_file)
-    session = next(
-        item
-        for item in list_sessions(runtime_paths.db_file)
-        if item.source_basename == "010124_013143"
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _queued_session_with_tracks(
+        tmp_path, runtime_paths, session_factory, artifact_registrar
     )
     client = FakeDoneAuphonicClient()
 
@@ -712,22 +930,25 @@ def test_reconcile_done_production_downloads_outputs(
 
     assert updated.status == "waiting_for_finalize"
     assert updated.auphonic_production_id == "prod-123"
-    assert Path(updated.pre_edit_master_path).exists()
-    assert Path(updated.transcript_path).exists()
+    master = get_media_artifact(
+        runtime_paths.db_file, session.session_uid, kind="pre_edit_master"
+    )
+    assert master is not None
+    assert workspace_path_for(runtime_paths, session.session_uid).exists()
 
 
 def test_reconcile_preserves_previewed_status(
-    fixture_raw_root, tmp_path: Path
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
 ) -> None:
-    config = _build_config(tmp_path)
-    runtime_paths = build_runtime_paths(config)
-    ensure_runtime_dirs(runtime_paths)
-    initialize_database(runtime_paths.db_file)
-    scan_and_ingest(fixture_raw_root, runtime_paths.db_file)
-    session = next(
-        item
-        for item in list_sessions(runtime_paths.db_file)
-        if item.source_basename == "010124_013143"
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _queued_session_with_tracks(
+        tmp_path, runtime_paths, session_factory, artifact_registrar
     )
     client = FakeAuphonicClient()
     prepared = prepare_session_with_auphonic(
@@ -757,16 +978,56 @@ def test_reconcile_preserves_previewed_status(
 
     assert updated.status == "auphonic_previewed"
     assert client.started == []
-    reloaded = get_session(runtime_paths.db_file, session.session_uid)
-    assert reloaded is not None
-    assert reloaded.status == "auphonic_previewed"
 
 
-def test_refresh_transcript_with_auphonic_uses_final_master(
-    fixture_raw_root, tmp_path: Path
+def _ready_for_draft_session(
+    tmp_path, runtime_paths, session_factory, artifact_registrar
+):
+    session = session_factory(
+        runtime_paths.db_file,
+        session_uid="session-refresh-1",
+        status="ready_for_draft",
+        auphonic_production_id="prod-123",
+    )
+    old_transcript = tmp_path / "old-transcript.vtt"
+    old_transcript.write_text(
+        "WEBVTT\n\n00:00.000 --> 00:01.000\nPre-edit transcript\n",
+        encoding="utf-8",
+    )
+    final_master = tmp_path / "final-master.mp3"
+    final_master.write_bytes(b"final-master")
+    artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid=session.session_uid,
+        kind="transcript",
+        path=old_transcript,
+    )
+    artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid=session.session_uid,
+        kind="final_master",
+        path=final_master,
+    )
+    return session
+
+
+def test_refresh_transcript_replaces_transcript_artifact(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
 ) -> None:
-    config, runtime_paths, session, final_master = _build_ready_for_draft_session(
-        fixture_raw_root, tmp_path
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _ready_for_draft_session(
+        tmp_path, runtime_paths, session_factory, artifact_registrar
+    )
+    old = get_media_artifact(
+        runtime_paths.db_file, session.session_uid, kind="transcript"
     )
     upsert_episode_metadata(
         runtime_paths.db_file,
@@ -784,24 +1045,64 @@ def test_refresh_transcript_with_auphonic_uses_final_master(
         client=client,
     )
 
-    refreshed_transcript = Path(updated.transcript_path)
     assert updated.status == "ready_for_draft"
-    assert refreshed_transcript == config.paths.deliverables_root / "transcripts" / (
-        f"{session.session_uid}.vtt"
+    refreshed = get_media_artifact(
+        runtime_paths.db_file, session.session_uid, kind="transcript"
     )
-    assert "Final cut transcript" in refreshed_transcript.read_text(encoding="utf-8")
-    assert client.created[0][2] == "transcript-preset"
-    assert client.created[0][1][0].local_path == str(final_master)
-    assert client.uploaded[0][2] == ["input_file"]
+    assert refreshed is not None
+    assert refreshed.sha256 != old.sha256
+    assert refreshed.source_id == "prod-refresh"
+    assert client.single_created == [
+        (
+            "010124_013143 transcript refresh",
+            "transcript-preset",
+            "svc-podline",
+            client.single_created[0][3],
+        )
+    ]
+    assert client.single_created[0][3].endswith("/final-master.mp3")
     assert client.started == ["prod-refresh"]
     assert get_episode(runtime_paths.db_file, session.session_uid) is None
+    assert updated.transcript_refresh_production_id is None
+
+
+def test_refresh_transcript_requires_final_master_artifact(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    tmp_path,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = session_factory(
+        runtime_paths.db_file,
+        session_uid="session-refresh-2",
+        status="ready_for_draft",
+    )
+
+    with pytest.raises(AuphonicError, match="no final master artifact"):
+        refresh_transcript_with_auphonic(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=session,
+            client=FakeTranscriptRefreshClient(),
+        )
 
 
 def test_refresh_transcript_resumes_started_production_after_local_failure(
-    fixture_raw_root, tmp_path: Path
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
 ) -> None:
-    config, runtime_paths, session, _final_master = _build_ready_for_draft_session(
-        fixture_raw_root, tmp_path
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _ready_for_draft_session(
+        tmp_path, runtime_paths, session_factory, artifact_registrar
     )
     client = FakeResumableTranscriptRefreshClient()
 
@@ -816,10 +1117,7 @@ def test_refresh_transcript_resumes_started_production_after_local_failure(
 
     interrupted = get_session(runtime_paths.db_file, session.session_uid)
     assert interrupted is not None
-    assert (
-        getattr(interrupted, "transcript_refresh_production_id", None)
-        == "prod-refresh"
-    )
+    assert interrupted.transcript_refresh_production_id == "prod-refresh"
 
     updated = refresh_transcript_with_auphonic(
         config=config,
@@ -829,147 +1127,196 @@ def test_refresh_transcript_resumes_started_production_after_local_failure(
         client=client,
     )
 
-    assert len(client.created) == 1
+    assert len(client.single_created) == 1
     assert client.started == ["prod-refresh"]
-    assert getattr(updated, "transcript_refresh_production_id", None) is None
+    assert updated.transcript_refresh_production_id is None
 
 
-def _build_ready_for_draft_session(fixture_raw_root, tmp_path: Path):
-    config = _build_config(tmp_path)
-    runtime_paths = build_runtime_paths(config)
-    ensure_runtime_dirs(runtime_paths)
-    initialize_database(runtime_paths.db_file)
-    scan_and_ingest(fixture_raw_root, runtime_paths.db_file)
-    session = next(
-        item
-        for item in list_sessions(runtime_paths.db_file)
-        if item.source_basename == "010124_013143"
+def test_pair_tracks_orders_fallback_by_recorder_position() -> None:
+    from types import SimpleNamespace
+
+    from podline.auphonic import _pair_tracks_with_preset_ids
+
+    def _artifact(role: str, filename: str):
+        return SimpleNamespace(role=role, filename=filename)
+
+    tracks = [
+        _artifact("guest1", "Tr3.webm"),
+        _artifact("guest2", "Tr4.webm"),
+        _artifact("host1", "Tr1.webm"),
+        _artifact("host2", "Tr2.webm"),
+    ]
+    preset_ids = ["Pasha", "Jonathan", "Guest A", "Guest B"]
+
+    pairs = _pair_tracks_with_preset_ids(preset_ids, tracks)
+
+    assert [(track_id, artifact.role) for track_id, artifact in pairs] == [
+        ("Pasha", "host1"),
+        ("Jonathan", "host2"),
+        ("Guest A", "guest1"),
+        ("Guest B", "guest2"),
+    ]
+
+
+class MultiSpeakerFakeAuphonicClient(FakeAuphonicClient):
+    """Preset with named tracks that do not match session roles."""
+
+    def create_production(
+        self, *, title: str, track_count: int, preset_id: str
+    ) -> AuphonicPreparedProduction:
+        self.created.append((title, track_count, preset_id))
+        return AuphonicPreparedProduction(
+            production_id="prod-123",
+            upload_track_ids=[
+                f"Preset Track {i}" for i in range(1, track_count + 1)
+            ],
+            status_page="https://example.test/status/prod-123",
+            edit_page="https://example.test/edit/prod-123",
+        )
+
+
+@pytest.mark.parametrize(
+    "roles",
+    [
+        [("host1", "Tr1.webm"), ("host2", "Tr2.webm"), ("guest1", "Tr3.webm")],
+        [
+            ("host1", "Tr1.webm"),
+            ("host2", "Tr2.webm"),
+            ("guest1", "Tr3.webm"),
+            ("guest2", "Tr4.webm"),
+        ],
+    ],
+    ids=["three-speakers", "four-speakers"],
+)
+def test_prepare_pairs_multi_speaker_roles_in_recorder_order(
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
+    roles,
+) -> None:
+    """Recorder order is the contract: preset track N gets recorder track N.
+
+    Roles are host1, host2, guest1, guest2 — any role-name sort (alphabetical
+    or natural) puts the guests first and silently maps Tr3/Tr4 onto the
+    first preset tracks.
+    """
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = session_factory(runtime_paths.db_file, status="queued")
+    for role, filename in roles:
+        path = tmp_path / "tracks" / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"opus-{role}".encode("utf-8"))
+        artifact_registrar(
+            runtime_paths.db_file,
+            runtime_paths,
+            session_uid=session.session_uid,
+            kind="raw_track",
+            role=role,
+            path=path,
+            duration_seconds=60.0,
+        )
+    client = MultiSpeakerFakeAuphonicClient()
+
+    prepare_session_with_auphonic(
+        config=config,
+        db_file=runtime_paths.db_file,
+        session=session,
+        client=client,
     )
-    old_transcript = tmp_path / "old-transcript.vtt"
-    old_transcript.write_text(
-        "WEBVTT\n\n00:00.000 --> 00:01.000\nPre-edit transcript\n",
-        encoding="utf-8",
-    )
-    pre_edit = tmp_path / "pre-edit.mp3"
-    pre_edit.write_bytes(b"pre-edit")
-    final_master = tmp_path / "final-master.mp3"
-    final_master.write_bytes(b"final-master")
 
-    update_session_status(
+    attached = [
+        (track_id, input_key.rsplit("/", 1)[-1])
+        for (_production, track_id, _service, input_key) in client.attached
+    ]
+    assert attached == [
+        (f"Preset Track {index + 1}", filename)
+        for index, (_role, filename) in enumerate(roles)
+    ]
+
+
+def test_start_failure_after_persist_recovers_via_reconcile_without_restart(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Crash between output persistence and the state transition is recoverable.
+
+    The remote production must not be started a second time, and recovery
+    must leave exactly one current artifact per kind plus a valid workspace.
+    """
+    import json
+
+    from podline.artifacts import ArtifactError, workspace_path_for
+    from podline.auphonic import reconcile_production_to_session
+    from podline.repository import get_session as get_session_record
+    from podline.repository import list_media_artifacts
+    from podline.storage import sha256_of_file
+
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = session_factory(
         runtime_paths.db_file,
-        session_uid=session.session_uid,
-        from_state=session.status,
-        to_state="ready_for_draft",
-        timestamp="now",
-        detail="ready for transcript refresh",
-        pre_edit_master_path=str(pre_edit),
-        transcript_path=str(old_transcript),
-        final_master_path=str(final_master),
+        status="auphonic_previewed",
+        auphonic_production_id="prod-123",
     )
-    ready_session = get_session(runtime_paths.db_file, session.session_uid)
-    assert ready_session is not None
-    return config, runtime_paths, ready_session, final_master
+    client = FakeAuphonicClient()
 
+    def _local_failure(**_kwargs):
+        raise ArtifactError("simulated local failure after outputs persisted")
 
-def _build_config(tmp_path: Path, enabled: bool = True) -> AppConfig:
-    runtime_home = tmp_path / "runtime"
-    deliverables_root = tmp_path / "deliverables"
-    return AppConfig(
-        runtime_home=runtime_home,
-        paths=PathsConfig(
-            raw_root=tmp_path / "raw",
-            deliverables_root=deliverables_root,
-        ),
-        polling=PollingConfig(interval_seconds=30),
-        notifications=NotificationsConfig(enabled=False),
-        auphonic=AuphonicConfig(
-            enabled=enabled,
-            api_key="secret-token" if enabled else "",
-            base_url="https://auphonic.example/api",
-            request_timeout_seconds=600,
-            poll_interval_seconds=0,
-            max_poll_attempts=2,
-            preset_ids={
-                "transcript_refresh": "transcript-preset",
-                "speakers_2": "preset-2",
-                "speakers_3": "preset-3",
-                "speakers_4": "preset-4",
-            },
-        ),
-        podbean=PodbeanConfig(
-            enabled=False,
-            client_id="",
-            client_secret="",
-            base_url="https://api.podbean.example/v1",
-            podcast_id="",
-        ),
-        cozytrack=_default_cozytrack_config(),
-        storage=_default_storage_config(),
-        config_file=runtime_home / "config.yaml",
+    # monkeypatch.undo() would also undo the autouse AWS env fixture (one
+    # MonkeyPatch instance per test), so scope this patch with a context.
+    with monkeypatch.context() as patcher:
+        patcher.setattr("podline.auphonic.create_workspace", _local_failure)
+        with pytest.raises(ArtifactError, match="simulated local failure"):
+            start_prepared_session_with_auphonic(
+                config=config,
+                runtime_paths=runtime_paths,
+                db_file=runtime_paths.db_file,
+                session=session,
+                client=client,
+            )
+
+    failed = get_session_record(runtime_paths.db_file, session.session_uid)
+    assert failed is not None
+    assert failed.status == "failed"
+    assert client.started == ["prod-123"]
+
+    recovery_client = FakeDoneAuphonicClient()
+    recovered = reconcile_production_to_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=failed,
+        production_id="prod-123",
+        client=recovery_client,
     )
 
-
-def _default_cozytrack_config() -> CozytrackConfig:
-    return CozytrackConfig(
-        base_url="http://localhost:3000",
-        api_key="",
-        download_subdir="cozytrack",
-        request_timeout_seconds=600,
+    assert recovered.status == "waiting_for_finalize"
+    assert recovery_client.started == []
+    masters = list_media_artifacts(
+        runtime_paths.db_file, session.session_uid, kind="pre_edit_master"
     )
-
-
-def _build_offset_session(tmp_path: Path):
-    config = _build_config(tmp_path)
-    runtime_paths = build_runtime_paths(config)
-    ensure_runtime_dirs(runtime_paths)
-    initialize_database(runtime_paths.db_file)
-
-    source_dir = tmp_path / "raw" / "cozytrack-session"
-    source_dir.mkdir(parents=True)
-    tr1 = source_dir / "Tr1.webm"
-    tr2 = source_dir / "Tr2.webm"
-    tr1.write_bytes(b"track-one")
-    tr2.write_bytes(b"track-two")
-
-    with connect(runtime_paths.db_file) as connection:
-        connection.execute(
-            "INSERT INTO sessions (session_uid, source_path, fingerprint, status, auphonic_production_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                "session-offset-1",
-                str(source_dir),
-                "fingerprint-offset-1",
-                "auphonic_prepared",
-                "prod-123",
-                "now",
-                "now",
-            ),
-        )
-        connection.execute(
-            "INSERT INTO assets (session_uid, role, filename, file_size, local_path) VALUES (?, ?, ?, ?, ?)",
-            ("session-offset-1", "host1", "Tr1.webm", 9, str(tr1)),
-        )
-        connection.execute(
-            "INSERT INTO assets (session_uid, role, filename, file_size, local_path) VALUES (?, ?, ?, ?, ?)",
-            ("session-offset-1", "host2", "Tr2.webm", 9, str(tr2)),
-        )
-        connection.commit()
-
-    session = get_session(runtime_paths.db_file, "session-offset-1")
-    assert session is not None
-    return config, runtime_paths, session
-
-
-def _duration_probe(durations):
-    def probe(path: Path) -> float:
-        return durations[path.name]
-
-    return probe
-
-
-def _default_storage_config() -> StorageConfig:
-    return StorageConfig(
-        enabled=False,
-        bucket="",
-        region="",
-        key_prefix="",
+    transcripts = list_media_artifacts(
+        runtime_paths.db_file, session.session_uid, kind="transcript"
     )
+    assert len(masters) == 1
+    assert len(transcripts) == 1
+
+    workspace = workspace_path_for(runtime_paths, session.session_uid)
+    manifest = json.loads((workspace / "manifest.json").read_text(encoding="utf-8"))
+    for kind, artifact in (
+        ("pre_edit_master", masters[0]),
+        ("transcript", transcripts[0]),
+    ):
+        entry = manifest["artifacts"][kind]
+        copy = workspace / entry["filename"]
+        assert copy.exists()
+        assert entry["sha256"] == artifact.sha256
+        assert sha256_of_file(copy) == artifact.sha256

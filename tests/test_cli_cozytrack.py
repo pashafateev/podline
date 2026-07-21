@@ -6,7 +6,7 @@ from typer.testing import CliRunner
 from podline import cli as cli_module
 from podline.cli import app
 from podline.cozytrack.client import CozytrackSession, CozytrackTrack
-from podline.db import initialize_database
+from podline.db import connect, initialize_database
 from podline.repository import get_session_by_cozytrack_id
 
 
@@ -126,25 +126,38 @@ def test_ct_list_filters_already_ingested_ids(tmp_path: Path, monkeypatch) -> No
     assert "sess-already" not in result.stdout
 
 
-def test_ct_ingest_creates_session_row(tmp_path: Path, monkeypatch) -> None:
+def test_ct_ingest_passes_runtime_paths_and_reports_artifacts(
+    tmp_path: Path, monkeypatch
+) -> None:
     runtime_home = tmp_path / "runtime"
     raw_root = tmp_path / "raw"
     config_file = tmp_path / "config.yaml"
     _write_config(config_file, runtime_home, raw_root)
 
-    fake = _FakeClient([_make_session("sess-1", "Demo Episode")])
+    seen = {}
 
-    def fake_ingest(*, config, db_file, cozytrack_session_id, name_override, logger):
-        from podline.cozytrack.ingest import ingest_session
-
-        return ingest_session(
-            config=config,
-            db_file=db_file,
-            cozytrack_session_id=cozytrack_session_id,
-            name_override=name_override,
-            client=fake,
-            logger=logger,
-        )
+    def fake_ingest(
+        *, config, runtime_paths, db_file, cozytrack_session_id, name_override, logger
+    ):
+        seen["runtime_paths"] = runtime_paths
+        seen["cozytrack_session_id"] = cozytrack_session_id
+        with connect(db_file) as connection:
+            connection.execute(
+                "INSERT INTO sessions (session_uid, source_path, fingerprint, status, cozytrack_session_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "session-ct-1",
+                    "/ingested/session-ct-1",
+                    "fingerprint-ct-1",
+                    "queued",
+                    cozytrack_session_id,
+                    "now",
+                    "now",
+                ),
+            )
+            connection.commit()
+        record = get_session_by_cozytrack_id(db_file, cozytrack_session_id)
+        assert record is not None
+        return record
 
     monkeypatch.setattr(cli_module, "cozytrack_ingest_session", fake_ingest)
 
@@ -153,9 +166,10 @@ def test_ct_ingest_creates_session_row(tmp_path: Path, monkeypatch) -> None:
     )
 
     assert result.exit_code == 0, result.stdout
+    assert "session-ct-1" in result.stdout
+    assert "artifacts" in result.stdout
+    assert seen["cozytrack_session_id"] == "sess-1"
+    assert seen["runtime_paths"] is not None
     db_file = runtime_home / "state" / "state.db"
     record = get_session_by_cozytrack_id(str(db_file), "sess-1")
     assert record is not None
-    assert Path(record.source_path).exists()
-    assert (Path(record.source_path) / "Tr1.webm").exists()
-    assert (Path(record.source_path) / "Tr2.webm").exists()

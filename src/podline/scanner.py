@@ -23,6 +23,24 @@ ROLE_MAP = {
     3: "guest1",
     4: "guest2",
 }
+_GUEST_ROLE_PATTERN = re.compile(r"guest(\d+)")
+
+
+def recorder_track_number(role: str) -> Optional[int]:
+    """Inverse of ROLE_MAP: the recorder track number a role was derived from.
+
+    Recorder order is the pipeline's canonical track order (Tr1 -> host1,
+    Tr2 -> host2, Tr3 -> guest1, ...); role names must never be ordered
+    alphabetically, which would put guests before hosts.
+    """
+    normalized = role.strip().lower()
+    for number, name in ROLE_MAP.items():
+        if name == normalized:
+            return number
+    match = _GUEST_ROLE_PATTERN.fullmatch(normalized)
+    if match:
+        return int(match.group(1)) + 2
+    return None
 WAV_ANALYSIS_FRAMES = 16384
 SILENCE_RMS_THRESHOLD = 100
 SESSION_SILENCE_FLOOR_DB = -90.0

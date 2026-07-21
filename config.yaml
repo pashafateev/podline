@@ -18,6 +18,7 @@ auphonic:
     speakers_2: ""
     speakers_3: ""
     speakers_4: ""
+  s3_service_id: ""
 podbean:
   enabled: false
   client_id: ""

@@ -8,6 +8,7 @@ from typer.testing import CliRunner
 from podline import cli as cli_module
 from podline.auphonic import (
     AuphonicAssetDuration,
+    AuphonicError,
     AuphonicOffsetPlan,
     AuphonicOffsetResult,
 )
@@ -109,24 +110,60 @@ def test_configure_logging_switches_debug_level(tmp_path: Path) -> None:
     assert logger.level == logging.DEBUG
 
 
-def test_refresh_resets_scans_and_lists_sessions(tmp_path: Path) -> None:
+def test_refresh_is_retired_and_points_at_import(tmp_path: Path) -> None:
     runtime_home = tmp_path / "runtime"
     raw_root = tmp_path / "raw"
     config_file = tmp_path / "config.yaml"
     _write_config(config_file, runtime_home, raw_root)
 
-    session_dir = raw_root / "010124_012430"
-    session_dir.mkdir(parents=True)
-    (session_dir / "010124_012430_Tr1.WAV").write_bytes(b"track-one")
-    (session_dir / "010124_012430_Tr2.WAV").write_bytes(b"track-two")
-
     result = runner.invoke(app, ["refresh", "--config", str(config_file)])
 
-    assert result.exit_code == 0
-    assert "Refresh Complete" in result.stdout
-    assert "discovered" in result.stdout
-    assert "created" in result.stdout
-    assert "010124_012430" in result.stdout
+    assert result.exit_code == 1
+    assert "retired" in result.stdout
+    assert "pod import" in result.stdout
+
+
+def test_scan_is_retired_and_points_at_import(tmp_path: Path) -> None:
+    runtime_home = tmp_path / "runtime"
+    raw_root = tmp_path / "raw"
+    config_file = tmp_path / "config.yaml"
+    _write_config(config_file, runtime_home, raw_root)
+
+    result = runner.invoke(app, ["scan", "--config", str(config_file)])
+
+    assert result.exit_code == 1
+    assert "retired" in result.stdout
+    assert "pod import" in result.stdout
+
+
+def test_import_command_registers_folder(tmp_path: Path, monkeypatch) -> None:
+    runtime_home = tmp_path / "runtime"
+    raw_root = tmp_path / "raw"
+    config_file = tmp_path / "config.yaml"
+    _write_config(config_file, runtime_home, raw_root)
+
+    folder = tmp_path / "recording"
+    folder.mkdir()
+    seen = {}
+
+    def fake_import(*, config, runtime_paths, db_file, folder, logger):
+        seen["folder"] = folder
+        seen["runtime_paths"] = runtime_paths
+        return SimpleNamespace(
+            session_uid="session-imported-1", status="queued"
+        ), True
+
+    monkeypatch.setattr(cli_module, "import_local_folder", fake_import)
+
+    result = runner.invoke(
+        app, ["import", str(folder), "--config", str(config_file)]
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert "Import Complete" in result.stdout
+    assert "session-imported-1" in result.stdout
+    assert seen["folder"] == folder
+    assert seen["runtime_paths"] is not None
 
 
 def test_list_shows_pick_column_and_full_mode(tmp_path: Path) -> None:
@@ -384,7 +421,7 @@ def test_auphonic_offset_command_prints_dry_run_plan(
     tr1 = AssetRecord("host1", "Tr1.webm", 9, "/tmp/source2/Tr1.webm")
     tr2 = AssetRecord("host2", "Tr2.webm", 9, "/tmp/source2/Tr2.webm")
 
-    def fake_offset(*, config, db_file, session, apply):
+    def fake_offset(*, config, runtime_paths, db_file, session, apply):
         calls.append((session.session_uid, apply))
         return AuphonicOffsetResult(
             plan=AuphonicOffsetPlan(
@@ -518,7 +555,7 @@ def test_status_shows_episode_draft_pending_only_when_ready_for_draft(
     assert "AI metadata pending" in result.stdout
 
 
-def test_finalize_uses_single_master_from_expected_directory(tmp_path: Path) -> None:
+def test_finalize_uses_single_master_from_expected_directory(tmp_path: Path, monkeypatch) -> None:
     runtime_home = tmp_path / "runtime"
     raw_root = tmp_path / "raw"
     config_file = tmp_path / "config.yaml"
@@ -569,12 +606,20 @@ def test_finalize_uses_single_master_from_expected_directory(tmp_path: Path) -> 
         )
         connection.commit()
 
+    captured = {}
+
+    def fake_finalize_session(*, config, runtime_paths, db_file, session, master_path):
+        captured["master_path"] = master_path
+        return SimpleNamespace(session_uid=session.session_uid, status="ready_for_draft")
+
+    monkeypatch.setattr(cli_module, "finalize_session", fake_finalize_session)
+
     result = runner.invoke(
         app, ["finalize", "session-finalize-1", "--config", str(config_file)]
     )
 
-    assert result.exit_code == 0
-    assert str(final_master) in result.stdout
+    assert result.exit_code == 0, result.stdout
+    assert captured["master_path"] == final_master
 
 
 def test_finalize_errors_when_multiple_expected_masters_exist(tmp_path: Path) -> None:
@@ -633,11 +678,11 @@ def test_finalize_errors_when_multiple_expected_masters_exist(tmp_path: Path) ->
     )
 
     assert result.exit_code == 1
-    assert "multiple audio masters were found" in result.stdout
+    assert "multiple masters were found" in result.stdout
 
 
 def test_finalize_accepts_filename_relative_to_expected_directory(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     runtime_home = tmp_path / "runtime"
     raw_root = tmp_path / "raw"
@@ -689,6 +734,14 @@ def test_finalize_accepts_filename_relative_to_expected_directory(
         )
         connection.commit()
 
+    captured = {}
+
+    def fake_finalize_session(*, config, runtime_paths, db_file, session, master_path):
+        captured["master_path"] = master_path
+        return SimpleNamespace(session_uid=session.session_uid, status="ready_for_draft")
+
+    monkeypatch.setattr(cli_module, "finalize_session", fake_finalize_session)
+
     result = runner.invoke(
         app,
         [
@@ -701,8 +754,8 @@ def test_finalize_accepts_filename_relative_to_expected_directory(
         ],
     )
 
-    assert result.exit_code == 0
-    assert str(final_master) in result.stdout
+    assert result.exit_code == 0, result.stdout
+    assert captured["master_path"] == final_master
 
 
 def test_finalize_prefers_current_directory_file_over_expected_directory(
@@ -764,6 +817,14 @@ def test_finalize_prefers_current_directory_file_over_expected_directory(
         )
         connection.commit()
 
+    captured = {}
+
+    def fake_finalize_session(*, config, runtime_paths, db_file, session, master_path):
+        captured["master_path"] = master_path
+        return SimpleNamespace(session_uid=session.session_uid, status="ready_for_draft")
+
+    monkeypatch.setattr(cli_module, "finalize_session", fake_finalize_session)
+
     result = runner.invoke(
         app,
         [
@@ -776,11 +837,11 @@ def test_finalize_prefers_current_directory_file_over_expected_directory(
         ],
     )
 
-    assert result.exit_code == 0
-    assert str(local_master.resolve()) in result.stdout
+    assert result.exit_code == 0, result.stdout
+    assert captured["master_path"] == local_master.resolve()
 
 
-def test_finalize_accepts_episode_shortcut_for_expected_master(tmp_path: Path) -> None:
+def test_finalize_accepts_episode_shortcut_for_expected_master(tmp_path: Path, monkeypatch) -> None:
     runtime_home = tmp_path / "runtime"
     raw_root = tmp_path / "raw"
     config_file = tmp_path / "config.yaml"
@@ -831,6 +892,14 @@ def test_finalize_accepts_episode_shortcut_for_expected_master(tmp_path: Path) -
         )
         connection.commit()
 
+    captured = {}
+
+    def fake_finalize_session(*, config, runtime_paths, db_file, session, master_path):
+        captured["master_path"] = master_path
+        return SimpleNamespace(session_uid=session.session_uid, status="ready_for_draft")
+
+    monkeypatch.setattr(cli_module, "finalize_session", fake_finalize_session)
+
     result = runner.invoke(
         app,
         [
@@ -843,8 +912,8 @@ def test_finalize_accepts_episode_shortcut_for_expected_master(tmp_path: Path) -
         ],
     )
 
-    assert result.exit_code == 0
-    assert str(final_master) in result.stdout
+    assert result.exit_code == 0, result.stdout
+    assert captured["master_path"] == final_master
 
 
 def test_transcript_refresh_accepts_selector_index(tmp_path: Path, monkeypatch) -> None:
@@ -933,3 +1002,140 @@ def test_transcript_refresh_accepts_selector_index(tmp_path: Path, monkeypatch) 
     }
     assert "Transcript Refreshed" in result.stdout
     assert "session-refresh-2" in result.stdout
+
+
+def _bootstrap_cli_runtime(tmp_path: Path):
+    """Write a config, initialize the runtime DB, and return (config, home, db)."""
+    runtime_home = tmp_path / "runtime"
+    raw_root = tmp_path / "raw"
+    raw_root.mkdir(parents=True, exist_ok=True)
+    config_file = tmp_path / "config.yaml"
+    _write_config(config_file, runtime_home, raw_root)
+    bootstrap = runner.invoke(app, ["list", "--config", str(config_file)])
+    assert bootstrap.exit_code == 0, bootstrap.stdout
+    return config_file, runtime_home, str(runtime_home / "state" / "state.db")
+
+
+def test_workspace_clean_rejects_negative_retention(
+    tmp_path: Path, session_factory
+) -> None:
+    config_file, runtime_home, db_file = _bootstrap_cli_runtime(tmp_path)
+    session_factory(db_file, session_uid="released-1", status="draft_created")
+    workspace = runtime_home / "workspaces" / "released-1"
+    workspace.mkdir(parents=True)
+    project = workspace / "edit.cpr"
+    project.write_bytes(b"fresh-cubase-project")
+
+    result = runner.invoke(
+        app,
+        [
+            "workspace-clean",
+            "--older-than-days",
+            "-1",
+            "--apply",
+            "--config",
+            str(config_file),
+        ],
+    )
+
+    assert project.exists(), "negative retention must never delete workspaces"
+    assert result.exit_code != 0
+
+
+def test_workspace_clean_rejects_nan_retention(
+    tmp_path: Path, session_factory
+) -> None:
+    """NaN passes numeric floors (nan < 0 is False) and must not evict anything."""
+    config_file, runtime_home, db_file = _bootstrap_cli_runtime(tmp_path)
+    session_factory(db_file, session_uid="released-2", status="draft_created")
+    workspace = runtime_home / "workspaces" / "released-2"
+    workspace.mkdir(parents=True)
+    project = workspace / "edit.cpr"
+    project.write_bytes(b"fresh-cubase-project")
+
+    result = runner.invoke(
+        app,
+        [
+            "workspace-clean",
+            "--older-than-days",
+            "nan",
+            "--apply",
+            "--config",
+            str(config_file),
+        ],
+    )
+
+    assert project.exists(), "NaN retention must never delete workspaces"
+    assert result.exit_code != 0
+
+
+def test_status_workspace_tag_requires_current_content(
+    tmp_path: Path, session_factory
+) -> None:
+    """+workspace means "the current artifact is in the workspace", not
+    "a file with that name exists"."""
+    import hashlib
+
+    from podline.repository import register_media_artifact
+
+    config_file, runtime_home, db_file = _bootstrap_cli_runtime(tmp_path)
+    session_factory(db_file, session_uid="s-tag", status="ready_for_draft")
+    current = b"WEBVTT\n\ncurrent transcript v2\n"
+    sha256 = hashlib.sha256(current).hexdigest()
+    register_media_artifact(
+        db_file,
+        session_uid="s-tag",
+        kind="transcript",
+        role="",
+        filename="ep.vtt",
+        content_type="text/vtt",
+        byte_size=len(current),
+        sha256=sha256,
+        duration_seconds=None,
+        s3_uri=f"s3://podline-media/sessions/s-tag/transcript/{sha256}/ep.vtt",
+        source_provider="test",
+        source_id=None,
+        timestamp="now",
+    )
+    workspace = runtime_home / "workspaces" / "s-tag"
+    workspace.mkdir(parents=True)
+    workspace_copy = workspace / "ep.vtt"
+
+    workspace_copy.write_bytes(current)
+    fresh = runner.invoke(app, ["status", "s-tag", "--config", str(config_file)])
+    assert fresh.exit_code == 0
+    assert "+workspace" in fresh.stdout
+
+    workspace_copy.write_bytes(b"WEBVTT\n\nstale transcript v1\n")
+    stale = runner.invoke(app, ["status", "s-tag", "--config", str(config_file)])
+    assert stale.exit_code == 0
+    assert "+workspace" not in stale.stdout
+
+
+def test_auphonic_prepare_survives_display_inspection_failure(
+    tmp_path: Path, session_factory, monkeypatch
+) -> None:
+    """The attached-tracks display is informational; a transient inspection
+    failure after a successful prepare must not fail the command."""
+    config_file, _runtime_home, db_file = _bootstrap_cli_runtime(tmp_path)
+    prepared = session_factory(
+        db_file,
+        session_uid="s-prep",
+        status="auphonic_prepared",
+        auphonic_production_id="prod-9",
+    )
+    monkeypatch.setattr(
+        cli_module, "prepare_session_with_auphonic", lambda **_kwargs: prepared
+    )
+
+    def _transient_failure(*_args, **_kwargs):
+        raise AuphonicError("transient inspection failure")
+
+    monkeypatch.setattr(cli_module, "inspect_production", _transient_failure)
+
+    result = runner.invoke(
+        app, ["auphonic-prepare", "s-prep", "--config", str(config_file)]
+    )
+
+    assert "Auphonic Prepared" in result.stdout
+    assert result.exit_code == 0

@@ -1,42 +1,19 @@
 from pathlib import Path
 
 import httpx
+import pytest
 
-from podline.config import (
-    AppConfig,
-    AuphonicConfig,
-    CozytrackConfig,
-    NotificationsConfig,
-    PathsConfig,
-    PodbeanConfig,
-    PollingConfig,
-    StorageConfig,
-)
-from podline.db import initialize_database
-from podline.ingest import scan_and_ingest
 from podline.podbean import (
     PodbeanClient,
     PodbeanError,
-    PodbeanDraftResult,
     create_podbean_draft,
     _next_episode_number,
 )
 from podline.repository import (
     get_episode,
     get_session,
-    list_sessions,
-    update_session_status,
     upsert_episode_metadata,
 )
-
-
-def _default_cozytrack_config() -> CozytrackConfig:
-    return CozytrackConfig(
-        base_url="http://localhost:3000",
-        api_key="",
-        download_subdir="cozytrack",
-        request_timeout_seconds=600,
-    )
 
 
 class FakePodbeanClient:
@@ -59,6 +36,7 @@ class FakePodbeanClient:
     def upload_presigned_file(
         self, presigned_url: str, file_path: Path, content_type: str
     ) -> None:
+        assert file_path.exists()
         self.uploaded.append((presigned_url, file_path.name, content_type))
 
     def create_draft_episode(
@@ -84,117 +62,103 @@ def test_next_episode_number_uses_max_existing_number() -> None:
     assert _next_episode_number([]) == 1
 
 
-def test_create_podbean_draft_persists_episode_and_updates_session(
-    fixture_raw_root, tmp_path: Path
+def test_create_podbean_draft_materializes_artifacts_and_updates_session(
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path: Path,
 ) -> None:
-    db_file = tmp_path / "state.db"
-    initialize_database(str(db_file))
-    scan_and_ingest(fixture_raw_root, str(db_file))
-    session = next(
-        item
-        for item in list_sessions(str(db_file))
-        if item.source_basename == "010124_013143"
+    config = app_config_factory(tmp_path, podbean_enabled=True)
+    runtime_paths = runtime_factory(config)
+    session = session_factory(
+        runtime_paths.db_file,
+        session_uid="session-podbean-1",
+        status="ready_for_draft",
     )
 
+    final_master = tmp_path / "final.mp3"
+    final_master.write_bytes(b"final")
     transcript = tmp_path / "transcript.vtt"
     transcript.write_text(
         "WEBVTT\n\n00:00.000 --> 00:01.000\nhello\n", encoding="utf-8"
     )
-    pre_edit = tmp_path / "pre.mp3"
-    pre_edit.write_bytes(b"pre")
-    final_master = tmp_path / "final.mp3"
-    final_master.write_bytes(b"final")
-    update_session_status(
-        str(db_file),
+    artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
         session_uid=session.session_uid,
-        from_state=session.status,
-        to_state="ready_for_draft",
-        timestamp="now",
-        detail="ready for podbean draft",
-        transcript_path=str(transcript),
-        pre_edit_master_path=str(pre_edit),
-        final_master_path=str(final_master),
+        kind="final_master",
+        path=final_master,
+    )
+    artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid=session.session_uid,
+        kind="transcript",
+        path=transcript,
     )
     upsert_episode_metadata(
-        str(db_file),
+        runtime_paths.db_file,
         session_uid=session.session_uid,
         title="Is my sponsor God?",
         description="Draft description",
     )
-    session = get_session(str(db_file), session.session_uid)
-    assert session is not None
-
-    config = AppConfig(
-        runtime_home=tmp_path,
-        paths=PathsConfig(
-            raw_root=tmp_path / "raw", deliverables_root=tmp_path / "deliverables"
-        ),
-        polling=PollingConfig(interval_seconds=30),
-        notifications=NotificationsConfig(enabled=False),
-        auphonic=AuphonicConfig(
-            enabled=False,
-            api_key="",
-            base_url="",
-            request_timeout_seconds=600,
-            poll_interval_seconds=1,
-            max_poll_attempts=1,
-            preset_ids={},
-        ),
-        podbean=PodbeanConfig(
-            enabled=True,
-            client_id="id",
-            client_secret="secret",
-            base_url="https://api.podbean.test/v1",
-            podcast_id="",
-        ),
-        cozytrack=_default_cozytrack_config(),
-        storage=_default_storage_config(),
-        config_file=tmp_path / "config.yaml",
-    )
+    client = FakePodbeanClient()
 
     episode = create_podbean_draft(
-        config=config, db_file=str(db_file), session=session, client=FakePodbeanClient()
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        client=client,
     )
 
     assert episode.episode_number == 16
     assert episode.podbean_post_id == "pb-123"
     assert episode.draft_url == "https://podbean.test/draft/pb-123"
-    refreshed = get_session(str(db_file), session.session_uid)
+    assert [name for _url, name, _ct in client.uploaded] == [
+        "final.mp3",
+        "transcript.vtt",
+    ]
+    refreshed = get_session(runtime_paths.db_file, session.session_uid)
     assert refreshed is not None
     assert refreshed.status == "draft_created"
-    saved = get_episode(str(db_file), session.session_uid)
+    saved = get_episode(runtime_paths.db_file, session.session_uid)
     assert saved is not None
     assert saved.episode_number == 16
 
 
-def test_podbean_client_wraps_http_status_errors(tmp_path: Path) -> None:
-    config = AppConfig(
-        runtime_home=tmp_path,
-        paths=PathsConfig(
-            raw_root=tmp_path / "raw", deliverables_root=tmp_path / "deliverables"
-        ),
-        polling=PollingConfig(interval_seconds=30),
-        notifications=NotificationsConfig(enabled=False),
-        auphonic=AuphonicConfig(
-            enabled=False,
-            api_key="",
-            base_url="",
-            request_timeout_seconds=600,
-            poll_interval_seconds=1,
-            max_poll_attempts=1,
-            preset_ids={},
-        ),
-        podbean=PodbeanConfig(
-            enabled=True,
-            client_id="id",
-            client_secret="secret",
-            base_url="https://api.podbean.test/v1",
-            podcast_id="",
-        ),
-        cozytrack=_default_cozytrack_config(),
-        storage=_default_storage_config(),
-        config_file=tmp_path / "config.yaml",
+def test_create_podbean_draft_requires_final_master_artifact(
+    app_config_factory, runtime_factory, session_factory, tmp_path: Path
+) -> None:
+    config = app_config_factory(tmp_path, podbean_enabled=True)
+    runtime_paths = runtime_factory(config)
+    session = session_factory(
+        runtime_paths.db_file,
+        session_uid="session-podbean-2",
+        status="ready_for_draft",
     )
+    upsert_episode_metadata(
+        runtime_paths.db_file,
+        session_uid=session.session_uid,
+        title="Title",
+        description="Description",
+    )
+
+    with pytest.raises(PodbeanError, match="No final_master artifact"):
+        create_podbean_draft(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=session,
+            client=FakePodbeanClient(),
+        )
+
+
+def test_podbean_client_wraps_http_status_errors(
+    app_config_factory, tmp_path: Path
+) -> None:
+    config = app_config_factory(tmp_path, podbean_enabled=True)
     client = PodbeanClient(config)
     request = httpx.Request("POST", "https://api.podbean.test/v1/oauth/token")
     response = httpx.Response(401, request=request, text="unauthorized")
@@ -206,12 +170,3 @@ def test_podbean_client_wraps_http_status_errors(tmp_path: Path) -> None:
         assert "unauthorized" in str(exc)
     else:
         raise AssertionError("Expected PodbeanError for wrapped HTTP failure")
-
-
-def _default_storage_config() -> StorageConfig:
-    return StorageConfig(
-        enabled=False,
-        bucket="",
-        region="",
-        key_prefix="",
-    )
