@@ -732,6 +732,171 @@ def test_reingest_resumes_interrupted_source_id_migration(
     assert _reconcile_event_count(runtime_paths.db_file, record.session_uid) == 1
 
 
+def test_resume_heals_legacy_ordered_session_without_fingerprint(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    """A legacy three-track import named in creation order (guest on Tr2)
+    that was associated without source ids: healing re-downloads in recorder
+    order, so filename/content pairing — and therefore the fingerprint —
+    differs from what is stored. Recovery must join by content hash against
+    the associated session instead of re-registering, which would collide
+    with the unique Cozytrack association on every retry."""
+    from podline.ingest import import_local_folder
+    from podline.repository import list_sessions, set_cozytrack_session_id
+
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+
+    ch1_bytes = b"webm-host-channel-one-data" * 32
+    guest_bytes = b"webm-remote-guest-data" * 32
+    ch2_bytes = b"webm-host-channel-two-data" * 32
+    import_dir = tmp_path / "riverside" / "2026-07-18_legacy-order"
+    import_dir.mkdir(parents=True)
+    (import_dir / "Tr1.webm").write_bytes(ch1_bytes)
+    (import_dir / "Tr2.webm").write_bytes(guest_bytes)
+    (import_dir / "Tr3.webm").write_bytes(ch2_bytes)
+    imported, _created = import_local_folder(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        folder=import_dir,
+        duration_probe=_probe,
+    )
+    assert set_cozytrack_session_id(
+        runtime_paths.db_file,
+        session_uid=imported.session_uid,
+        cozytrack_session_id="sess-legacy-order",
+        status=imported.status,
+        timestamp="2026-07-18T00:00:00+00:00",
+    )
+
+    fake = FakeCozytrackClient(
+        sessions=[
+            _make_identified_session(
+                session_id="sess-legacy-order",
+                tracks=[
+                    ("ct-ch-1", "host-local-ch-1", "Local Ch 1"),
+                    ("ct-guest", "guest_j", "J"),
+                    ("ct-ch-2", "host-local-ch-2", "Local Ch 2"),
+                ],
+            )
+        ],
+        downloads={
+            "ct-ch-1": ch1_bytes,
+            "ct-guest": guest_bytes,
+            "ct-ch-2": ch2_bytes,
+        },
+    )
+
+    record = ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-legacy-order",
+        client=fake,
+        duration_probe=_probe,
+    )
+
+    assert record.session_uid == imported.session_uid
+    assert len(list_sessions(runtime_paths.db_file)) == 1
+    artifacts = list_media_artifacts(runtime_paths.db_file, record.session_uid)
+    assert [(a.role, a.filename, a.source_id) for a in artifacts] == [
+        ("guest1", "Tr2.webm", "ct-guest"),
+        ("host1", "Tr1.webm", "ct-ch-1"),
+        ("host2", "Tr3.webm", "ct-ch-2"),
+    ]
+    assert _reconcile_event_count(runtime_paths.db_file, record.session_uid) == 1
+
+    downloads_after_heal = len(fake.requested_track_ids)
+    ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-legacy-order",
+        client=fake,
+        duration_probe=_probe,
+    )
+    assert len(fake.requested_track_ids) == downloads_after_heal
+    assert len(list_sessions(runtime_paths.db_file)) == 1
+
+
+def test_resume_reports_content_mismatch_without_crashing(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    """If the stored audio does not content-match the Cozytrack downloads,
+    healing must leave the ids unset and complete — a loud warning on each
+    explicit re-run, never an error loop or a guessed mapping."""
+    from podline.ingest import import_local_folder
+    from podline.repository import set_cozytrack_session_id
+
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+
+    import_dir = tmp_path / "riverside" / "2026-07-18_mismatch"
+    import_dir.mkdir(parents=True)
+    (import_dir / "Tr1.webm").write_bytes(b"stored-bytes-one" * 32)
+    (import_dir / "Tr2.webm").write_bytes(b"stored-bytes-two" * 32)
+    imported, _created = import_local_folder(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        folder=import_dir,
+        duration_probe=_probe,
+    )
+    assert set_cozytrack_session_id(
+        runtime_paths.db_file,
+        session_uid=imported.session_uid,
+        cozytrack_session_id="sess-mismatch",
+        status=imported.status,
+        timestamp="2026-07-18T00:00:00+00:00",
+    )
+
+    fake = FakeCozytrackClient(
+        sessions=[
+            _make_identified_session(
+                session_id="sess-mismatch",
+                tracks=[
+                    ("ct-host", "host", "Host"),
+                    ("ct-guest", "guest_x", "X"),
+                ],
+            )
+        ],
+        downloads={
+            "ct-host": b"different-bytes-one" * 32,
+            "ct-guest": b"different-bytes-two" * 32,
+        },
+    )
+
+    record = ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-mismatch",
+        client=fake,
+        duration_probe=_probe,
+    )
+
+    assert record.session_uid == imported.session_uid
+    artifacts = list_media_artifacts(runtime_paths.db_file, record.session_uid)
+    assert [(a.role, a.source_id) for a in artifacts] == [
+        ("host1", None),
+        ("host2", None),
+    ]
+    assert _reconcile_event_count(runtime_paths.db_file, record.session_uid) == 0
+
+    # Still unhealed, so an explicit re-run tries again instead of giving up.
+    downloads_before = len(fake.requested_track_ids)
+    ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-mismatch",
+        client=fake,
+        duration_probe=_probe,
+    )
+    assert len(fake.requested_track_ids) > downloads_before
+
+
 def test_ingest_session_is_idempotent(
     moto_s3, app_config_factory, runtime_factory, tmp_path: Path
 ) -> None:

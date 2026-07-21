@@ -11,7 +11,7 @@ never modified or removed.
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from podline.artifacts import content_type_for, seed_cache
 from podline.config import AppConfig
@@ -25,7 +25,6 @@ from podline.models import (
     UnsupportedSession,
 )
 from podline.repository import (
-    backfill_artifact_source_ids,
     create_session_with_artifacts,
     get_session_by_fingerprint,
     set_cozytrack_session_id,
@@ -49,22 +48,21 @@ def _default_duration_probe(path: Path) -> float:
 
 
 def source_ids_by_content(
-    candidate: ScanCandidate, track_source_ids: Dict[str, str]
+    tracks: Iterable[Tuple[Path, str]]
 ) -> Dict[str, str]:
-    """Map a candidate's track content hashes to provider source ids.
+    """Map (file, provider source id) pairs to a content-hash -> id join.
 
     Pairing by content instead of filename keeps the join correct when the
     stored artifacts were named differently than the staged downloads.
-    Tracks with byte-identical content cannot be told apart and are skipped
-    rather than guessed at.
+    Pairs without a source id are ignored; files with byte-identical
+    content cannot be told apart and are skipped rather than guessed at.
     """
     by_sha: Dict[str, str] = {}
     duplicates = set()
-    for track in candidate.spoken_tracks:
-        source_id = track_source_ids.get(track.path.name)
+    for path, source_id in tracks:
         if not source_id:
             continue
-        sha256 = sha256_of_file(track.path)
+        sha256 = sha256_of_file(path)
         if sha256 in by_sha:
             duplicates.add(sha256)
             continue
@@ -115,7 +113,8 @@ def register_candidate_with_storage(
                 status=existing.status,
                 timestamp=datetime.now(timezone.utc).isoformat(),
                 source_ids_by_sha256=source_ids_by_content(
-                    candidate, track_source_ids or {}
+                    (track.path, (track_source_ids or {}).get(track.path.name, ""))
+                    for track in candidate.spoken_tracks
                 ),
             )
             _log(
@@ -136,24 +135,6 @@ def register_candidate_with_storage(
                 f"from Cozytrack session {existing.cozytrack_session_id}; "
                 f"refusing to also associate it with {cozytrack_session_id}"
             )
-        if cozytrack_session_id and track_source_ids:
-            # Re-ingest of an already-associated session: heal source ids a
-            # previous interrupted or pre-migration run failed to persist.
-            healed = backfill_artifact_source_ids(
-                db_file,
-                session_uid=existing.session_uid,
-                source_ids_by_sha256=source_ids_by_content(
-                    candidate, track_source_ids
-                ),
-                timestamp=datetime.now(timezone.utc).isoformat(),
-            )
-            if healed:
-                _log(
-                    logger,
-                    "Backfilled Cozytrack source ids for %s raw tracks on %s",
-                    healed,
-                    existing.session_uid,
-                )
         _log(
             logger,
             "Session content already registered as %s; skipping",

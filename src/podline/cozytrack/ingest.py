@@ -16,9 +16,14 @@ from podline.cozytrack.client import (
     host_channel_number,
     is_host_participant,
 )
-from podline.ingest import DurationProbe, register_candidate_with_storage
+from podline.ingest import (
+    DurationProbe,
+    register_candidate_with_storage,
+    source_ids_by_content,
+)
 from podline.models import RuntimePaths, ScanCandidate, SessionRecord, UnsupportedSession
 from podline.repository import (
+    backfill_artifact_source_ids,
     get_session_by_cozytrack_id,
     list_media_artifacts,
     reconcile_artifact_roles,
@@ -69,44 +74,51 @@ def ingest_session(
     """
     existing = get_session_by_cozytrack_id(db_file, cozytrack_session_id)
     if existing is not None:
+        _log(
+            logger,
+            "Cozytrack session %s already ingested as %s",
+            cozytrack_session_id,
+            existing.session_uid,
+        )
+        client = client or CozytrackClient(config)
+        try:
+            cozytrack_session = client.get_session(cozytrack_session_id)
+        except CozytrackError as exc:
+            raise CozytrackIngestError(
+                f"Could not load Cozytrack session {cozytrack_session_id} to "
+                f"verify roles for {existing.session_uid}: {exc}"
+            ) from exc
         missing_ids = _spoken_tracks_missing_source_ids(db_file, existing.session_uid)
         if missing_ids:
             # A previous run associated the session but never persisted the
             # track source ids (interrupted migration or pre-migration
-            # code). Without them nothing can be reconciled from the DB
-            # alone, so fall through to the full download flow: register's
-            # dedup branch re-joins ids by content hash and roles reconcile
-            # after. Each retry converges toward the healed state.
+            # code). Heal against the session the association names, joined
+            # strictly by content hash — never through fingerprint-based
+            # registration, which depends on track naming that may have
+            # changed across ingest versions and would collide with the
+            # unique Cozytrack association on re-registration.
             _log(
                 logger,
-                "Cozytrack session %s already ingested as %s but %s track(s) "
-                "lack source ids; re-downloading to resume the migration",
-                cozytrack_session_id,
+                "Session %s lacks source ids for %s track(s); re-downloading "
+                "to heal by content hash",
                 existing.session_uid,
                 missing_ids,
             )
-        else:
-            _log(
-                logger,
-                "Cozytrack session %s already ingested as %s",
-                cozytrack_session_id,
-                existing.session_uid,
-            )
-            client = client or CozytrackClient(config)
-            try:
-                cozytrack_session = client.get_session(cozytrack_session_id)
-            except CozytrackError as exc:
-                raise CozytrackIngestError(
-                    f"Could not load Cozytrack session {cozytrack_session_id} to "
-                    f"verify roles for {existing.session_uid}: {exc}"
-                ) from exc
-            _reconcile_existing_session_roles(
+            _heal_associated_session(
+                runtime_paths=runtime_paths,
                 db_file=db_file,
                 existing=existing,
                 cozytrack_session=cozytrack_session,
+                client=client,
                 logger=logger,
             )
-            return existing
+        _reconcile_existing_session_roles(
+            db_file=db_file,
+            existing=existing,
+            cozytrack_session=cozytrack_session,
+            logger=logger,
+        )
+        return existing
 
     client = client or CozytrackClient(config)
     session = client.get_session(cozytrack_session_id)
@@ -214,6 +226,63 @@ def ingest_session(
         record.session_uid,
     )
     return record
+
+
+def _heal_associated_session(
+    *,
+    runtime_paths: RuntimePaths,
+    db_file: str,
+    existing: SessionRecord,
+    cozytrack_session: CozytrackSession,
+    client: CozytrackClientProtocol,
+    logger: Optional[logging.Logger],
+) -> None:
+    """Re-download an associated session's tracks and heal missing source ids.
+
+    The association already names the session, so the join is content hash
+    against its stored artifacts — registration and fingerprints are never
+    involved (both depend on track naming, which changed across ingest
+    versions). Content that matches nothing leaves its ids missing and is
+    reported, not guessed at; the next run simply tries again.
+    """
+    folder = _build_staging_folder(
+        runtime_paths=runtime_paths,
+        session=cozytrack_session,
+        name_override=None,
+    )
+    folder.mkdir(parents=True, exist_ok=True)
+    try:
+        downloads = []
+        for index, track in enumerate(cozytrack_session.tracks, start=1):
+            destination = folder / f"Tr{index}.webm"
+            url = client.get_track_download_url(track.id)
+            client.download_to_file(url, destination)
+            downloads.append((destination, track.id))
+        healed = backfill_artifact_source_ids(
+            db_file,
+            session_uid=existing.session_uid,
+            source_ids_by_sha256=source_ids_by_content(downloads),
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    if healed:
+        _log(
+            logger,
+            "Backfilled Cozytrack source ids for %s raw tracks on %s",
+            healed,
+            existing.session_uid,
+        )
+    still_missing = _spoken_tracks_missing_source_ids(db_file, existing.session_uid)
+    if still_missing:
+        _log(
+            logger,
+            "Session %s still lacks source ids for %s track(s): stored audio "
+            "does not content-match the Cozytrack downloads; leaving them "
+            "unset",
+            existing.session_uid,
+            still_missing,
+        )
 
 
 def _spoken_tracks_missing_source_ids(db_file: str, session_uid: str) -> int:
