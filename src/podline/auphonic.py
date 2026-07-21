@@ -3,13 +3,17 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import json
 import logging
+import stat
 from pathlib import Path
+from pathlib import PurePosixPath
 import re
 import shutil
 import subprocess
+import tempfile
 from time import sleep
 from typing import Callable, Dict, Iterable, List, Optional, Protocol, Tuple
 from urllib.parse import quote, unquote, urlparse
+import zipfile
 
 import httpx
 
@@ -17,6 +21,7 @@ from podline.artifacts import (
     create_workspace,
     materialize_artifact_record,
     store_artifact_file,
+    store_artifact_files,
 )
 from podline.config import AppConfig
 from podline.cozytrack.client import (
@@ -34,6 +39,7 @@ from podline.models import (
 )
 from podline.repository import (
     complete_transcript_refresh,
+    delete_media_artifacts,
     discard_transcript_refresh_production,
     get_media_artifact,
     get_session,
@@ -62,6 +68,22 @@ class AuphonicOutputFile:
 class AuphonicProduction:
     production_id: str
     output_files: List[AuphonicOutputFile]
+
+
+@dataclass(frozen=True)
+class StemTrackBinding:
+    role: str
+    track_id: str
+    input_filename: str
+    offset_seconds: float
+
+
+@dataclass(frozen=True)
+class ExtractedStem:
+    role: str
+    track_id: str
+    offset_seconds: float
+    path: Path
 
 
 @dataclass(frozen=True)
@@ -878,7 +900,8 @@ def _persist_outputs(
     db_file: str,
     session_uid: str,
     production: AuphonicProduction,
-) -> Dict[str, MediaArtifactRecord]:
+    production_details: Optional[Dict] = None,
+) -> Dict[str, object]:
     staging_dir = Path(runtime_paths.staging_dir) / session_uid
     staging_dir.mkdir(parents=True, exist_ok=True)
 
@@ -924,7 +947,269 @@ def _persist_outputs(
     # names so a later re-download cannot write through the shared inode.
     staged_master.unlink()
     staged_transcript.unlink()
-    return {"master": master_artifact, "transcript": transcript_artifact}
+    result = {"master": master_artifact, "transcript": transcript_artifact}
+
+    tracks_output = next(
+        (
+            item
+            for item in production.output_files
+            if item.kind.lower() == "tracks" and item.extension.lower() == "flac.zip"
+        ),
+        None,
+    )
+    if tracks_output is not None:
+        details = production_details or inspect_production(
+            config, production.production_id, client=client
+        )
+        stems = _persist_stem_archive(
+            client=client,
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=db_file,
+            session_uid=session_uid,
+            production_id=production.production_id,
+            tracks_output=tracks_output,
+            multi_input_files=details.get("multi_input_files") or [],
+        )
+        result["stems"] = stems
+    else:
+        # The completed production is authoritative. Do not leave a stem set
+        # from an earlier reprocess current when Individual Tracks is absent.
+        delete_media_artifacts(
+            db_file,
+            session_uid=session_uid,
+            kind=ArtifactKind.PRE_EDIT_STEM.value,
+        )
+    return result
+
+
+def _persist_stem_archive(
+    *,
+    client: AuphonicClientProtocol,
+    config: AppConfig,
+    runtime_paths: RuntimePaths,
+    db_file: str,
+    session_uid: str,
+    production_id: str,
+    tracks_output: AuphonicOutputFile,
+    multi_input_files: List[Dict],
+) -> List[MediaArtifactRecord]:
+    staging_dir = Path(runtime_paths.staging_dir) / session_uid
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        prefix=f"{session_uid}_pre_edit_stems_",
+        suffix=".flac.zip",
+        dir=staging_dir,
+        delete=False,
+    ) as temporary_archive:
+        archive_path = Path(temporary_archive.name)
+    try:
+        client.download_file(tracks_output.download_url, archive_path)
+
+        bindings = _stem_track_bindings(
+            config=config,
+            db_file=db_file,
+            session_uid=session_uid,
+            multi_input_files=multi_input_files,
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="pre_edit_stems_", dir=staging_dir
+        ) as extraction_dir:
+            extracted = _extract_stem_archive(
+                archive_path=archive_path,
+                destination_dir=Path(extraction_dir),
+                bindings=bindings,
+            )
+            files = [
+                {
+                    "role": item.role,
+                    "source_path": item.path,
+                    "content_type": "audio/flac",
+                    "duration_seconds": probe_audio_duration_from_packets(item.path),
+                    "source_provider": "auphonic",
+                    "source_id": production_id,
+                }
+                for item in extracted
+            ]
+            return store_artifact_files(
+                config=config,
+                runtime_paths=runtime_paths,
+                db_file=db_file,
+                session_uid=session_uid,
+                kind=ArtifactKind.PRE_EDIT_STEM.value,
+                files=files,
+                expected_roles=[binding.role for binding in bindings],
+            )
+    finally:
+        archive_path.unlink(missing_ok=True)
+
+
+def _stem_track_bindings(
+    *,
+    config: AppConfig,
+    db_file: str,
+    session_uid: str,
+    multi_input_files: List[Dict],
+) -> List[StemTrackBinding]:
+    raw_tracks = sorted(
+        _spoken_raw_tracks(config, db_file, session_uid),
+        key=lambda artifact: _recorder_order_key(artifact.role),
+    )
+    prepared_tracks = [
+        item
+        for item in multi_input_files
+        if str(item.get("type") or "").lower() == "multitrack"
+        and item.get("input_file")
+    ]
+    if len(prepared_tracks) != len(raw_tracks):
+        raise AuphonicError(
+            "Auphonic prepared track count does not match the session's exact roles"
+        )
+
+    bindings = []
+    matched_ids = set()
+    for artifact in raw_tracks:
+        track = _find_multi_input_track_for_asset(prepared_tracks, artifact)
+        track_id = str(track.get("id") or "").strip()
+        if not track_id:
+            raise AuphonicError(
+                f"Auphonic track for role {artifact.role} has no stable id"
+            )
+        normalized_id = _normalize_stem_token(track_id)
+        if not normalized_id or normalized_id in matched_ids:
+            raise AuphonicError("Auphonic prepared tracks contain duplicate ids")
+        matched_ids.add(normalized_id)
+        try:
+            offset_seconds = float(track.get("offset") or 0)
+        except (TypeError, ValueError) as exc:
+            raise AuphonicError(
+                f"Auphonic track {track_id} has an invalid offset"
+            ) from exc
+        if offset_seconds < 0:
+            raise AuphonicError(
+                f"Auphonic track {track_id} has a negative offset"
+            )
+        bindings.append(
+            StemTrackBinding(
+                role=artifact.role,
+                track_id=track_id,
+                input_filename=artifact.filename,
+                offset_seconds=offset_seconds,
+            )
+        )
+    return bindings
+
+
+def _extract_stem_archive(
+    *,
+    archive_path: Path,
+    destination_dir: Path,
+    bindings: List[StemTrackBinding],
+) -> List[ExtractedStem]:
+    """Validate the whole ZIP before extracting any Auphonic stem."""
+    expected_by_token = {}
+    for binding in bindings:
+        tokens = {
+            _normalize_stem_token(binding.track_id),
+            _normalize_stem_token(binding.role),
+            _normalize_stem_token(Path(binding.input_filename).stem),
+        }
+        for token in {token for token in tokens if token}:
+            expected_by_token.setdefault(token, []).append(binding)
+
+    try:
+        archive = zipfile.ZipFile(archive_path)
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise AuphonicError(f"Auphonic tracks archive is not a valid ZIP: {exc}") from exc
+
+    with archive:
+        members = archive.infolist()
+        seen_names = set()
+        mapped = {}
+        for member in members:
+            raw_name = member.filename
+            normalized_path = raw_name.replace("\\", "/")
+            pure_path = PurePosixPath(normalized_path)
+            mode = member.external_attr >> 16
+            unsafe = (
+                not raw_name
+                or pure_path.is_absolute()
+                or bool(re.match(r"^[A-Za-z]:", normalized_path))
+                or ".." in pure_path.parts
+                or stat.S_ISLNK(mode)
+                or bool(member.flag_bits & 0x1)
+            )
+            if unsafe:
+                raise AuphonicError(
+                    f"Auphonic tracks archive contains unsafe entry: {raw_name!r}"
+                )
+            normalized_name = normalized_path.casefold()
+            if normalized_name in seen_names:
+                raise AuphonicError(
+                    f"Auphonic tracks archive contains duplicate entry: {raw_name!r}"
+                )
+            seen_names.add(normalized_name)
+            if member.is_dir() or pure_path.suffix.lower() != ".flac":
+                raise AuphonicError(
+                    f"Auphonic tracks archive contains non-FLAC entry: {raw_name!r}"
+                )
+            token = _normalize_stem_token(pure_path.stem)
+            candidates = expected_by_token.get(token, [])
+            if len(candidates) != 1:
+                raise AuphonicError(
+                    f"Auphonic tracks archive contains extra or unmapped entry: {raw_name!r}"
+                )
+            binding = candidates[0]
+            if binding.role in mapped:
+                raise AuphonicError(
+                    f"Auphonic tracks archive contains duplicate stem for role {binding.role}"
+                )
+            mapped[binding.role] = member
+
+        expected_roles = {binding.role for binding in bindings}
+        actual_roles = set(mapped)
+        if actual_roles != expected_roles:
+            raise AuphonicError(
+                "Auphonic tracks archive is missing expected roles: "
+                f"{sorted(expected_roles - actual_roles)}"
+            )
+
+        filenames = {}
+        for binding in bindings:
+            filename = _safe_stem_filename(binding.track_id)
+            folded = filename.casefold()
+            if folded in filenames:
+                raise AuphonicError(
+                    "Auphonic track ids resolve to duplicate stem filenames"
+                )
+            filenames[folded] = filename
+
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        extracted = []
+        for binding in bindings:
+            target = destination_dir / _safe_stem_filename(binding.track_id)
+            with archive.open(mapped[binding.role]) as source, target.open("wb") as output:
+                shutil.copyfileobj(source, output)
+            extracted.append(
+                ExtractedStem(
+                    role=binding.role,
+                    track_id=binding.track_id,
+                    offset_seconds=binding.offset_seconds,
+                    path=target,
+                )
+            )
+    return extracted
+
+
+def _normalize_stem_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value).casefold())
+
+
+def _safe_stem_filename(track_id: str) -> str:
+    basename = re.sub(r"[^A-Za-z0-9 _.-]+", "-", track_id).strip(" .")
+    if not basename:
+        raise AuphonicError("Auphonic track id cannot form a safe stem filename")
+    return f"{basename}.flac"
 
 
 def _persist_transcript_output(
@@ -1110,6 +1395,53 @@ def inspect_production(
         "warning_message": data_node.get("warning_message") or "",
         "multi_input_files": data_node.get("multi_input_files") or [],
         "output_files": data_node.get("output_files") or [],
+    }
+
+
+def resolve_stem_workspace_metadata(
+    *,
+    config: AppConfig,
+    db_file: str,
+    session: SessionRecord,
+    client: Optional[AuphonicClientProtocol] = None,
+) -> Dict[str, Dict[str, object]]:
+    """Resolve persisted stem roles to the completed Auphonic track state."""
+    if not session.auphonic_production_id:
+        raise AuphonicError(
+            f"Session {session.session_uid} has no stored Auphonic production id"
+        )
+    stems = list_media_artifacts(
+        db_file, session.session_uid, kind=ArtifactKind.PRE_EDIT_STEM.value
+    )
+    if not stems:
+        raise AuphonicError(
+            f"Session {session.session_uid} has no persisted Auphonic stems"
+        )
+    client = client or AuphonicClient(config)
+    details = inspect_production(
+        config, session.auphonic_production_id, client=client
+    )
+    bindings = _stem_track_bindings(
+        config=config,
+        db_file=db_file,
+        session_uid=session.session_uid,
+        multi_input_files=details.get("multi_input_files") or [],
+    )
+    persisted_roles = {stem.role for stem in stems}
+    binding_roles = {binding.role for binding in bindings}
+    if persisted_roles != binding_roles:
+        raise AuphonicError(
+            "Persisted Auphonic stem roles do not match the completed production; "
+            f"missing={sorted(binding_roles - persisted_roles) or 'none'} "
+            f"extra={sorted(persisted_roles - binding_roles) or 'none'}"
+        )
+    return {
+        binding.role: {
+            "track_id": binding.track_id,
+            "input_filename": binding.input_filename,
+            "offset_seconds": binding.offset_seconds,
+        }
+        for binding in bindings
     }
 
 
@@ -1493,6 +1825,7 @@ def reconcile_production_to_session(
             db_file=db_file,
             session_uid=session.session_uid,
             production=production,
+            production_details=details,
         )
         workspace = create_workspace(
             config=config,

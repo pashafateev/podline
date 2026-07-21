@@ -696,6 +696,58 @@ def register_media_artifact(
     return record
 
 
+def replace_media_artifact_set(
+    db_file: str,
+    *,
+    session_uid: str,
+    kind: str,
+    artifacts: List[dict],
+    timestamp: str,
+) -> List[MediaArtifactRecord]:
+    """Atomically replace every current role for one artifact kind.
+
+    Callers upload and verify the complete set before entering this function.
+    The transaction then removes obsolete roles and upserts the new set as one
+    unit, so readers never observe a partial stem set.
+    """
+    if not artifacts:
+        raise ValueError("Artifact set must not be empty")
+    roles = [str(artifact.get("role") or "") for artifact in artifacts]
+    if any(not role for role in roles):
+        raise ValueError("Every artifact in a role-keyed set must have a role")
+    if len(set(roles)) != len(roles):
+        raise ValueError("Artifact set contains duplicate roles")
+
+    placeholders = ", ".join("?" for _role in roles)
+    with connect(db_file) as connection:
+        connection.execute(
+            f"DELETE FROM media_artifacts WHERE session_uid = ? AND kind = ? "
+            f"AND role NOT IN ({placeholders})",
+            [session_uid, kind, *roles],
+        )
+        for artifact in artifacts:
+            _insert_media_artifact(
+                connection,
+                session_uid=session_uid,
+                kind=kind,
+                timestamp=timestamp,
+                **artifact,
+            )
+        connection.commit()
+
+    return list_media_artifacts(db_file, session_uid, kind=kind)
+
+
+def delete_media_artifacts(db_file: str, *, session_uid: str, kind: str) -> None:
+    """Remove the current rows for an optional artifact kind."""
+    with connect(db_file) as connection:
+        connection.execute(
+            "DELETE FROM media_artifacts WHERE session_uid = ? AND kind = ?",
+            (session_uid, kind),
+        )
+        connection.commit()
+
+
 def create_session_with_artifacts(
     db_file: str,
     *,

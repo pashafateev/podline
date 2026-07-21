@@ -19,6 +19,7 @@ class SessionStatus(str, Enum):
 class ArtifactKind(str, Enum):
     RAW_TRACK = "raw_track"
     PRE_EDIT_MASTER = "pre_edit_master"
+    PRE_EDIT_STEM = "pre_edit_stem"
     TRANSCRIPT = "transcript"
     FINAL_MASTER = "final_master"
 

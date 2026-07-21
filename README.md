@@ -10,7 +10,7 @@ Current scope
 - Core inspection commands: `pod init`, `pod health`, `pod list`, `pod status`, `pod cache-clear`.
 - Ingest commands: `pod ct-list`, `pod ct-ingest` (Cozytrack) and `pod import <folder>` (Riverside/local). `pod scan` and `pod refresh` are retired — they registered drive-path sessions the S3 pipeline cannot process.
 - Auphonic commands: `pod auphonic-prepare`, `pod auphonic-preview`, `pod auphonic-offset`, `pod auphonic-start`, `pod auphonic-reset`, `pod auphonic-inspect`, `pod auphonic-sync`. Productions read audio directly from S3 through the Auphonic external service — there are no local uploads. `auphonic-reset` abandons a prepared/previewed production and requeues the session for a fresh prepare (e.g. after a role reconciliation).
-- Editing and post-edit commands: `pod workspace`, `pod finalize`, `pod transcript-refresh`, `pod episode-meta`, `pod podbean-draft`.
+- Editing and post-edit commands: `pod workspace` (optional `--stems` repair workspace), `pod finalize`, `pod transcript-refresh`, `pod episode-meta`, `pod podbean-draft`.
 - The external drive is no longer required for the pipeline; it remains readable history for pre-S3 sessions. File-touching commands on those old sessions fail with a clear "no artifacts registered" error.
 - `recorded_at` is best-effort metadata. The recorder date is not always reliable, so this value may reflect filesystem timing rather than a true recording timestamp.
 - Silent extra spoken tracks are ignored during classification, so sessions with empty `Tr3`/`Tr4` files can still classify correctly as 2-speaker sessions.
@@ -102,6 +102,42 @@ pod status @1
 ```
 
 The pre-edit master and transcript are persisted to S3 and a workspace is created automatically at `~/podline/workspaces/<session_uid>/` with both files. `pod workspace @1` recreates or refreshes it at any time.
+
+Optional repair branch after reviewing the Auphonic master
+
+Normal episodes continue directly to the master edit. If an episode needs microphone-level repair, enable **Individual Tracks / FLAC** on the existing Auphonic production, reprocess it, then run:
+
+```bash
+pod auphonic-sync --session @1
+pod workspace @1 --stems
+```
+
+The second command keeps the session in `waiting_for_finalize` and creates:
+
+```text
+~/podline/workspaces/<session_uid>/
+├── <pre-edit-master>.mp3
+├── <transcript>.vtt
+├── stems/
+│   ├── Jonathan.flac
+│   └── Pasha.flac
+└── repair-manifest.json
+```
+
+The stem ZIP is optional. When present, Podline safely validates it, maps every FLAC to the exact prepared Auphonic track and persisted speaker role, and stores one immutable `pre_edit_stem` artifact per role without replacing any `raw_track`. Missing, extra, duplicate, non-FLAC, symlink, absolute-path, and path-traversal entries are rejected before extraction.
+
+`repair-manifest.json` records the role, workspace and source checksums, Auphonic production and track IDs, configured offset, any offset Podline applied, and the loudness status. If the exported durations show that Auphonic already rendered the offsets, Podline copies the stems unchanged; otherwise it applies the production offsets while constructing the workspace. Re-running `pod workspace @1 --stems` refreshes Podline-managed master, transcript, stem, and manifest files but preserves Cubase projects, exported masters, and other user-created files.
+
+> Auphonic individual tracks are processed but are **not loudness-normalized**. Run a final loudness and true-peak check on the repaired Cubase mix before `pod finalize`.
+
+After repairing and mixing the stems in Cubase, rejoin the normal flow:
+
+```bash
+pod finalize @1 --master <export>
+pod transcript-refresh @1
+pod episode-meta @1
+pod podbean-draft @1
+```
 
 4. Edit in Cubase from the workspace, export the final master, then attach it
 ```bash
