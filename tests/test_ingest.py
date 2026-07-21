@@ -11,7 +11,7 @@ from podline.repository import (
     list_media_artifacts,
     list_sessions,
 )
-from podline.storage import parse_s3_uri
+from podline.storage import MediaStorage, StorageError, parse_s3_uri
 
 
 def _make_session_folder(tmp_path: Path, name: str = "010124_013143") -> Path:
@@ -61,6 +61,39 @@ def test_import_local_folder_registers_session_and_artifacts(
         assert len(stored) == artifact.byte_size
         cached = cache_path_for(runtime_paths, artifact.sha256, artifact.filename)
         assert cached.exists()
+
+
+def test_import_registers_nothing_until_every_track_upload_succeeds(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path, monkeypatch
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    folder = _make_session_folder(tmp_path)
+    storage = MediaStorage(config.storage)
+    original_upload = storage.upload_file
+    attempts = []
+
+    def _fail_second_upload(**kwargs):
+        attempts.append(kwargs["key"])
+        if len(attempts) == 2:
+            raise StorageError("simulated exhausted transient upload")
+        return original_upload(**kwargs)
+
+    monkeypatch.setattr(storage, "upload_file", _fail_second_upload)
+
+    with pytest.raises(IngestError, match="simulated exhausted transient upload"):
+        import_local_folder(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            folder=folder,
+            storage=storage,
+            duration_probe=_fixed_probe,
+        )
+
+    assert len(attempts) == 2
+    assert count_sessions(runtime_paths.db_file) == 0
+    assert list_sessions(runtime_paths.db_file) == []
 
 
 def test_import_local_folder_is_idempotent_for_same_content(

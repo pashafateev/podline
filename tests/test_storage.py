@@ -48,9 +48,15 @@ def _wrapped_upload_error(*, code: str, status: int) -> S3UploadFailedError:
         },
         "UploadPart",
     )
-    wrapped = S3UploadFailedError(f"multipart transfer failed: {client_error}")
-    wrapped.__cause__ = client_error
-    return wrapped
+    try:
+        raise client_error
+    except ClientError:
+        try:
+            # boto3 wraps transfer ClientErrors this way, retaining the
+            # structured failure only as the implicit exception context.
+            raise S3UploadFailedError(f"multipart transfer failed: {client_error}")
+        except S3UploadFailedError as wrapped:
+            return wrapped
 
 
 def test_build_session_key_shapes_content_addressed_paths() -> None:
@@ -229,7 +235,7 @@ def test_upload_file_refuses_same_size_object_with_different_content(
 
 @mock_aws
 def test_upload_file_retries_connection_closed_then_succeeds(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, caplog
 ) -> None:
     storage = _make_storage()
     source = tmp_path / "track.webm"
@@ -247,6 +253,7 @@ def test_upload_file_retries_connection_closed_then_succeeds(
 
     monkeypatch.setattr(storage._client, "upload_file", _flaky_upload)
     monkeypatch.setattr("time.sleep", delays.append)
+    caplog.set_level(logging.WARNING, logger="podline")
 
     uri = storage.upload_file(
         local_path=source,
@@ -258,6 +265,9 @@ def test_upload_file_retries_connection_closed_then_succeeds(
     assert uri == f"s3://{BUCKET}/{key}"
     assert len(attempts) == 2
     assert len(delays) == 1
+    assert key in caplog.text
+    assert "attempt 1/3" in caplog.text
+    assert "retrying the full transfer in" in caplog.text
 
 
 @mock_aws

@@ -28,6 +28,7 @@ Project layout
 S3 media storage
 - A private Podline S3 bucket is the authoritative store for session media; `src/podline/storage.py` and `src/podline/artifacts.py` hold the storage layer (content-addressed keys `sessions/{session_uid}/{kind}/{sha256}/{filename}`, checksum-verified downloads, replace-in-place `media_artifacts` rows).
 - Configure it under `storage.*` in `config.local.yaml` (`enabled`, `bucket`, `region`, optional `key_prefix`, optional `profile` for a dedicated AWS credentials profile). Setting `enabled: false` pauses new ingests without affecting anything else.
+- Transient S3 upload failures retry automatically as complete transfers. Podline verifies content-addressed size and checksum after ambiguous failures, so final failures remain safe to rerun.
 - Auphonic reads S3 audio through an Amazon S3 external service registered in the Auphonic account (read-only IAM user); set its UUID as `auphonic.s3_service_id`. `scripts/setup_iam_users.sh` provisions the IAM users.
 - `pod health` reports storage access and cache usage; `pod cache-clear` empties the local cache (entries re-download on demand). Workspaces under `~/podline/workspaces/` are never touched by cache clearing; retire them with `pod workspace-clean` once episodes are out (dry run by default, `--apply` deletes workspaces of `draft_created` sessions untouched for 14+ days, `--older-than-days` to tune).
 
