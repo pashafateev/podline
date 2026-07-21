@@ -528,11 +528,16 @@ def set_cozytrack_session_id(
     cozytrack_session_id: str,
     status: str,
     timestamp: str,
+    source_ids_by_sha256: Optional[Dict[str, str]] = None,
 ) -> bool:
     """Associate a Cozytrack session with an existing unassociated session.
 
     Guarded so an already-associated session is never rewritten; returns
-    False in that case.
+    False in that case. When source_ids_by_sha256 is given, the raw-track
+    source ids are persisted in the same transaction as the association —
+    an interrupted run must never leave an associated session without its
+    source ids, because later ingests skip downloading and would have
+    nothing left to join on.
     """
     with connect(db_file) as connection:
         cursor = connection.execute(
@@ -545,18 +550,30 @@ def set_cozytrack_session_id(
         )
         if cursor.rowcount != 1:
             return False
+        backfilled = 0
+        kind = ArtifactKind.RAW_TRACK.value
+        for sha256, source_id in sorted((source_ids_by_sha256 or {}).items()):
+            id_cursor = connection.execute(
+                """
+                UPDATE media_artifacts
+                SET source_id = ?, updated_at = ?
+                WHERE session_uid = ? AND kind = ? AND sha256 = ?
+                  AND (source_id IS NULL OR source_id = '')
+                """,
+                (source_id, timestamp, session_uid, kind, sha256),
+            )
+            backfilled += id_cursor.rowcount
+        detail = (
+            f"associated Cozytrack session {cozytrack_session_id} with existing content"
+        )
+        if backfilled:
+            detail += f"; backfilled source ids for {backfilled} raw tracks"
         connection.execute(
             """
             INSERT INTO events (session_uid, from_state, to_state, timestamp, detail)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (
-                session_uid,
-                status,
-                status,
-                timestamp,
-                f"associated Cozytrack session {cozytrack_session_id} with existing content",
-            ),
+            (session_uid, status, status, timestamp, detail),
         )
         connection.commit()
     return True

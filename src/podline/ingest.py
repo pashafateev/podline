@@ -25,6 +25,7 @@ from podline.models import (
     UnsupportedSession,
 )
 from podline.repository import (
+    backfill_artifact_source_ids,
     create_session_with_artifacts,
     get_session_by_fingerprint,
     set_cozytrack_session_id,
@@ -45,6 +46,32 @@ def _default_duration_probe(path: Path) -> float:
     from podline.auphonic import probe_audio_duration_from_packets
 
     return probe_audio_duration_from_packets(path)
+
+
+def source_ids_by_content(
+    candidate: ScanCandidate, track_source_ids: Dict[str, str]
+) -> Dict[str, str]:
+    """Map a candidate's track content hashes to provider source ids.
+
+    Pairing by content instead of filename keeps the join correct when the
+    stored artifacts were named differently than the staged downloads.
+    Tracks with byte-identical content cannot be told apart and are skipped
+    rather than guessed at.
+    """
+    by_sha: Dict[str, str] = {}
+    duplicates = set()
+    for track in candidate.spoken_tracks:
+        source_id = track_source_ids.get(track.path.name)
+        if not source_id:
+            continue
+        sha256 = sha256_of_file(track.path)
+        if sha256 in by_sha:
+            duplicates.add(sha256)
+            continue
+        by_sha[sha256] = source_id
+    for sha256 in duplicates:
+        by_sha.pop(sha256, None)
+    return by_sha
 
 
 def register_candidate_with_storage(
@@ -78,12 +105,18 @@ def register_candidate_with_storage(
             # Same content was registered without a Cozytrack association
             # (e.g. via pod import). Backfill it so ct-list stops offering
             # the session and re-ingest short-circuits before downloading.
+            # The source ids ride in the same transaction: once the
+            # association is visible, retries stop downloading, so this is
+            # the only moment the ids can be joined from files on disk.
             set_cozytrack_session_id(
                 db_file,
                 session_uid=existing.session_uid,
                 cozytrack_session_id=cozytrack_session_id,
                 status=existing.status,
                 timestamp=datetime.now(timezone.utc).isoformat(),
+                source_ids_by_sha256=source_ids_by_content(
+                    candidate, track_source_ids or {}
+                ),
             )
             _log(
                 logger,
@@ -103,6 +136,24 @@ def register_candidate_with_storage(
                 f"from Cozytrack session {existing.cozytrack_session_id}; "
                 f"refusing to also associate it with {cozytrack_session_id}"
             )
+        if cozytrack_session_id and track_source_ids:
+            # Re-ingest of an already-associated session: heal source ids a
+            # previous interrupted or pre-migration run failed to persist.
+            healed = backfill_artifact_source_ids(
+                db_file,
+                session_uid=existing.session_uid,
+                source_ids_by_sha256=source_ids_by_content(
+                    candidate, track_source_ids
+                ),
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            )
+            if healed:
+                _log(
+                    logger,
+                    "Backfilled Cozytrack source ids for %s raw tracks on %s",
+                    healed,
+                    existing.session_uid,
+                )
         _log(
             logger,
             "Session content already registered as %s; skipping",

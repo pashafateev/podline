@@ -645,6 +645,93 @@ def test_deduplicated_ingest_backfills_source_ids_and_roles(
     assert _reconcile_event_count(runtime_paths.db_file, record.session_uid) == 1
 
 
+def test_reingest_resumes_interrupted_source_id_migration(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    """A session associated with Cozytrack but left without source ids (an
+    interrupted or pre-migration run) must not be stranded behind the
+    idempotent return: re-running ct-ingest re-downloads, joins the ids by
+    content, and reconciles roles — converging on the healed state."""
+    from podline.ingest import import_local_folder
+    from podline.repository import set_cozytrack_session_id
+
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+
+    tr1_bytes = b"webm-host-channel-data" * 32
+    tr2_bytes = b"webm-remote-guest-data" * 32
+    import_dir = tmp_path / "riverside" / "2026-07-18_interrupted"
+    import_dir.mkdir(parents=True)
+    (import_dir / "Tr1.webm").write_bytes(tr1_bytes)
+    (import_dir / "Tr2.webm").write_bytes(tr2_bytes)
+    imported, _created = import_local_folder(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        folder=import_dir,
+        duration_probe=_probe,
+    )
+
+    # The stuck state the old code (or a crash before the atomic backfill
+    # existed) leaves behind: association persisted, source ids never were.
+    assert set_cozytrack_session_id(
+        runtime_paths.db_file,
+        session_uid=imported.session_uid,
+        cozytrack_session_id="sess-interrupted",
+        status=imported.status,
+        timestamp="2026-07-18T00:00:00+00:00",
+    )
+    artifacts = list_media_artifacts(runtime_paths.db_file, imported.session_uid)
+    assert [(a.role, a.source_id) for a in artifacts] == [
+        ("host1", None),
+        ("host2", None),
+    ]
+
+    fake = FakeCozytrackClient(
+        sessions=[
+            _make_identified_session(
+                session_id="sess-interrupted",
+                tracks=[
+                    ("ct-host", "host", "Host"),
+                    ("ct-guest", "guest_x", "X"),
+                ],
+            )
+        ],
+        downloads={"ct-host": tr1_bytes, "ct-guest": tr2_bytes},
+    )
+
+    record = ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-interrupted",
+        client=fake,
+        duration_probe=_probe,
+    )
+
+    assert record.session_uid == imported.session_uid
+    assert fake.requested_track_ids == ["ct-host", "ct-guest"]
+    artifacts = list_media_artifacts(runtime_paths.db_file, record.session_uid)
+    assert [(a.role, a.filename, a.source_id) for a in artifacts] == [
+        ("guest1", "Tr2.webm", "ct-guest"),
+        ("host1", "Tr1.webm", "ct-host"),
+    ]
+    assert _reconcile_event_count(runtime_paths.db_file, record.session_uid) == 1
+
+    # Healed: the next run takes the cheap idempotent path again.
+    downloads_after_heal = len(fake.requested_track_ids)
+    ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-interrupted",
+        client=fake,
+        duration_probe=_probe,
+    )
+    assert len(fake.requested_track_ids) == downloads_after_heal
+    assert _reconcile_event_count(runtime_paths.db_file, record.session_uid) == 1
+
+
 def test_ingest_session_is_idempotent(
     moto_s3, app_config_factory, runtime_factory, tmp_path: Path
 ) -> None:

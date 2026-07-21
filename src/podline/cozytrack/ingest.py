@@ -19,13 +19,12 @@ from podline.cozytrack.client import (
 from podline.ingest import DurationProbe, register_candidate_with_storage
 from podline.models import RuntimePaths, ScanCandidate, SessionRecord, UnsupportedSession
 from podline.repository import (
-    backfill_artifact_source_ids,
     get_session_by_cozytrack_id,
     list_media_artifacts,
     reconcile_artifact_roles,
 )
 from podline.scanner import _parse_session_dir
-from podline.storage import MediaStorage, sha256_of_file
+from podline.storage import MediaStorage
 
 
 class CozytrackIngestError(RuntimeError):
@@ -70,27 +69,44 @@ def ingest_session(
     """
     existing = get_session_by_cozytrack_id(db_file, cozytrack_session_id)
     if existing is not None:
-        _log(
-            logger,
-            "Cozytrack session %s already ingested as %s",
-            cozytrack_session_id,
-            existing.session_uid,
-        )
-        client = client or CozytrackClient(config)
-        try:
-            cozytrack_session = client.get_session(cozytrack_session_id)
-        except CozytrackError as exc:
-            raise CozytrackIngestError(
-                f"Could not load Cozytrack session {cozytrack_session_id} to "
-                f"verify roles for {existing.session_uid}: {exc}"
-            ) from exc
-        _reconcile_existing_session_roles(
-            db_file=db_file,
-            existing=existing,
-            cozytrack_session=cozytrack_session,
-            logger=logger,
-        )
-        return existing
+        missing_ids = _spoken_tracks_missing_source_ids(db_file, existing.session_uid)
+        if missing_ids:
+            # A previous run associated the session but never persisted the
+            # track source ids (interrupted migration or pre-migration
+            # code). Without them nothing can be reconciled from the DB
+            # alone, so fall through to the full download flow: register's
+            # dedup branch re-joins ids by content hash and roles reconcile
+            # after. Each retry converges toward the healed state.
+            _log(
+                logger,
+                "Cozytrack session %s already ingested as %s but %s track(s) "
+                "lack source ids; re-downloading to resume the migration",
+                cozytrack_session_id,
+                existing.session_uid,
+                missing_ids,
+            )
+        else:
+            _log(
+                logger,
+                "Cozytrack session %s already ingested as %s",
+                cozytrack_session_id,
+                existing.session_uid,
+            )
+            client = client or CozytrackClient(config)
+            try:
+                cozytrack_session = client.get_session(cozytrack_session_id)
+            except CozytrackError as exc:
+                raise CozytrackIngestError(
+                    f"Could not load Cozytrack session {cozytrack_session_id} to "
+                    f"verify roles for {existing.session_uid}: {exc}"
+                ) from exc
+            _reconcile_existing_session_roles(
+                db_file=db_file,
+                existing=existing,
+                cozytrack_session=cozytrack_session,
+                logger=logger,
+            )
+            return existing
 
     client = client or CozytrackClient(config)
     session = client.get_session(cozytrack_session_id)
@@ -172,27 +188,9 @@ def ingest_session(
             logger=logger,
         )
         if not created:
-            # Same content already registered (e.g. pod import backfilled
-            # with this Cozytrack id). Its artifacts carry no Cozytrack
-            # source ids, and both role reconciliation and multitrack
-            # offset topology join on them — persist the ids first,
-            # pairing staging downloads with stored artifacts by content
-            # hash so either side's file naming is irrelevant.
-            backfilled = backfill_artifact_source_ids(
-                db_file,
-                session_uid=record.session_uid,
-                source_ids_by_sha256=_source_ids_by_content(
-                    parsed, track_source_ids
-                ),
-                timestamp=datetime.now(timezone.utc).isoformat(),
-            )
-            if backfilled:
-                _log(
-                    logger,
-                    "Backfilled Cozytrack source ids for %s raw tracks on %s",
-                    backfilled,
-                    record.session_uid,
-                )
+            # Same content already registered (a pod import that register
+            # just associated and backfilled source ids for, or a resumed
+            # migration). With ids in place the roles can reconcile.
             _reconcile_existing_session_roles(
                 db_file=db_file,
                 existing=record,
@@ -218,28 +216,13 @@ def ingest_session(
     return record
 
 
-def _source_ids_by_content(
-    candidate: ScanCandidate, track_source_ids: Dict[str, str]
-) -> Dict[str, str]:
-    """Map staging track content hashes to Cozytrack track ids.
-
-    Tracks with byte-identical content cannot be told apart and are
-    skipped rather than guessed at.
-    """
-    by_sha: Dict[str, str] = {}
-    duplicates = set()
-    for track in candidate.spoken_tracks:
-        source_id = track_source_ids.get(track.path.name)
-        if not source_id:
-            continue
-        sha256 = sha256_of_file(track.path)
-        if sha256 in by_sha:
-            duplicates.add(sha256)
-            continue
-        by_sha[sha256] = source_id
-    for sha256 in duplicates:
-        by_sha.pop(sha256, None)
-    return by_sha
+def _spoken_tracks_missing_source_ids(db_file: str, session_uid: str) -> int:
+    """Count spoken raw tracks whose Cozytrack source id was never persisted."""
+    return sum(
+        1
+        for artifact in list_media_artifacts(db_file, session_uid, kind="raw_track")
+        if artifact.role != "mix" and not (artifact.source_id or "").strip()
+    )
 
 
 def _reconcile_existing_session_roles(
