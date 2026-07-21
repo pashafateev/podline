@@ -794,36 +794,40 @@ def test_session_offset_keeps_two_local_tracks_at_zero_and_targets_remote(
         artifact_registrar,
         tracks=[
             ("host1", "Tr1.webm", 4529.511, "host-local-ch-1"),
-            ("host2", "Tr2.webm", 4528.060, "host-local-ch-2"),
-            ("guest1", "Tr3.webm", 4526.871, "guest-laura"),
+            ("host2", "Tr2.webm", 4528.060, "guest-j"),
+            ("guest1", "Tr3.webm", 4526.871, "host-local-ch-2"),
         ],
     )
     client = FakeOffsetAuphonicClient(
         tracks=[
             {"id": "Local 1", "type": "multitrack", "input_file": "Tr1.webm"},
-            {"id": "Local 2", "type": "multitrack", "input_file": "Tr2.webm"},
-            {"id": "Laura", "type": "multitrack", "input_file": "Tr3.webm"},
+            {"id": "J", "type": "multitrack", "input_file": "Tr2.webm"},
+            {"id": "Local 2", "type": "multitrack", "input_file": "Tr3.webm"},
         ]
     )
 
-    plan = plan_session_auphonic_offset(
+    result = offset_session_auphonic_production(
         config=config,
         runtime_paths=runtime_paths,
         db_file=runtime_paths.db_file,
         session=session,
+        apply=True,
         client=client,
         cozytrack_client=cozytrack_client,
     )
+    plan = result.plan
 
     assert cozytrack_client.requested_session_ids == ["ct-session-1"]
     assert [asset.filename for asset in plan.reference_assets] == [
         "Tr1.webm",
-        "Tr2.webm",
+        "Tr3.webm",
     ]
     assert plan.reference_asset.filename == "Tr1.webm"
-    assert [target.asset.filename for target in plan.targets] == ["Tr3.webm"]
-    assert plan.targets[0].track_id == "Laura"
-    assert plan.targets[0].offset_seconds == pytest.approx(2.640)
+    assert [target.asset.filename for target in plan.targets] == ["Tr2.webm"]
+    assert plan.targets[0].track_id == "J"
+    assert plan.targets[0].offset_seconds == pytest.approx(1.451)
+    assert client.offset_updates == [("prod-123", "J", pytest.approx(1.451))]
+    assert [track["id"] for track in result.track_states] == ["J"]
 
 
 def test_session_offset_targets_each_remote_against_one_local_reference(
@@ -850,14 +854,16 @@ def test_session_offset_targets_each_remote_against_one_local_reference(
         ]
     )
 
-    plan = plan_session_auphonic_offset(
+    result = offset_session_auphonic_production(
         config=config,
         runtime_paths=runtime_paths,
         db_file=runtime_paths.db_file,
         session=session,
+        apply=True,
         client=client,
         cozytrack_client=cozytrack_client,
     )
+    plan = result.plan
 
     assert [target.asset.filename for target in plan.targets] == [
         "Tr2.webm",
@@ -866,6 +872,10 @@ def test_session_offset_targets_each_remote_against_one_local_reference(
     assert [target.offset_seconds for target in plan.targets] == pytest.approx(
         [1.5, 2.75]
     )
+    assert client.offset_updates == [
+        ("prod-123", "Alice", pytest.approx(1.5)),
+        ("prod-123", "Bob", pytest.approx(2.75)),
+    ]
 
 
 def test_session_offset_plan_uses_stored_durations(
@@ -890,10 +900,10 @@ def test_session_offset_plan_uses_stored_durations(
         duration_probe=exploding_probe,
     )
 
-    assert plan.target_asset.filename == "Tr2.webm"
-    assert plan.longer_asset.filename == "Tr1.webm"
-    assert plan.target_track_id == "Pasha"
-    assert plan.offset_seconds == pytest.approx(1.801)
+    assert plan.targets[0].asset.filename == "Tr2.webm"
+    assert plan.reference_asset.filename == "Tr1.webm"
+    assert plan.targets[0].track_id == "Pasha"
+    assert plan.targets[0].offset_seconds == pytest.approx(1.801)
 
 
 def test_session_offset_probes_and_persists_missing_durations(
@@ -925,7 +935,7 @@ def test_session_offset_probes_and_persists_missing_durations(
     )
 
     assert sorted(probed) == ["Tr1.webm", "Tr2.webm"]
-    assert plan.offset_seconds == pytest.approx(1.801)
+    assert plan.targets[0].offset_seconds == pytest.approx(1.801)
     persisted = get_media_artifact(
         runtime_paths.db_file, session.session_uid, kind="raw_track", role="host1"
     )
@@ -953,7 +963,7 @@ def test_session_offset_dry_run_does_not_update_auphonic(
     )
 
     assert result.applied is False
-    assert result.track_state is None
+    assert result.track_states == []
     assert client.offset_updates == []
 
 
@@ -978,9 +988,8 @@ def test_session_offset_apply_updates_matched_track_id(
 
     assert result.applied is True
     assert client.offset_updates == [("prod-123", "Pasha", pytest.approx(1.801))]
-    assert result.track_state is not None
-    assert result.track_state["id"] == "Pasha"
-    assert result.track_state["offset"] == pytest.approx(1.801)
+    assert result.track_states[0]["id"] == "Pasha"
+    assert result.track_states[0]["offset"] == pytest.approx(1.801)
 
 
 def test_session_offset_fails_when_production_is_not_change_allowed(

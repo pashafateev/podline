@@ -115,6 +115,7 @@ def test_client_list_ready_sessions_uses_api_key_header(
                         {
                             "id": "tr-1",
                             "participantName": "Pasha",
+                            "participantId": "host-local-ch-1",
                             "status": "complete",
                             "createdAt": "2026-04-24T12:00:01Z",
                         }
@@ -138,6 +139,7 @@ def test_client_list_ready_sessions_uses_api_key_header(
     assert sessions[0].id == "sess-1"
     assert sessions[0].finalized_at == "2026-04-24T12:00:00Z"
     assert sessions[0].tracks[0].participant_name == "Pasha"
+    assert sessions[0].tracks[0].participant_id == "host-local-ch-1"
 
 
 def test_client_get_track_download_url_returns_presigned_url(

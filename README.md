@@ -84,12 +84,12 @@ Notes on ingest:
 ```bash
 pod auphonic-prepare @1 --debug   # creates the production and attaches S3 tracks
 pod auphonic-offset @1            # dry run; uses durations stored at ingest
-pod auphonic-offset @1 --apply    # apply the positive offset to the shorter track
+pod auphonic-offset @1 --apply    # offset remote track(s); keep local tracks at zero
 pod auphonic-preview @1
 pod auphonic-inspect --session @1
 ```
 
-For two-track Cozytrack sessions, run `pod auphonic-offset` before preview/start. Durations come from audio packet timing recorded at ingest; the command updates the prepared production with a per-track `offset` and does not start processing.
+Run `pod auphonic-offset` before preview/start. Durations come from audio packet timing recorded at ingest. For mixed Cozytrack sessions, stable participant identity distinguishes host-local tracks from remote tracks: local tracks remain at zero, while every shorter remote track is offset against the longest local reference. The command updates the prepared production and does not start processing.
 
 3. Start Auphonic after previewing the edit page
 ```bash

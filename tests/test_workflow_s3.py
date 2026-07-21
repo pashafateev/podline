@@ -205,7 +205,7 @@ def test_full_s3_pipeline_without_any_drive_paths(
         ),
     )
     assert result.applied is True
-    assert result.plan.offset_seconds > 0
+    assert result.plan.targets[0].offset_seconds > 0
 
     # 4. Preview, then start; outputs persist to S3 and the workspace appears.
     preview = preview_prepared_session_with_auphonic(

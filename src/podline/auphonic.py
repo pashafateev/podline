@@ -19,6 +19,11 @@ from podline.artifacts import (
     store_artifact_file,
 )
 from podline.config import AppConfig
+from podline.cozytrack.client import (
+    CozytrackClient,
+    CozytrackClientProtocol,
+    CozytrackError,
+)
 from podline.models import (
     ArtifactKind,
     MediaArtifactRecord,
@@ -78,21 +83,27 @@ class AuphonicAssetDuration:
 
 
 @dataclass(frozen=True)
+class AuphonicOffsetTarget:
+    asset: MediaArtifactRecord
+    track_id: str
+    input_file: str
+    offset_seconds: float
+
+
+@dataclass(frozen=True)
 class AuphonicOffsetPlan:
     production_id: str
     asset_durations: List[AuphonicAssetDuration]
-    target_asset: MediaArtifactRecord
-    longer_asset: MediaArtifactRecord
-    target_track_id: str
-    target_input_file: str
-    offset_seconds: float
+    reference_assets: List[MediaArtifactRecord]
+    reference_asset: MediaArtifactRecord
+    targets: List[AuphonicOffsetTarget]
 
 
 @dataclass(frozen=True)
 class AuphonicOffsetResult:
     plan: AuphonicOffsetPlan
     applied: bool
-    track_state: Optional[Dict]
+    track_states: List[Dict]
 
 
 DurationProbe = Callable[[Path], float]
@@ -1125,6 +1136,61 @@ def probe_audio_duration_from_packets(path: Path) -> float:
     return _duration_from_ffprobe_packet_data(payload, source=path)
 
 
+def _partition_cozytrack_offset_tracks(
+    *,
+    config: AppConfig,
+    session: SessionRecord,
+    asset_durations: List[AuphonicAssetDuration],
+    cozytrack_client: Optional[CozytrackClientProtocol],
+) -> Tuple[List[AuphonicAssetDuration], List[AuphonicAssetDuration]]:
+    """Split host-local references from remote tracks using Cozytrack identity.
+
+    Duration alone cannot distinguish a slightly shorter second local channel
+    from a remote participant who joined late. Cozytrack's stable participant
+    ids make that distinction explicit for mixed sessions.
+    """
+    if not session.cozytrack_session_id:
+        raise AuphonicError(
+            f"Session {session.session_uid} has more than 2 audio assets but no Cozytrack session id; local/remote track topology is required"
+        )
+
+    try:
+        cozytrack_client = cozytrack_client or CozytrackClient(config)
+        cozytrack_session = cozytrack_client.get_session(
+            session.cozytrack_session_id
+        )
+    except CozytrackError as exc:
+        raise AuphonicError(
+            f"Could not load Cozytrack topology for session {session.cozytrack_session_id}: {exc}"
+        ) from exc
+
+    tracks_by_id = {track.id: track for track in cozytrack_session.tracks}
+    local_durations = []
+    remote_durations = []
+    for item in asset_durations:
+        source_id = (item.asset.source_id or "").strip()
+        source_track = tracks_by_id.get(source_id)
+        if source_track is None:
+            raise AuphonicError(
+                f"Could not match registered asset {item.asset.filename} source_id={source_id or 'none'} to Cozytrack session {session.cozytrack_session_id}"
+            )
+        participant_id = (source_track.participant_id or "").strip()
+        if not participant_id:
+            raise AuphonicError(
+                f"Cozytrack track {source_track.id} for {item.asset.filename} has no participantId; local/remote topology is required for sessions with more than 2 tracks"
+            )
+        if participant_id == "host" or participant_id.startswith("host-local-ch-"):
+            local_durations.append(item)
+        else:
+            remote_durations.append(item)
+
+    if not local_durations or not remote_durations:
+        raise AuphonicError(
+            f"Session {session.session_uid} must contain at least one host-local and one remote Cozytrack track to compute multitrack offsets; found {len(local_durations)} local and {len(remote_durations)} remote"
+        )
+    return local_durations, remote_durations
+
+
 def plan_session_auphonic_offset(
     *,
     config: AppConfig,
@@ -1132,12 +1198,16 @@ def plan_session_auphonic_offset(
     db_file: str,
     session: SessionRecord,
     client: Optional[AuphonicClientProtocol] = None,
+    cozytrack_client: Optional[CozytrackClientProtocol] = None,
     duration_probe: DurationProbe = probe_audio_duration_from_packets,
 ) -> AuphonicOffsetPlan:
-    tracks = _spoken_raw_tracks(config, db_file, session.session_uid)
-    if len(tracks) != 2:
+    tracks = sorted(
+        _spoken_raw_tracks(config, db_file, session.session_uid),
+        key=lambda artifact: _recorder_order_key(artifact.role),
+    )
+    if len(tracks) < 2:
         raise AuphonicError(
-            f"Session {session.session_uid} must have exactly 2 audio assets to compute an Auphonic offset; found {len(tracks)}"
+            f"Session {session.session_uid} must have at least 2 audio assets to compute an Auphonic offset; found {len(tracks)}"
         )
     if not session.auphonic_production_id:
         raise AuphonicError(
@@ -1157,37 +1227,58 @@ def plan_session_auphonic_offset(
         )
         for artifact in tracks
     ]
-    sorted_durations = sorted(asset_durations, key=lambda item: item.duration_seconds)
-    shorter = sorted_durations[0]
-    longer = sorted_durations[-1]
-    offset_decimal = Decimal(str(longer.duration_seconds)) - Decimal(
-        str(shorter.duration_seconds)
-    )
-    if offset_decimal <= 0:
-        raise AuphonicError(
-            f"Session {session.session_uid} assets have equal durations; no positive Auphonic offset can be computed"
+    if len(asset_durations) == 2:
+        sorted_durations = sorted(
+            asset_durations, key=lambda item: item.duration_seconds
         )
+        remote_durations = [sorted_durations[0]]
+        local_durations = [sorted_durations[-1]]
+    else:
+        local_durations, remote_durations = _partition_cozytrack_offset_tracks(
+            config=config,
+            session=session,
+            asset_durations=asset_durations,
+            cozytrack_client=cozytrack_client,
+        )
+
+    reference = max(local_durations, key=lambda item: item.duration_seconds)
 
     client = client or AuphonicClient(config)
     details = inspect_production(config, session.auphonic_production_id, client=client)
     _validate_offset_production_state(details)
-    target_track = _find_multi_input_track_for_asset(
-        details.get("multi_input_files") or [], shorter.asset
-    )
-    target_track_id = str(target_track.get("id") or "")
-    if not target_track_id:
-        raise AuphonicError(
-            f"Matched Auphonic track for {shorter.asset.filename} has no id; inspected tracks: {_format_track_choices(details.get('multi_input_files') or [])}"
+    inspected_tracks = details.get("multi_input_files") or []
+    targets = []
+    for remote in remote_durations:
+        offset_decimal = Decimal(str(reference.duration_seconds)) - Decimal(
+            str(remote.duration_seconds)
+        )
+        if offset_decimal <= 0:
+            raise AuphonicError(
+                f"Remote asset {remote.asset.filename} is not shorter than local reference {reference.asset.filename}; no positive Auphonic offset can be computed"
+            )
+        target_track = _find_multi_input_track_for_asset(
+            inspected_tracks, remote.asset
+        )
+        target_track_id = str(target_track.get("id") or "")
+        if not target_track_id:
+            raise AuphonicError(
+                f"Matched Auphonic track for {remote.asset.filename} has no id; inspected tracks: {_format_track_choices(inspected_tracks)}"
+            )
+        targets.append(
+            AuphonicOffsetTarget(
+                asset=remote.asset,
+                track_id=target_track_id,
+                input_file=str(target_track.get("input_file") or ""),
+                offset_seconds=float(offset_decimal),
+            )
         )
 
     return AuphonicOffsetPlan(
         production_id=session.auphonic_production_id,
         asset_durations=asset_durations,
-        target_asset=shorter.asset,
-        longer_asset=longer.asset,
-        target_track_id=target_track_id,
-        target_input_file=str(target_track.get("input_file") or ""),
-        offset_seconds=float(offset_decimal),
+        reference_assets=[item.asset for item in local_durations],
+        reference_asset=reference.asset,
+        targets=targets,
     )
 
 
@@ -1199,6 +1290,7 @@ def offset_session_auphonic_production(
     session: SessionRecord,
     apply: bool = False,
     client: Optional[AuphonicClientProtocol] = None,
+    cozytrack_client: Optional[CozytrackClientProtocol] = None,
     duration_probe: DurationProbe = probe_audio_duration_from_packets,
 ) -> AuphonicOffsetResult:
     client = client or AuphonicClient(config)
@@ -1208,24 +1300,29 @@ def offset_session_auphonic_production(
         db_file=db_file,
         session=session,
         client=client,
+        cozytrack_client=cozytrack_client,
         duration_probe=duration_probe,
     )
 
     if not apply:
-        return AuphonicOffsetResult(plan=plan, applied=False, track_state=None)
+        return AuphonicOffsetResult(plan=plan, applied=False, track_states=[])
 
-    client.update_multi_input_file_offset(
-        plan.production_id, plan.target_track_id, plan.offset_seconds
-    )
-    details = inspect_production(config, plan.production_id, client=client)
-    track_state = _find_multi_input_track_by_id(
-        details.get("multi_input_files") or [], plan.target_track_id
-    )
-    if track_state is None:
-        raise AuphonicError(
-            f"Auphonic offset was applied but updated track {plan.target_track_id} was not present on re-inspection"
+    for target in plan.targets:
+        client.update_multi_input_file_offset(
+            plan.production_id, target.track_id, target.offset_seconds
         )
-    return AuphonicOffsetResult(plan=plan, applied=True, track_state=track_state)
+    details = inspect_production(config, plan.production_id, client=client)
+    track_states = []
+    for target in plan.targets:
+        track_state = _find_multi_input_track_by_id(
+            details.get("multi_input_files") or [], target.track_id
+        )
+        if track_state is None:
+            raise AuphonicError(
+                f"Auphonic offset was applied but updated track {target.track_id} was not present on re-inspection"
+            )
+        track_states.append(track_state)
+    return AuphonicOffsetResult(plan=plan, applied=True, track_states=track_states)
 
 
 def reconcile_production_to_session(
