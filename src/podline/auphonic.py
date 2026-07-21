@@ -36,6 +36,7 @@ from podline.repository import (
     update_media_artifact_duration,
     update_session_status,
 )
+from podline.scanner import recorder_track_number
 from podline.storage import parse_s3_uri, redact_url
 
 
@@ -997,7 +998,8 @@ def _pair_tracks_with_preset_ids(
     server-side link between a preset track id and a session role. When the
     preset's track ids match the artifact roles exactly (case-insensitive),
     pair by name; otherwise fall back to position — preset order against
-    roles in natural sort order, so host10 follows host2 instead of host1.
+    recorder order (Tr1 -> host1, Tr2 -> host2, Tr3 -> guest1, ...). Any
+    role-name sort would put guests before hosts.
     """
     if len(track_ids) != len(tracks):
         raise AuphonicError(
@@ -1009,8 +1011,16 @@ def _pair_tracks_with_preset_ids(
     } == set(by_role):
         return [(track_id, by_role[track_id.lower()]) for track_id in track_ids]
 
-    ordered = sorted(tracks, key=lambda artifact: _natural_role_key(artifact.role))
+    ordered = sorted(tracks, key=lambda artifact: _recorder_order_key(artifact.role))
     return list(zip(track_ids, ordered))
+
+
+def _recorder_order_key(role: str) -> Tuple[int, int, Tuple[str, int, str]]:
+    """Sort roles by recorder track number; unknown roles follow, naturally sorted."""
+    number = recorder_track_number(role)
+    if number is None:
+        return (1, 0, _natural_role_key(role))
+    return (0, number, _natural_role_key(role))
 
 
 def _natural_role_key(role: str) -> Tuple[str, int, str]:

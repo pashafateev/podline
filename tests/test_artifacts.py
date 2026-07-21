@@ -450,6 +450,19 @@ def test_get_media_artifact_distinguishes_roles(tmp_path: Path) -> None:
     )
 
 
+def test_workspace_cleanup_rejects_nan_and_negative_retention(
+    tmp_path: Path,
+) -> None:
+    from podline.artifacts import plan_workspace_cleanup
+
+    runtime_paths = _build_runtime_paths(tmp_path)
+    for invalid in (float("nan"), -1.0):
+        with pytest.raises(ArtifactError, match="at least 0 days"):
+            plan_workspace_cleanup(
+                runtime_paths, runtime_paths.db_file, older_than_days=invalid
+            )
+
+
 def test_create_workspace_refreshes_replaced_transcript(
     app_config_factory, runtime_factory, artifact_registrar, tmp_path: Path
 ) -> None:

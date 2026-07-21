@@ -1132,6 +1132,32 @@ def test_refresh_transcript_resumes_started_production_after_local_failure(
     assert updated.transcript_refresh_production_id is None
 
 
+def test_pair_tracks_orders_fallback_by_recorder_position() -> None:
+    from types import SimpleNamespace
+
+    from podline.auphonic import _pair_tracks_with_preset_ids
+
+    def _artifact(role: str, filename: str):
+        return SimpleNamespace(role=role, filename=filename)
+
+    tracks = [
+        _artifact("guest1", "Tr3.webm"),
+        _artifact("guest2", "Tr4.webm"),
+        _artifact("host1", "Tr1.webm"),
+        _artifact("host2", "Tr2.webm"),
+    ]
+    preset_ids = ["Pasha", "Jonathan", "Guest A", "Guest B"]
+
+    pairs = _pair_tracks_with_preset_ids(preset_ids, tracks)
+
+    assert [(track_id, artifact.role) for track_id, artifact in pairs] == [
+        ("Pasha", "host1"),
+        ("Jonathan", "host2"),
+        ("Guest A", "guest1"),
+        ("Guest B", "guest2"),
+    ]
+
+
 class MultiSpeakerFakeAuphonicClient(FakeAuphonicClient):
     """Preset with named tracks that do not match session roles."""
 
@@ -1244,16 +1270,18 @@ def test_start_failure_after_persist_recovers_via_reconcile_without_restart(
     def _local_failure(**_kwargs):
         raise ArtifactError("simulated local failure after outputs persisted")
 
-    monkeypatch.setattr("podline.auphonic.create_workspace", _local_failure)
-    with pytest.raises(ArtifactError, match="simulated local failure"):
-        start_prepared_session_with_auphonic(
-            config=config,
-            runtime_paths=runtime_paths,
-            db_file=runtime_paths.db_file,
-            session=session,
-            client=client,
-        )
-    monkeypatch.undo()
+    # monkeypatch.undo() would also undo the autouse AWS env fixture (one
+    # MonkeyPatch instance per test), so scope this patch with a context.
+    with monkeypatch.context() as patcher:
+        patcher.setattr("podline.auphonic.create_workspace", _local_failure)
+        with pytest.raises(ArtifactError, match="simulated local failure"):
+            start_prepared_session_with_auphonic(
+                config=config,
+                runtime_paths=runtime_paths,
+                db_file=runtime_paths.db_file,
+                session=session,
+                client=client,
+            )
 
     failed = get_session_record(runtime_paths.db_file, session.session_uid)
     assert failed is not None

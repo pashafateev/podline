@@ -27,7 +27,7 @@ from podline.auphonic import (
     start_prepared_session_with_auphonic,
 )
 from podline.config import load_config
-from podline.storage import redact_url, storage_health
+from podline.storage import redact_url, sha256_of_file, storage_health
 from podline.cozytrack.client import CozytrackError
 from podline.cozytrack.ingest import (
     CozytrackIngestError,
@@ -474,11 +474,15 @@ def workspace_clean(
     """
     config_path = _resolve_config_path(config)
     _loaded_config, runtime_paths, _logger = _bootstrap(config_path)
-    candidates = plan_workspace_cleanup(
-        runtime_paths,
-        runtime_paths.db_file,
-        older_than_days=older_than_days,
-    )
+    try:
+        candidates = plan_workspace_cleanup(
+            runtime_paths,
+            runtime_paths.db_file,
+            older_than_days=older_than_days,
+        )
+    except ArtifactError as exc:
+        typer.secho(f"✖ {exc}", fg=typer.colors.RED, bold=True)
+        raise typer.Exit(code=1)
 
     _print_header("Workspace Cleanup" if apply else "Workspace Cleanup (dry run)")
     if not candidates:
@@ -609,7 +613,14 @@ def status(
             cached = cache_path_for(
                 runtime_paths, artifact.sha256, artifact.filename
             ).exists()
-            in_workspace = (workspace_dir / artifact.filename).exists()
+            # +workspace means "the current version is in the workspace",
+            # not "a file by this name exists" — a transcript refresh leaves
+            # a stale same-named copy behind, so verify content.
+            workspace_copy = workspace_dir / artifact.filename
+            in_workspace = (
+                workspace_copy.exists()
+                and sha256_of_file(workspace_copy) == artifact.sha256
+            )
             location = "cached" if cached else "s3-only"
             if in_workspace:
                 location += "+workspace"
@@ -1060,8 +1071,13 @@ def auphonic_prepare_command(
         ]
     )
     # Show which file landed on which named preset track so a wrong pairing
-    # is visible before anything starts.
-    details = inspect_production(loaded_config, updated.auphonic_production_id)
+    # is visible before anything starts. The session is already prepared at
+    # this point, so a failure here is informational, never an exit code.
+    try:
+        details = inspect_production(loaded_config, updated.auphonic_production_id)
+    except AuphonicError as exc:
+        typer.echo(f"(attached-track display unavailable: {exc})")
+        return
     attached = details.get("multi_input_files") or []
     if attached:
         _print_section(
