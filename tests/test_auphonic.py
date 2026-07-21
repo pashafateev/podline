@@ -1130,3 +1130,165 @@ def test_refresh_transcript_resumes_started_production_after_local_failure(
     assert len(client.single_created) == 1
     assert client.started == ["prod-refresh"]
     assert updated.transcript_refresh_production_id is None
+
+
+class MultiSpeakerFakeAuphonicClient(FakeAuphonicClient):
+    """Preset with named tracks that do not match session roles."""
+
+    def create_production(
+        self, *, title: str, track_count: int, preset_id: str
+    ) -> AuphonicPreparedProduction:
+        self.created.append((title, track_count, preset_id))
+        return AuphonicPreparedProduction(
+            production_id="prod-123",
+            upload_track_ids=[
+                f"Preset Track {i}" for i in range(1, track_count + 1)
+            ],
+            status_page="https://example.test/status/prod-123",
+            edit_page="https://example.test/edit/prod-123",
+        )
+
+
+@pytest.mark.parametrize(
+    "roles",
+    [
+        [("host1", "Tr1.webm"), ("host2", "Tr2.webm"), ("guest1", "Tr3.webm")],
+        [
+            ("host1", "Tr1.webm"),
+            ("host2", "Tr2.webm"),
+            ("guest1", "Tr3.webm"),
+            ("guest2", "Tr4.webm"),
+        ],
+    ],
+    ids=["three-speakers", "four-speakers"],
+)
+def test_prepare_pairs_multi_speaker_roles_in_recorder_order(
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
+    roles,
+) -> None:
+    """Recorder order is the contract: preset track N gets recorder track N.
+
+    Roles are host1, host2, guest1, guest2 — any role-name sort (alphabetical
+    or natural) puts the guests first and silently maps Tr3/Tr4 onto the
+    first preset tracks.
+    """
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = session_factory(runtime_paths.db_file, status="queued")
+    for role, filename in roles:
+        path = tmp_path / "tracks" / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"opus-{role}".encode("utf-8"))
+        artifact_registrar(
+            runtime_paths.db_file,
+            runtime_paths,
+            session_uid=session.session_uid,
+            kind="raw_track",
+            role=role,
+            path=path,
+            duration_seconds=60.0,
+        )
+    client = MultiSpeakerFakeAuphonicClient()
+
+    prepare_session_with_auphonic(
+        config=config,
+        db_file=runtime_paths.db_file,
+        session=session,
+        client=client,
+    )
+
+    attached = [
+        (track_id, input_key.rsplit("/", 1)[-1])
+        for (_production, track_id, _service, input_key) in client.attached
+    ]
+    assert attached == [
+        (f"Preset Track {index + 1}", filename)
+        for index, (_role, filename) in enumerate(roles)
+    ]
+
+
+def test_start_failure_after_persist_recovers_via_reconcile_without_restart(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Crash between output persistence and the state transition is recoverable.
+
+    The remote production must not be started a second time, and recovery
+    must leave exactly one current artifact per kind plus a valid workspace.
+    """
+    import json
+
+    from podline.artifacts import ArtifactError, workspace_path_for
+    from podline.auphonic import reconcile_production_to_session
+    from podline.repository import get_session as get_session_record
+    from podline.repository import list_media_artifacts
+    from podline.storage import sha256_of_file
+
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = session_factory(
+        runtime_paths.db_file,
+        status="auphonic_previewed",
+        auphonic_production_id="prod-123",
+    )
+    client = FakeAuphonicClient()
+
+    def _local_failure(**_kwargs):
+        raise ArtifactError("simulated local failure after outputs persisted")
+
+    monkeypatch.setattr("podline.auphonic.create_workspace", _local_failure)
+    with pytest.raises(ArtifactError, match="simulated local failure"):
+        start_prepared_session_with_auphonic(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=session,
+            client=client,
+        )
+    monkeypatch.undo()
+
+    failed = get_session_record(runtime_paths.db_file, session.session_uid)
+    assert failed is not None
+    assert failed.status == "failed"
+    assert client.started == ["prod-123"]
+
+    recovery_client = FakeDoneAuphonicClient()
+    recovered = reconcile_production_to_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=failed,
+        production_id="prod-123",
+        client=recovery_client,
+    )
+
+    assert recovered.status == "waiting_for_finalize"
+    assert recovery_client.started == []
+    masters = list_media_artifacts(
+        runtime_paths.db_file, session.session_uid, kind="pre_edit_master"
+    )
+    transcripts = list_media_artifacts(
+        runtime_paths.db_file, session.session_uid, kind="transcript"
+    )
+    assert len(masters) == 1
+    assert len(transcripts) == 1
+
+    workspace = workspace_path_for(runtime_paths, session.session_uid)
+    manifest = json.loads((workspace / "manifest.json").read_text(encoding="utf-8"))
+    for kind, artifact in (
+        ("pre_edit_master", masters[0]),
+        ("transcript", transcripts[0]),
+    ):
+        entry = manifest["artifacts"][kind]
+        copy = workspace / entry["filename"]
+        assert copy.exists()
+        assert entry["sha256"] == artifact.sha256
+        assert sha256_of_file(copy) == artifact.sha256

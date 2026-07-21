@@ -371,3 +371,72 @@ def test_slugify_handles_unicode_and_punctuation() -> None:
     assert slugify("Hello, World!") == "hello-world"
     assert slugify("   ") == "session"
     assert slugify("ep07: Boba & Beats") == "ep07-boba-beats"
+
+
+def test_deduplicated_ingest_backfills_cozytrack_identity(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    """Same audio imported locally first, then ingested from Cozytrack.
+
+    Dedup must not create a second session, and the surviving session must
+    take over the Cozytrack identity so ct-list stops advertising it and
+    later ingests stop re-downloading the tracks.
+    """
+    from podline.ingest import import_local_folder
+    from podline.repository import get_session_by_cozytrack_id, list_sessions
+
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+
+    tr1_bytes = b"webm-track-1-data" * 32
+    tr2_bytes = b"webm-track-2-data" * 32
+    import_dir = tmp_path / "riverside" / "2026-04-24_demo"
+    import_dir.mkdir(parents=True)
+    (import_dir / "Tr1.webm").write_bytes(tr1_bytes)
+    (import_dir / "Tr2.webm").write_bytes(tr2_bytes)
+    imported, created = import_local_folder(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        folder=import_dir,
+        duration_probe=_probe,
+    )
+    assert created is True
+    assert imported.cozytrack_session_id is None
+
+    fake = FakeCozytrackClient(
+        sessions=[_make_session(session_id="sess-dup")],
+        downloads={"track-a": tr1_bytes, "track-b": tr2_bytes},
+    )
+    record = ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-dup",
+        client=fake,
+        duration_probe=_probe,
+    )
+
+    assert record.session_uid == imported.session_uid
+    assert len(list_sessions(runtime_paths.db_file)) == 1
+    assert record.cozytrack_session_id == "sess-dup"
+    linked = get_session_by_cozytrack_id(runtime_paths.db_file, "sess-dup")
+    assert linked is not None
+    assert linked.session_uid == imported.session_uid
+
+    ready = list_ready_sessions_for_ingest(
+        config=config, db_file=runtime_paths.db_file, client=fake
+    )
+    assert [session.id for session in ready] == []
+
+    downloads_before_rerun = len(fake.downloaded_paths)
+    rerun = ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-dup",
+        client=fake,
+        duration_probe=_probe,
+    )
+    assert rerun.session_uid == imported.session_uid
+    assert len(fake.downloaded_paths) == downloads_before_rerun

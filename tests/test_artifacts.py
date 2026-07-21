@@ -448,3 +448,69 @@ def test_get_media_artifact_distinguishes_roles(tmp_path: Path) -> None:
     assert (
         len(list_media_artifacts(runtime_paths.db_file, "session-1")) == 2
     )
+
+
+def test_create_workspace_refreshes_replaced_transcript(
+    app_config_factory, runtime_factory, artifact_registrar, tmp_path: Path
+) -> None:
+    """Replacing the current transcript (same filename, new content) must
+    refresh the workspace copy and manifest on the next workspace run."""
+    import json
+
+    from podline.artifacts import create_workspace
+    from podline.storage import sha256_of_file
+
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    master = tmp_path / "src" / "pre_edit.mp3"
+    master.parent.mkdir(parents=True)
+    master.write_bytes(b"pre-edit-master")
+    artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid="s-ws",
+        kind="pre_edit_master",
+        path=master,
+    )
+    original = tmp_path / "v1" / "ep.vtt"
+    original.parent.mkdir(parents=True)
+    original.write_bytes(b"WEBVTT\n\noriginal\n")
+    artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid="s-ws",
+        kind="transcript",
+        path=original,
+    )
+
+    workspace = create_workspace(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session_uid="s-ws",
+    )
+    assert (workspace / "ep.vtt").read_bytes() == b"WEBVTT\n\noriginal\n"
+
+    refreshed = tmp_path / "v2" / "ep.vtt"
+    refreshed.parent.mkdir(parents=True)
+    refreshed.write_bytes(b"WEBVTT\n\nrefreshed after transcript-refresh\n")
+    artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid="s-ws",
+        kind="transcript",
+        path=refreshed,
+    )
+
+    workspace = create_workspace(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session_uid="s-ws",
+    )
+
+    assert (
+        workspace / "ep.vtt"
+    ).read_bytes() == b"WEBVTT\n\nrefreshed after transcript-refresh\n"
+    manifest = json.loads((workspace / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["artifacts"]["transcript"]["sha256"] == sha256_of_file(refreshed)
