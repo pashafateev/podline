@@ -1145,11 +1145,14 @@ def _partition_cozytrack_offset_tracks(
     asset_durations: List[AuphonicAssetDuration],
     cozytrack_client: Optional[CozytrackClientProtocol],
 ) -> Tuple[List[AuphonicAssetDuration], List[AuphonicAssetDuration]]:
-    """Split host-local references from remote tracks using Cozytrack identity.
+    """Split host-local tracks from remote tracks using Cozytrack identity.
 
-    Duration alone cannot distinguish a slightly shorter second local channel
-    from a remote participant who joined late. Cozytrack's stable participant
-    ids make that distinction explicit for mixed sessions.
+    Cozytrack starts every recorder sequentially and stops them together, so
+    offsets come from duration shortfalls alone — local channels need them
+    too. Topology still matters for sessions with more than two tracks: the
+    alignment reference must be a host-local channel (the host machine
+    records from session start), and a remote track outlasting every local
+    channel means the registered assets do not match the Cozytrack session.
     """
     if not session.cozytrack_session_id:
         raise AuphonicError(
@@ -1230,15 +1233,15 @@ def plan_session_auphonic_offset(
         for artifact in tracks
     ]
     if len(asset_durations) == 2:
-        # Preserve the original duration-only behavior for two-track sessions;
-        # topology is only required to disambiguate sessions with more tracks.
+        # Two-track sessions may have no Cozytrack topology (e.g. pod
+        # import); with a shared stop time the longer track started first
+        # and anchors the alignment.
         sorted_durations = sorted(
             asset_durations, key=lambda item: item.duration_seconds
         )
-        remote_durations = [sorted_durations[0]]
         local_durations = [sorted_durations[-1]]
     else:
-        local_durations, remote_durations = _partition_cozytrack_offset_tracks(
+        local_durations, _remote_durations = _partition_cozytrack_offset_tracks(
             config=config,
             session=session,
             asset_durations=asset_durations,
@@ -1253,28 +1256,34 @@ def plan_session_auphonic_offset(
     inspected_tracks = details.get("multi_input_files") or []
     targets = []
     aligned_assets = []
-    for remote in remote_durations:
+    # Cozytrack starts each track's recorder sequentially and stops them all
+    # together, so every shorter track — additional host-local channels
+    # included — started late by exactly its duration shortfall against the
+    # reference. Only the reference stays at zero.
+    for item in asset_durations:
+        if item is reference:
+            continue
         offset_decimal = Decimal(str(reference.duration_seconds)) - Decimal(
-            str(remote.duration_seconds)
+            str(item.duration_seconds)
         )
         if offset_decimal < 0:
             raise AuphonicError(
-                f"Remote asset {remote.asset.filename} is not shorter than local reference {reference.asset.filename}; no positive Auphonic offset can be computed"
+                f"Asset {item.asset.filename} is not shorter than the local reference {reference.asset.filename}; no positive Auphonic offset can be computed"
             )
         if offset_decimal == 0:
-            aligned_assets.append(remote.asset)
+            aligned_assets.append(item.asset)
             continue
         target_track = _find_multi_input_track_for_asset(
-            inspected_tracks, remote.asset
+            inspected_tracks, item.asset
         )
         target_track_id = str(target_track.get("id") or "")
         if not target_track_id:
             raise AuphonicError(
-                f"Matched Auphonic track for {remote.asset.filename} has no id; inspected tracks: {_format_track_choices(inspected_tracks)}"
+                f"Matched Auphonic track for {item.asset.filename} has no id; inspected tracks: {_format_track_choices(inspected_tracks)}"
             )
         targets.append(
             AuphonicOffsetTarget(
-                asset=remote.asset,
+                asset=item.asset,
                 track_id=target_track_id,
                 input_file=str(target_track.get("input_file") or ""),
                 offset_seconds=float(offset_decimal),

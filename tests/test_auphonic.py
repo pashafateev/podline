@@ -791,9 +791,14 @@ def _three_auphonic_tracks():
     ]
 
 
-def test_session_offset_keeps_two_local_tracks_at_zero_and_targets_remote(
+def test_session_offset_targets_late_local_channel_and_remote(
     app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
 ) -> None:
+    """Cozytrack recorders start sequentially, so a second host-local channel
+    needs an offset exactly like a remote track does. The stored roles here
+    are deliberately wrong (guest registered as host2, local channel as
+    guest1, the download-order mislabeling this fixture reproduces): offsets
+    must follow participant identity and durations, not roles."""
     config = app_config_factory(tmp_path)
     runtime_paths = runtime_factory(config)
     session, cozytrack_client = _cozytrack_offset_session(
@@ -832,11 +837,19 @@ def test_session_offset_keeps_two_local_tracks_at_zero_and_targets_remote(
         "Tr3.webm",
     ]
     assert plan.reference_asset.filename == "Tr1.webm"
-    assert [target.asset.filename for target in plan.targets] == ["Tr2.webm"]
-    assert plan.targets[0].track_id == "J"
-    assert plan.targets[0].offset_seconds == pytest.approx(1.451)
-    assert client.offset_updates == [("prod-123", "J", pytest.approx(1.451))]
-    assert [track["id"] for track in result.track_states] == ["J"]
+    assert [target.asset.filename for target in plan.targets] == [
+        "Tr2.webm",
+        "Tr3.webm",
+    ]
+    assert [target.track_id for target in plan.targets] == ["J", "Local 2"]
+    assert [target.offset_seconds for target in plan.targets] == pytest.approx(
+        [1.451, 2.640]
+    )
+    assert client.offset_updates == [
+        ("prod-123", "J", pytest.approx(1.451)),
+        ("prod-123", "Local 2", pytest.approx(2.640)),
+    ]
+    assert [track["id"] for track in result.track_states] == ["J", "Local 2"]
 
 
 def test_session_offset_targets_each_remote_against_one_local_reference(
@@ -915,6 +928,42 @@ def test_session_offset_skips_aligned_remote_and_updates_shorter_remote(
         cozytrack_client=cozytrack_client,
     )
 
+    assert [asset.filename for asset in result.plan.aligned_assets] == ["Tr2.webm"]
+    assert [target.asset.filename for target in result.plan.targets] == ["Tr3.webm"]
+    assert client.offset_updates == [
+        ("prod-123", "Remote 2", pytest.approx(2.75))
+    ]
+
+
+def test_session_offset_skips_aligned_local_channel(
+    app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session, cozytrack_client = _cozytrack_offset_session(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        tracks=[
+            ("host1", "Tr1.webm", 100.0, "host-local-ch-1"),
+            ("host2", "Tr2.webm", 100.0, "host-local-ch-2"),
+            ("guest1", "Tr3.webm", 97.25, "guest-a"),
+        ],
+    )
+    client = FakeOffsetAuphonicClient(tracks=_three_auphonic_tracks())
+
+    result = offset_session_auphonic_production(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        apply=True,
+        client=client,
+        cozytrack_client=cozytrack_client,
+    )
+
+    assert result.plan.reference_asset.filename == "Tr1.webm"
     assert [asset.filename for asset in result.plan.aligned_assets] == ["Tr2.webm"]
     assert [target.asset.filename for target in result.plan.targets] == ["Tr3.webm"]
     assert client.offset_updates == [
