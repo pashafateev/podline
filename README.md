@@ -77,6 +77,7 @@ pod list
 
 Notes on ingest:
 - Tracks are hashed and uploaded to `s3://<bucket>/sessions/<uid>/raw_track/...`; packet-derived durations are stored for the offset step. Nothing is written to the external drive.
+- Cozytrack roles come from stable participant ids (`host-local-ch-N` → hostN, guests numbered by recorder start order), and files are named in recorder order — not row-creation order, which can interleave a guest between host channels. Sessions without participant ids keep the legacy creation-order naming.
 - Cozytrack downloads land in a disposable staging folder that is removed after registration; re-running `pod ct-ingest <id>` is a no-op, and re-importing an identical folder is detected by content fingerprint.
 - WebM/Opus stems are passed through to Auphonic as-is via the S3 service reference.
 
@@ -84,12 +85,12 @@ Notes on ingest:
 ```bash
 pod auphonic-prepare @1 --debug   # creates the production and attaches S3 tracks
 pod auphonic-offset @1            # dry run; uses durations stored at ingest
-pod auphonic-offset @1 --apply    # offset remote track(s); keep local tracks at zero
+pod auphonic-offset @1 --apply    # offset every track shorter than the reference
 pod auphonic-preview @1
 pod auphonic-inspect --session @1
 ```
 
-Run `pod auphonic-offset` before preview/start. Durations come from audio packet timing recorded at ingest. For mixed Cozytrack sessions, stable participant identity distinguishes host-local tracks from remote tracks: local tracks remain at zero, while every shorter remote track is offset against the longest local reference. Remote tracks already equal to the reference are reported as aligned and skipped. The command updates the prepared production and does not start processing.
+Run `pod auphonic-offset` before preview/start. Durations come from audio packet timing recorded at ingest. Cozytrack starts each track's recorder sequentially and stops them all together, so a track's start offset equals its duration shortfall against the reference (the longest host-local track). Every shorter track is offset — remote tracks and additional host-local channels alike; for sessions with more than 2 tracks, stable participant identity picks the local reference and validates the topology. Tracks already equal to the reference are reported as aligned and skipped. The command updates the prepared production and does not start processing.
 
 3. Start Auphonic after previewing the edit page
 ```bash

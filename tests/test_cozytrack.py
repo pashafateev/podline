@@ -10,6 +10,7 @@ from podline.cozytrack.client import (
     CozytrackError,
     CozytrackSession,
     CozytrackTrack,
+    host_channel_number,
     is_host_participant,
 )
 from podline.cozytrack.ingest import (
@@ -79,6 +80,26 @@ def test_is_host_participant_uses_cozytrack_identity_contract(
     participant_id: str, expected: bool
 ) -> None:
     assert is_host_participant(participant_id) is expected
+
+
+@pytest.mark.parametrize(
+    ("participant_id", "expected"),
+    [
+        ("host", 1),
+        ("host-local-ch-1", 1),
+        ("host-local-ch-2", 2),
+        ("host-local-ch-12", 12),
+        ("host-local-ch-", None),
+        ("host-local-ch-x", None),
+        ("host-local-ch-0", None),
+        ("guest-1", None),
+        ("", None),
+    ],
+)
+def test_host_channel_number_parses_identity_contract(
+    participant_id: str, expected
+) -> None:
+    assert host_channel_number(participant_id) == expected
 
 
 def _make_session(
@@ -279,6 +300,136 @@ def test_ingest_session_uploads_artifacts_and_cleans_staging(
         assert cache_path_for(
             runtime_paths, artifact.sha256, artifact.filename
         ).exists()
+
+
+def _make_identified_session(
+    *,
+    session_id: str,
+    name: str = "Mixed Session",
+    tracks,
+) -> CozytrackSession:
+    """Session whose tracks carry stable participant ids, created in the
+    given order (Cozytrack creates rows in recorder start order)."""
+    return CozytrackSession(
+        id=session_id,
+        name=name,
+        status="ready",
+        finalized_at="2026-07-18T17:00:00.000Z",
+        tracks=[
+            CozytrackTrack(
+                id=track_id,
+                participant_name=participant_name,
+                status="complete",
+                created_at=f"2026-07-18T16:52:{39 + index:02d}Z",
+                participant_id=participant_id,
+            )
+            for index, (track_id, participant_id, participant_name) in enumerate(
+                tracks
+            )
+        ],
+    )
+
+
+def test_ingest_session_derives_roles_from_participant_ids(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    """A guest recorder interleaved between the host-local channels must not
+    shift naming or roles: files follow recorder order (host channels, then
+    guests) and roles follow participant identity."""
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+
+    fake = FakeCozytrackClient(
+        sessions=[
+            _make_identified_session(
+                session_id="sess-mixed",
+                tracks=[
+                    ("ct-ch-1", "host-local-ch-1", "Local Ch 1"),
+                    ("ct-guest", "guest_df6e4c0f", "J"),
+                    ("ct-ch-2", "host-local-ch-2", "Local Ch 2"),
+                ],
+            )
+        ]
+    )
+
+    record = ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-mixed",
+        client=fake,
+        duration_probe=_probe,
+    )
+
+    assert fake.requested_track_ids == ["ct-ch-1", "ct-ch-2", "ct-guest"]
+    artifacts = list_media_artifacts(runtime_paths.db_file, record.session_uid)
+    assert [(a.role, a.filename, a.source_id) for a in artifacts] == [
+        ("guest1", "Tr3.webm", "ct-guest"),
+        ("host1", "Tr1.webm", "ct-ch-1"),
+        ("host2", "Tr2.webm", "ct-ch-2"),
+    ]
+
+
+def test_ingest_session_rejects_partially_identified_tracks(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+
+    fake = FakeCozytrackClient(
+        sessions=[
+            _make_identified_session(
+                session_id="sess-partial",
+                tracks=[
+                    ("ct-ch-1", "host-local-ch-1", "Local Ch 1"),
+                    ("ct-guest", None, "J"),
+                ],
+            )
+        ]
+    )
+
+    with pytest.raises(CozytrackIngestError, match="missing participantId: ct-guest"):
+        ingest_session(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            cozytrack_session_id="sess-partial",
+            client=fake,
+            duration_probe=_probe,
+        )
+
+    assert fake.requested_track_ids == []
+    assert get_session_by_cozytrack_id(runtime_paths.db_file, "sess-partial") is None
+
+
+def test_ingest_session_rejects_duplicate_participant_roles(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+
+    fake = FakeCozytrackClient(
+        sessions=[
+            _make_identified_session(
+                session_id="sess-dup",
+                tracks=[
+                    ("ct-host", "host", "Host"),
+                    ("ct-ch-1", "host-local-ch-1", "Local Ch 1"),
+                    ("ct-guest", "guest_a", "A"),
+                ],
+            )
+        ]
+    )
+
+    with pytest.raises(CozytrackIngestError, match="duplicate role 'host1'"):
+        ingest_session(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            cozytrack_session_id="sess-dup",
+            client=fake,
+            duration_probe=_probe,
+        )
 
 
 def test_ingest_session_is_idempotent(
