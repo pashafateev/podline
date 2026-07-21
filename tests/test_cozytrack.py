@@ -570,6 +570,81 @@ def test_reingest_leaves_roles_alone_when_tracks_cannot_be_mapped(
     assert _reconcile_event_count(runtime_paths.db_file, record.session_uid) == 0
 
 
+def test_deduplicated_ingest_backfills_source_ids_and_roles(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    """Same audio imported locally first, then ingested from Cozytrack with
+    participant identity: the surviving session must gain source ids
+    (paired by content hash — a local import stores none) and
+    participant-derived roles, or offset topology can never resolve."""
+    from podline.ingest import import_local_folder
+
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+
+    tr1_bytes = b"webm-host-channel-data" * 32
+    tr2_bytes = b"webm-remote-guest-data" * 32
+    import_dir = tmp_path / "riverside" / "2026-07-18_demo"
+    import_dir.mkdir(parents=True)
+    (import_dir / "Tr1.webm").write_bytes(tr1_bytes)
+    (import_dir / "Tr2.webm").write_bytes(tr2_bytes)
+    imported, created = import_local_folder(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        folder=import_dir,
+        duration_probe=_probe,
+    )
+    assert created is True
+    artifacts = list_media_artifacts(runtime_paths.db_file, imported.session_uid)
+    assert [(a.role, a.source_id) for a in artifacts] == [
+        ("host1", None),
+        ("host2", None),
+    ]
+
+    fake = FakeCozytrackClient(
+        sessions=[
+            _make_identified_session(
+                session_id="sess-import-dup",
+                tracks=[
+                    ("ct-host", "host", "Host"),
+                    ("ct-guest", "guest_x", "X"),
+                ],
+            )
+        ],
+        downloads={"ct-host": tr1_bytes, "ct-guest": tr2_bytes},
+    )
+
+    record = ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-import-dup",
+        client=fake,
+        duration_probe=_probe,
+    )
+
+    assert record.session_uid == imported.session_uid
+    assert record.cozytrack_session_id == "sess-import-dup"
+    artifacts = list_media_artifacts(runtime_paths.db_file, record.session_uid)
+    assert [(a.role, a.filename, a.source_id, a.source_provider) for a in artifacts] == [
+        ("guest1", "Tr2.webm", "ct-guest", "local_import"),
+        ("host1", "Tr1.webm", "ct-host", "local_import"),
+    ]
+    assert _reconcile_event_count(runtime_paths.db_file, record.session_uid) == 1
+
+    # The healed session behaves like a native ct-ingest on later re-runs.
+    ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-import-dup",
+        client=fake,
+        duration_probe=_probe,
+    )
+    assert _reconcile_event_count(runtime_paths.db_file, record.session_uid) == 1
+
+
 def test_ingest_session_is_idempotent(
     moto_s3, app_config_factory, runtime_factory, tmp_path: Path
 ) -> None:

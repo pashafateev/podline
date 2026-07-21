@@ -19,12 +19,13 @@ from podline.cozytrack.client import (
 from podline.ingest import DurationProbe, register_candidate_with_storage
 from podline.models import RuntimePaths, ScanCandidate, SessionRecord, UnsupportedSession
 from podline.repository import (
+    backfill_artifact_source_ids,
     get_session_by_cozytrack_id,
     list_media_artifacts,
     reconcile_artifact_roles,
 )
 from podline.scanner import _parse_session_dir
-from podline.storage import MediaStorage
+from podline.storage import MediaStorage, sha256_of_file
 
 
 class CozytrackIngestError(RuntimeError):
@@ -172,8 +173,26 @@ def ingest_session(
         )
         if not created:
             # Same content already registered (e.g. pod import backfilled
-            # with this Cozytrack id); its stored roles may predate
-            # participant-derived naming.
+            # with this Cozytrack id). Its artifacts carry no Cozytrack
+            # source ids, and both role reconciliation and multitrack
+            # offset topology join on them — persist the ids first,
+            # pairing staging downloads with stored artifacts by content
+            # hash so either side's file naming is irrelevant.
+            backfilled = backfill_artifact_source_ids(
+                db_file,
+                session_uid=record.session_uid,
+                source_ids_by_sha256=_source_ids_by_content(
+                    parsed, track_source_ids
+                ),
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            )
+            if backfilled:
+                _log(
+                    logger,
+                    "Backfilled Cozytrack source ids for %s raw tracks on %s",
+                    backfilled,
+                    record.session_uid,
+                )
             _reconcile_existing_session_roles(
                 db_file=db_file,
                 existing=record,
@@ -197,6 +216,30 @@ def ingest_session(
         record.session_uid,
     )
     return record
+
+
+def _source_ids_by_content(
+    candidate: ScanCandidate, track_source_ids: Dict[str, str]
+) -> Dict[str, str]:
+    """Map staging track content hashes to Cozytrack track ids.
+
+    Tracks with byte-identical content cannot be told apart and are
+    skipped rather than guessed at.
+    """
+    by_sha: Dict[str, str] = {}
+    duplicates = set()
+    for track in candidate.spoken_tracks:
+        source_id = track_source_ids.get(track.path.name)
+        if not source_id:
+            continue
+        sha256 = sha256_of_file(track.path)
+        if sha256 in by_sha:
+            duplicates.add(sha256)
+            continue
+        by_sha[sha256] = source_id
+    for sha256 in duplicates:
+        by_sha.pop(sha256, None)
+    return by_sha
 
 
 def _reconcile_existing_session_roles(

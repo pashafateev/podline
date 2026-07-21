@@ -305,6 +305,38 @@ def reconcile_artifact_roles(
         connection.commit()
 
 
+def backfill_artifact_source_ids(
+    db_file: str,
+    *,
+    session_uid: str,
+    source_ids_by_sha256: Dict[str, str],
+    timestamp: str,
+) -> int:
+    """Fill missing raw-track source ids by content hash.
+
+    Only artifacts without a source id are touched — an existing id is
+    provenance and never overwritten. Returns the number of updated rows.
+    """
+    if not source_ids_by_sha256:
+        return 0
+    updated = 0
+    kind = ArtifactKind.RAW_TRACK.value
+    with connect(db_file) as connection:
+        for sha256, source_id in sorted(source_ids_by_sha256.items()):
+            cursor = connection.execute(
+                """
+                UPDATE media_artifacts
+                SET source_id = ?, updated_at = ?
+                WHERE session_uid = ? AND kind = ? AND sha256 = ?
+                  AND (source_id IS NULL OR source_id = '')
+                """,
+                (source_id, timestamp, session_uid, kind, sha256),
+            )
+            updated += cursor.rowcount
+        connection.commit()
+    return updated
+
+
 def reset_session_to_queued(
     db_file: str,
     *,
