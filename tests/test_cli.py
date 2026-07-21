@@ -466,6 +466,84 @@ def test_auphonic_offset_command_prints_dry_run_plan(
     assert "applied" in result.stdout
 
 
+def test_auphonic_reset_command_requeues_session(tmp_path: Path) -> None:
+    runtime_home = tmp_path / "runtime"
+    raw_root = tmp_path / "raw"
+    config_file = tmp_path / "config.yaml"
+    _write_config(config_file, runtime_home, raw_root)
+
+    db_file = runtime_home / "state" / "state.db"
+    initialize_database(str(db_file))
+    with connect(str(db_file)) as connection:
+        connection.execute(
+            "INSERT INTO sessions (session_uid, source_path, fingerprint, status, auphonic_production_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "session-1",
+                "/tmp/source1",
+                "fingerprint-1",
+                "auphonic_previewed",
+                "prod-stale",
+                "2024",
+                "2024",
+            ),
+        )
+        connection.commit()
+
+    result = runner.invoke(
+        app, ["auphonic-reset", "session-1", "--config", str(config_file)]
+    )
+
+    assert result.exit_code == 0
+    assert "Auphonic Reset" in result.stdout
+    assert "prod-stale" in result.stdout
+    assert "pod auphonic-prepare session-1" in result.stdout
+    with connect(str(db_file)) as connection:
+        row = connection.execute(
+            "SELECT status, auphonic_production_id FROM sessions WHERE session_uid = ?",
+            ("session-1",),
+        ).fetchone()
+    assert row["status"] == "queued"
+    assert row["auphonic_production_id"] is None
+
+
+def test_auphonic_reset_command_rejects_started_session(tmp_path: Path) -> None:
+    runtime_home = tmp_path / "runtime"
+    raw_root = tmp_path / "raw"
+    config_file = tmp_path / "config.yaml"
+    _write_config(config_file, runtime_home, raw_root)
+
+    db_file = runtime_home / "state" / "state.db"
+    initialize_database(str(db_file))
+    with connect(str(db_file)) as connection:
+        connection.execute(
+            "INSERT INTO sessions (session_uid, source_path, fingerprint, status, auphonic_production_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "session-1",
+                "/tmp/source1",
+                "fingerprint-1",
+                "auphonic_started",
+                "prod-live",
+                "2024",
+                "2024",
+            ),
+        )
+        connection.commit()
+
+    result = runner.invoke(
+        app, ["auphonic-reset", "session-1", "--config", str(config_file)]
+    )
+
+    assert result.exit_code == 1
+    assert "must be auphonic_prepared or auphonic_previewed" in result.stdout
+    with connect(str(db_file)) as connection:
+        row = connection.execute(
+            "SELECT status, auphonic_production_id FROM sessions WHERE session_uid = ?",
+            ("session-1",),
+        ).fetchone()
+    assert row["status"] == "auphonic_started"
+    assert row["auphonic_production_id"] == "prod-live"
+
+
 def test_status_uses_sectioned_output(tmp_path: Path) -> None:
     runtime_home = tmp_path / "runtime"
     raw_root = tmp_path / "raw"

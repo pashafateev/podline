@@ -22,6 +22,7 @@ from podline.auphonic import (
     process_session_with_auphonic,
     reconcile_production_to_session,
     refresh_transcript_with_auphonic,
+    reset_session_auphonic_production,
     resolve_auphonic_service_id,
     resolve_preset_id,
     start_prepared_session_with_auphonic,
@@ -1330,6 +1331,71 @@ def test_session_offset_fails_when_track_matching_is_ambiguous(
     assert "Ambiguous" in str(exc_info.value)
     assert "Pasha-a" in str(exc_info.value)
     assert "Pasha-b" in str(exc_info.value)
+
+
+def test_auphonic_reset_requeues_prepared_session(
+    app_config_factory, runtime_factory, session_factory, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = session_factory(
+        runtime_paths.db_file,
+        session_uid="session-reset-1",
+        status="auphonic_previewed",
+        auphonic_production_id="prod-old",
+    )
+
+    refreshed = reset_session_auphonic_production(
+        db_file=runtime_paths.db_file,
+        session=session,
+    )
+
+    assert refreshed.status == "queued"
+    assert refreshed.auphonic_production_id is None
+
+    from podline.db import connect
+
+    with connect(runtime_paths.db_file) as connection:
+        events = connection.execute(
+            "SELECT from_state, to_state, detail FROM events WHERE session_uid = ?",
+            (session.session_uid,),
+        ).fetchall()
+    assert [
+        (event["from_state"], event["to_state"]) for event in events
+    ] == [("auphonic_previewed", "queued")]
+    assert "prod-old" in events[0]["detail"]
+
+    # A second reset with the stale session object must fail loudly: the
+    # status guard protects against racing transitions.
+    with pytest.raises(RuntimeError, match="status changed underneath"):
+        reset_session_auphonic_production(
+            db_file=runtime_paths.db_file,
+            session=session,
+        )
+
+
+@pytest.mark.parametrize(
+    "status", ["queued", "auphonic_started", "waiting_for_finalize", "draft_created"]
+)
+def test_auphonic_reset_rejects_non_resettable_states(
+    app_config_factory, runtime_factory, session_factory, tmp_path, status
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = session_factory(
+        runtime_paths.db_file,
+        session_uid=f"session-reset-{status}",
+        status=status,
+        auphonic_production_id="prod-old",
+    )
+
+    with pytest.raises(
+        AuphonicError, match="must be auphonic_prepared or auphonic_previewed"
+    ):
+        reset_session_auphonic_production(
+            db_file=runtime_paths.db_file,
+            session=session,
+        )
 
 
 def test_done_status_is_not_treated_as_failed() -> None:

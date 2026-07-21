@@ -2,7 +2,7 @@ import logging
 import re
 import shutil
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -10,6 +10,7 @@ from podline.config import AppConfig
 from podline.cozytrack.client import (
     CozytrackClient,
     CozytrackClientProtocol,
+    CozytrackError,
     CozytrackSession,
     CozytrackTrack,
     host_channel_number,
@@ -17,7 +18,11 @@ from podline.cozytrack.client import (
 )
 from podline.ingest import DurationProbe, register_candidate_with_storage
 from podline.models import RuntimePaths, ScanCandidate, SessionRecord, UnsupportedSession
-from podline.repository import get_session_by_cozytrack_id
+from podline.repository import (
+    get_session_by_cozytrack_id,
+    list_media_artifacts,
+    reconcile_artifact_roles,
+)
 from podline.scanner import _parse_session_dir
 from podline.storage import MediaStorage
 
@@ -69,6 +74,20 @@ def ingest_session(
             "Cozytrack session %s already ingested as %s",
             cozytrack_session_id,
             existing.session_uid,
+        )
+        client = client or CozytrackClient(config)
+        try:
+            cozytrack_session = client.get_session(cozytrack_session_id)
+        except CozytrackError as exc:
+            raise CozytrackIngestError(
+                f"Could not load Cozytrack session {cozytrack_session_id} to "
+                f"verify roles for {existing.session_uid}: {exc}"
+            ) from exc
+        _reconcile_existing_session_roles(
+            db_file=db_file,
+            existing=existing,
+            cozytrack_session=cozytrack_session,
+            logger=logger,
         )
         return existing
 
@@ -139,7 +158,7 @@ def ingest_session(
         if roles_by_filename:
             parsed = _candidate_with_participant_roles(parsed, roles_by_filename)
 
-        record, _created = register_candidate_with_storage(
+        record, created = register_candidate_with_storage(
             config=config,
             runtime_paths=runtime_paths,
             db_file=db_file,
@@ -151,6 +170,16 @@ def ingest_session(
             duration_probe=duration_probe,
             logger=logger,
         )
+        if not created:
+            # Same content already registered (e.g. pod import backfilled
+            # with this Cozytrack id); its stored roles may predate
+            # participant-derived naming.
+            _reconcile_existing_session_roles(
+                db_file=db_file,
+                existing=record,
+                cozytrack_session=session,
+                logger=logger,
+            )
     except CozytrackIngestError:
         shutil.rmtree(folder, ignore_errors=True)
         raise
@@ -168,6 +197,83 @@ def ingest_session(
         record.session_uid,
     )
     return record
+
+
+def _reconcile_existing_session_roles(
+    *,
+    db_file: str,
+    existing: SessionRecord,
+    cozytrack_session: CozytrackSession,
+    logger: Optional[logging.Logger],
+) -> None:
+    """Re-align persisted raw-track roles with Cozytrack participant identity.
+
+    Sessions ingested before roles derived from participant ids (or before
+    Cozytrack exposed them) can hold download-order roles that mislabel a
+    guest interleaved between host channels. Re-running ingest is the
+    migration path: when every spoken artifact maps to a Cozytrack track by
+    source id, mismatched roles are rewritten in place; otherwise the
+    session is left untouched with a warning. Filenames and content are
+    never modified.
+    """
+    roles_by_track_id = _derive_participant_roles(cozytrack_session.tracks)
+    if roles_by_track_id is None:
+        return
+    artifacts = [
+        artifact
+        for artifact in list_media_artifacts(
+            db_file, existing.session_uid, kind="raw_track"
+        )
+        if artifact.role != "mix"
+    ]
+    if not artifacts:
+        return
+
+    role_updates: Dict[str, str] = {}
+    for artifact in artifacts:
+        source_id = (artifact.source_id or "").strip()
+        derived_role = roles_by_track_id.get(source_id) if source_id else None
+        if derived_role is None:
+            _log(
+                logger,
+                "Cannot verify roles for %s: artifact %s (role=%s) has no "
+                "matching Cozytrack track; leaving roles unchanged",
+                existing.session_uid,
+                artifact.filename,
+                artifact.role,
+            )
+            return
+        if derived_role != artifact.role:
+            role_updates[artifact.role] = derived_role
+    if not role_updates:
+        return
+
+    changes = ", ".join(
+        f"{old}->{new}" for old, new in sorted(role_updates.items())
+    )
+    reconcile_artifact_roles(
+        db_file,
+        session_uid=existing.session_uid,
+        status=existing.status,
+        role_updates=role_updates,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        detail=f"reconciled raw track roles from Cozytrack participant ids: {changes}",
+    )
+    _log(
+        logger,
+        "Reconciled roles for %s from Cozytrack participant ids: %s",
+        existing.session_uid,
+        changes,
+    )
+    if existing.auphonic_production_id:
+        _log(
+            logger,
+            "Session %s has Auphonic production %s prepared under the old "
+            "roles; run 'pod auphonic-reset %s' and re-run auphonic-prepare",
+            existing.session_uid,
+            existing.auphonic_production_id,
+            existing.session_uid,
+        )
 
 
 def _derive_participant_roles(

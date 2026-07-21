@@ -9,7 +9,7 @@ Current scope
 - The working manual-assisted path is implemented end to end through Podbean draft creation, with a Podline-owned S3 bucket as the authoritative store for all new session media.
 - Core inspection commands: `pod init`, `pod health`, `pod list`, `pod status`, `pod cache-clear`.
 - Ingest commands: `pod ct-list`, `pod ct-ingest` (Cozytrack) and `pod import <folder>` (Riverside/local). `pod scan` and `pod refresh` are retired — they registered drive-path sessions the S3 pipeline cannot process.
-- Auphonic commands: `pod auphonic-prepare`, `pod auphonic-preview`, `pod auphonic-offset`, `pod auphonic-start`, `pod auphonic-inspect`, `pod auphonic-sync`. Productions read audio directly from S3 through the Auphonic external service — there are no local uploads.
+- Auphonic commands: `pod auphonic-prepare`, `pod auphonic-preview`, `pod auphonic-offset`, `pod auphonic-start`, `pod auphonic-reset`, `pod auphonic-inspect`, `pod auphonic-sync`. Productions read audio directly from S3 through the Auphonic external service — there are no local uploads. `auphonic-reset` abandons a prepared/previewed production and requeues the session for a fresh prepare (e.g. after a role reconciliation).
 - Editing and post-edit commands: `pod workspace`, `pod finalize`, `pod transcript-refresh`, `pod episode-meta`, `pod podbean-draft`.
 - The external drive is no longer required for the pipeline; it remains readable history for pre-S3 sessions. File-touching commands on those old sessions fail with a clear "no artifacts registered" error.
 - `recorded_at` is best-effort metadata. The recorder date is not always reliable, so this value may reflect filesystem timing rather than a true recording timestamp.
@@ -78,6 +78,7 @@ pod list
 Notes on ingest:
 - Tracks are hashed and uploaded to `s3://<bucket>/sessions/<uid>/raw_track/...`; packet-derived durations are stored for the offset step. Nothing is written to the external drive.
 - Cozytrack roles come from stable participant ids (`host-local-ch-N` → hostN, guests numbered by recorder start order), and files are named in recorder order — not row-creation order, which can interleave a guest between host channels. Sessions without participant ids keep the legacy creation-order naming.
+- Re-running `pod ct-ingest` on an already-ingested session reconciles its stored roles against Cozytrack participant ids (the migration path for sessions ingested before identity-based roles). If roles change on a session that already has a prepared production, run `pod auphonic-reset` and re-run `pod auphonic-prepare`/`auphonic-offset` so the preset wiring picks up the corrected roles.
 - Cozytrack downloads land in a disposable staging folder that is removed after registration; re-running `pod ct-ingest <id>` is a no-op, and re-importing an identical folder is detected by content fingerprint.
 - WebM/Opus stems are passed through to Auphonic as-is via the S3 service reference.
 

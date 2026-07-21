@@ -39,6 +39,7 @@ from podline.repository import (
     get_session,
     list_media_artifacts,
     record_transcript_refresh_production,
+    reset_session_to_queued,
     update_media_artifact_duration,
     update_session_status,
 )
@@ -1341,6 +1342,55 @@ def offset_session_auphonic_production(
             )
         track_states.append(track_state)
     return AuphonicOffsetResult(plan=plan, applied=True, track_states=track_states)
+
+
+_AUPHONIC_RESETTABLE_STATUSES = {
+    SessionStatus.AUPHONIC_PREPARED.value,
+    SessionStatus.AUPHONIC_PREVIEWED.value,
+}
+
+
+def reset_session_auphonic_production(
+    *,
+    db_file: str,
+    session: SessionRecord,
+    logger: Optional[logging.Logger] = None,
+) -> SessionRecord:
+    """Abandon the prepared Auphonic production and requeue the session.
+
+    Prepare wires preset tracks from roles at prepare time, so a production
+    created before a role fix keeps the old wiring; offsets applied before a
+    duration fix keep the old alignment. Resetting returns the session to
+    queued for a fresh prepare/offset/preview cycle. The abandoned
+    production is left untouched on Auphonic; only editing states before
+    start are resettable — once outputs are persisted a reset would orphan
+    downstream artifacts.
+    """
+    if session.status not in _AUPHONIC_RESETTABLE_STATUSES:
+        raise AuphonicError(
+            f"Session {session.session_uid} must be auphonic_prepared or "
+            f"auphonic_previewed to reset; status is {session.status}"
+        )
+    production_id = session.auphonic_production_id or "none"
+    reset_session_to_queued(
+        db_file,
+        session_uid=session.session_uid,
+        from_state=session.status,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        detail=f"abandoned Auphonic production {production_id} for rebuild",
+    )
+    _log(
+        logger,
+        "Reset %s to queued; abandoned Auphonic production %s",
+        session.session_uid,
+        production_id,
+    )
+    refreshed = get_session(db_file, session.session_uid)
+    if refreshed is None:
+        raise AuphonicError(
+            f"Session {session.session_uid} was not found after reset"
+        )
+    return refreshed
 
 
 def reconcile_production_to_session(
