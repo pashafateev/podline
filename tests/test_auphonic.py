@@ -738,13 +738,14 @@ def _cozytrack_offset_session(
     artifact_registrar,
     *,
     tracks,
+    cozytrack_session_id="ct-session-1",
 ):
     session = session_factory(
         runtime_paths.db_file,
         session_uid="session-offset-cozytrack",
         status="auphonic_prepared",
         auphonic_production_id="prod-123",
-        cozytrack_session_id="ct-session-1",
+        cozytrack_session_id=cozytrack_session_id,
     )
     cozytrack_tracks = []
     for index, (role, filename, duration, participant_id) in enumerate(tracks, start=1):
@@ -773,13 +774,21 @@ def _cozytrack_offset_session(
         )
     return session, FakeOffsetCozytrackClient(
         CozytrackSession(
-            id="ct-session-1",
+            id=cozytrack_session_id or "ct-session-1",
             name="Mixed local and remote",
             status="ready",
             finalized_at="2026-07-18T01:30:00Z",
             tracks=cozytrack_tracks,
         )
     )
+
+
+def _three_auphonic_tracks():
+    return [
+        {"id": "Host", "type": "multitrack", "input_file": "Tr1.webm"},
+        {"id": "Remote 1", "type": "multitrack", "input_file": "Tr2.webm"},
+        {"id": "Remote 2", "type": "multitrack", "input_file": "Tr3.webm"},
+    ]
 
 
 def test_session_offset_keeps_two_local_tracks_at_zero_and_targets_remote(
@@ -876,6 +885,239 @@ def test_session_offset_targets_each_remote_against_one_local_reference(
         ("prod-123", "Alice", pytest.approx(1.5)),
         ("prod-123", "Bob", pytest.approx(2.75)),
     ]
+
+
+def test_session_offset_skips_aligned_remote_and_updates_shorter_remote(
+    app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session, cozytrack_client = _cozytrack_offset_session(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        tracks=[
+            ("host1", "Tr1.webm", 100.0, "host"),
+            ("host2", "Tr2.webm", 100.0, "guest-aligned"),
+            ("guest1", "Tr3.webm", 97.25, "guest-late"),
+        ],
+    )
+    client = FakeOffsetAuphonicClient(tracks=_three_auphonic_tracks())
+
+    result = offset_session_auphonic_production(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        apply=True,
+        client=client,
+        cozytrack_client=cozytrack_client,
+    )
+
+    assert [asset.filename for asset in result.plan.aligned_assets] == ["Tr2.webm"]
+    assert [target.asset.filename for target in result.plan.targets] == ["Tr3.webm"]
+    assert client.offset_updates == [
+        ("prod-123", "Remote 2", pytest.approx(2.75))
+    ]
+
+
+def test_session_offset_multitrack_dry_run_does_not_update_auphonic(
+    app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session, cozytrack_client = _cozytrack_offset_session(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        tracks=[
+            ("host1", "Tr1.webm", 100.0, "host"),
+            ("host2", "Tr2.webm", 98.5, "guest-alice"),
+            ("guest1", "Tr3.webm", 97.25, "guest-bob"),
+        ],
+    )
+    client = FakeOffsetAuphonicClient(tracks=_three_auphonic_tracks())
+
+    result = offset_session_auphonic_production(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        apply=False,
+        client=client,
+        cozytrack_client=cozytrack_client,
+    )
+
+    assert [target.asset.filename for target in result.plan.targets] == [
+        "Tr2.webm",
+        "Tr3.webm",
+    ]
+    assert result.applied is False
+    assert result.track_states == []
+    assert client.offset_updates == []
+
+
+def test_session_offset_requires_cozytrack_topology_for_more_than_two_tracks(
+    app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session, cozytrack_client = _cozytrack_offset_session(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        tracks=[
+            ("host1", "Tr1.webm", 100.0, "host"),
+            ("host2", "Tr2.webm", 99.0, "guest-a"),
+            ("guest1", "Tr3.webm", 98.0, "guest-b"),
+        ],
+        cozytrack_session_id=None,
+    )
+
+    with pytest.raises(AuphonicError, match="no Cozytrack session id"):
+        plan_session_auphonic_offset(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=session,
+            client=FakeOffsetAuphonicClient(tracks=_three_auphonic_tracks()),
+            cozytrack_client=cozytrack_client,
+        )
+
+
+def test_session_offset_rejects_unmatched_cozytrack_source_id(
+    app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session, cozytrack_client = _cozytrack_offset_session(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        tracks=[
+            ("host1", "Tr1.webm", 100.0, "host"),
+            ("host2", "Tr2.webm", 99.0, "guest-a"),
+            ("guest1", "Tr3.webm", 98.0, "guest-b"),
+        ],
+    )
+    cozytrack_client.session = CozytrackSession(
+        id=cozytrack_client.session.id,
+        name=cozytrack_client.session.name,
+        status=cozytrack_client.session.status,
+        finalized_at=cozytrack_client.session.finalized_at,
+        tracks=cozytrack_client.session.tracks[:-1],
+    )
+
+    with pytest.raises(AuphonicError, match="Tr3.webm.*source_id=ct-track-3"):
+        plan_session_auphonic_offset(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=session,
+            client=FakeOffsetAuphonicClient(tracks=_three_auphonic_tracks()),
+            cozytrack_client=cozytrack_client,
+        )
+
+
+def test_session_offset_requires_participant_id_for_multitrack_topology(
+    app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session, cozytrack_client = _cozytrack_offset_session(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        tracks=[
+            ("host1", "Tr1.webm", 100.0, "host"),
+            ("host2", "Tr2.webm", 99.0, None),
+            ("guest1", "Tr3.webm", 98.0, "guest-b"),
+        ],
+    )
+
+    with pytest.raises(AuphonicError, match="Tr2.webm has no participantId"):
+        plan_session_auphonic_offset(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=session,
+            client=FakeOffsetAuphonicClient(tracks=_three_auphonic_tracks()),
+            cozytrack_client=cozytrack_client,
+        )
+
+
+@pytest.mark.parametrize(
+    ("participant_ids", "expected_counts"),
+    [
+        (["host", "host-local-ch-1", "host-local-ch-2"], "3 local and 0 remote"),
+        (["guest-a", "guest-b", "guest-c"], "0 local and 3 remote"),
+    ],
+)
+def test_session_offset_requires_both_local_and_remote_tracks(
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
+    participant_ids,
+    expected_counts,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session, cozytrack_client = _cozytrack_offset_session(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        tracks=[
+            ("host1", "Tr1.webm", 100.0, participant_ids[0]),
+            ("host2", "Tr2.webm", 99.0, participant_ids[1]),
+            ("guest1", "Tr3.webm", 98.0, participant_ids[2]),
+        ],
+    )
+
+    with pytest.raises(AuphonicError, match=expected_counts):
+        plan_session_auphonic_offset(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=session,
+            client=FakeOffsetAuphonicClient(tracks=_three_auphonic_tracks()),
+            cozytrack_client=cozytrack_client,
+        )
+
+
+def test_session_offset_rejects_remote_longer_than_local_reference(
+    app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session, cozytrack_client = _cozytrack_offset_session(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        tracks=[
+            ("host1", "Tr1.webm", 100.0, "host"),
+            ("host2", "Tr2.webm", 101.0, "guest-a"),
+            ("guest1", "Tr3.webm", 98.0, "guest-b"),
+        ],
+    )
+
+    with pytest.raises(AuphonicError, match="Tr2.webm is not shorter"):
+        plan_session_auphonic_offset(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=session,
+            client=FakeOffsetAuphonicClient(tracks=_three_auphonic_tracks()),
+            cozytrack_client=cozytrack_client,
+        )
 
 
 def test_session_offset_plan_uses_stored_durations(

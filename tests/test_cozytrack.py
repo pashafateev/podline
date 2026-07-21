@@ -10,6 +10,7 @@ from podline.cozytrack.client import (
     CozytrackError,
     CozytrackSession,
     CozytrackTrack,
+    is_host_participant,
 )
 from podline.cozytrack.ingest import (
     CozytrackIngestError,
@@ -62,6 +63,22 @@ class FakeCozytrackClient:
             self.downloads.get(track_id, f"audio-data-{track_id}".encode("utf-8"))
         )
         self.downloaded_paths.append(destination)
+
+
+@pytest.mark.parametrize(
+    ("participant_id", "expected"),
+    [
+        ("host", True),
+        ("host-local-ch-1", True),
+        ("host-local-ch-2", True),
+        ("guest-1", False),
+        ("", False),
+    ],
+)
+def test_is_host_participant_uses_cozytrack_identity_contract(
+    participant_id: str, expected: bool
+) -> None:
+    assert is_host_participant(participant_id) is expected
 
 
 def _make_session(

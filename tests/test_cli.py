@@ -421,6 +421,7 @@ def test_auphonic_offset_command_prints_dry_run_plan(
     calls = []
     tr1 = AssetRecord("host1", "Tr1.webm", 9, "/tmp/source2/Tr1.webm")
     tr2 = AssetRecord("host2", "Tr2.webm", 9, "/tmp/source2/Tr2.webm")
+    tr3 = AssetRecord("guest1", "Tr3.webm", 9, "/tmp/source2/Tr3.webm")
 
     def fake_offset(*, config, runtime_paths, db_file, session, apply):
         calls.append((session.session_uid, apply))
@@ -430,6 +431,7 @@ def test_auphonic_offset_command_prints_dry_run_plan(
                 asset_durations=[
                     AuphonicAssetDuration(tr1, 101.234),
                     AuphonicAssetDuration(tr2, 99.433),
+                    AuphonicAssetDuration(tr3, 101.234),
                 ],
                 reference_assets=[tr1],
                 reference_asset=tr1,
@@ -441,6 +443,7 @@ def test_auphonic_offset_command_prints_dry_run_plan(
                         offset_seconds=1.801,
                     )
                 ],
+                aligned_assets=[tr3],
             ),
             applied=False,
             track_states=[],
@@ -458,6 +461,8 @@ def test_auphonic_offset_command_prints_dry_run_plan(
     assert "Tr2.webm" in result.stdout
     assert "offset_seconds" in result.stdout
     assert "1.801" in result.stdout
+    assert "Already Aligned" in result.stdout
+    assert "Tr3.webm" in result.stdout
     assert "applied" in result.stdout
 
 
