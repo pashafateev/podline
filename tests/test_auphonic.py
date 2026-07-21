@@ -26,6 +26,7 @@ from podline.auphonic import (
     resolve_preset_id,
     start_prepared_session_with_auphonic,
 )
+from podline.cozytrack.client import CozytrackSession, CozytrackTrack
 from podline.repository import (
     get_episode,
     get_media_artifact,
@@ -718,6 +719,153 @@ def _offset_session(
         duration_seconds=99.433 if durations else None,
     )
     return session
+
+
+class FakeOffsetCozytrackClient:
+    def __init__(self, session: CozytrackSession) -> None:
+        self.session = session
+        self.requested_session_ids = []
+
+    def get_session(self, session_id: str) -> CozytrackSession:
+        self.requested_session_ids.append(session_id)
+        return self.session
+
+
+def _cozytrack_offset_session(
+    tmp_path,
+    runtime_paths,
+    session_factory,
+    artifact_registrar,
+    *,
+    tracks,
+):
+    session = session_factory(
+        runtime_paths.db_file,
+        session_uid="session-offset-cozytrack",
+        status="auphonic_prepared",
+        auphonic_production_id="prod-123",
+        cozytrack_session_id="ct-session-1",
+    )
+    cozytrack_tracks = []
+    for index, (role, filename, duration, participant_id) in enumerate(tracks, start=1):
+        path = tmp_path / filename
+        path.write_bytes(f"track-{index}".encode())
+        source_id = f"ct-track-{index}"
+        artifact_registrar(
+            runtime_paths.db_file,
+            runtime_paths,
+            session_uid=session.session_uid,
+            kind="raw_track",
+            role=role,
+            path=path,
+            duration_seconds=duration,
+            source_provider="cozytrack",
+            source_id=source_id,
+        )
+        cozytrack_tracks.append(
+            CozytrackTrack(
+                id=source_id,
+                participant_name=role,
+                status="complete",
+                created_at=f"2026-07-18T00:00:0{index}Z",
+                participant_id=participant_id,
+            )
+        )
+    return session, FakeOffsetCozytrackClient(
+        CozytrackSession(
+            id="ct-session-1",
+            name="Mixed local and remote",
+            status="ready",
+            finalized_at="2026-07-18T01:30:00Z",
+            tracks=cozytrack_tracks,
+        )
+    )
+
+
+def test_session_offset_keeps_two_local_tracks_at_zero_and_targets_remote(
+    app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session, cozytrack_client = _cozytrack_offset_session(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        tracks=[
+            ("host1", "Tr1.webm", 4529.511, "host-local-ch-1"),
+            ("host2", "Tr2.webm", 4528.060, "host-local-ch-2"),
+            ("guest1", "Tr3.webm", 4526.871, "guest-laura"),
+        ],
+    )
+    client = FakeOffsetAuphonicClient(
+        tracks=[
+            {"id": "Local 1", "type": "multitrack", "input_file": "Tr1.webm"},
+            {"id": "Local 2", "type": "multitrack", "input_file": "Tr2.webm"},
+            {"id": "Laura", "type": "multitrack", "input_file": "Tr3.webm"},
+        ]
+    )
+
+    plan = plan_session_auphonic_offset(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        client=client,
+        cozytrack_client=cozytrack_client,
+    )
+
+    assert cozytrack_client.requested_session_ids == ["ct-session-1"]
+    assert [asset.filename for asset in plan.reference_assets] == [
+        "Tr1.webm",
+        "Tr2.webm",
+    ]
+    assert plan.reference_asset.filename == "Tr1.webm"
+    assert [target.asset.filename for target in plan.targets] == ["Tr3.webm"]
+    assert plan.targets[0].track_id == "Laura"
+    assert plan.targets[0].offset_seconds == pytest.approx(2.640)
+
+
+def test_session_offset_targets_each_remote_against_one_local_reference(
+    app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session, cozytrack_client = _cozytrack_offset_session(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        tracks=[
+            ("host1", "Tr1.webm", 100.0, "host"),
+            ("host2", "Tr2.webm", 98.5, "guest-alice"),
+            ("guest1", "Tr3.webm", 97.25, "guest-bob"),
+        ],
+    )
+    client = FakeOffsetAuphonicClient(
+        tracks=[
+            {"id": "Host", "type": "multitrack", "input_file": "Tr1.webm"},
+            {"id": "Alice", "type": "multitrack", "input_file": "Tr2.webm"},
+            {"id": "Bob", "type": "multitrack", "input_file": "Tr3.webm"},
+        ]
+    )
+
+    plan = plan_session_auphonic_offset(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        client=client,
+        cozytrack_client=cozytrack_client,
+    )
+
+    assert [target.asset.filename for target in plan.targets] == [
+        "Tr2.webm",
+        "Tr3.webm",
+    ]
+    assert [target.offset_seconds for target in plan.targets] == pytest.approx(
+        [1.5, 2.75]
+    )
 
 
 def test_session_offset_plan_uses_stored_durations(
