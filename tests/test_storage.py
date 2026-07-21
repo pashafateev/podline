@@ -1,7 +1,10 @@
+import logging
 from pathlib import Path
 
 import boto3
 import pytest
+from boto3.exceptions import S3UploadFailedError
+from botocore.exceptions import ClientError, ConnectionClosedError, EndpointConnectionError
 from moto import mock_aws
 
 from podline.config import StorageConfig
@@ -35,6 +38,19 @@ def _storage_config(bucket: str = BUCKET) -> StorageConfig:
 def _make_storage() -> MediaStorage:
     boto3.client("s3", region_name="us-east-1").create_bucket(Bucket=BUCKET)
     return MediaStorage(_storage_config())
+
+
+def _wrapped_upload_error(*, code: str, status: int) -> S3UploadFailedError:
+    client_error = ClientError(
+        {
+            "Error": {"Code": code, "Message": f"{code} during multipart upload"},
+            "ResponseMetadata": {"HTTPStatusCode": status},
+        },
+        "UploadPart",
+    )
+    wrapped = S3UploadFailedError(f"multipart transfer failed: {client_error}")
+    wrapped.__cause__ = client_error
+    return wrapped
 
 
 def test_build_session_key_shapes_content_addressed_paths() -> None:
@@ -212,17 +228,148 @@ def test_upload_file_refuses_same_size_object_with_different_content(
 
 
 @mock_aws
-def test_upload_file_wraps_transfer_errors(tmp_path: Path, monkeypatch) -> None:
-    from boto3.exceptions import S3UploadFailedError
-
+def test_upload_file_retries_connection_closed_then_succeeds(
+    tmp_path: Path, monkeypatch
+) -> None:
     storage = _make_storage()
     source = tmp_path / "track.webm"
     source.write_bytes(b"opus-bytes")
+    key = "sessions/s1/raw_track/aaa/track.webm"
+    original_upload = storage._client.upload_file
+    attempts = []
+    delays = []
+
+    def _flaky_upload(*args, **kwargs):
+        attempts.append(args)
+        if len(attempts) == 1:
+            raise ConnectionClosedError(endpoint_url="https://s3.test/upload")
+        return original_upload(*args, **kwargs)
+
+    monkeypatch.setattr(storage._client, "upload_file", _flaky_upload)
+    monkeypatch.setattr("time.sleep", delays.append)
+
+    uri = storage.upload_file(
+        local_path=source,
+        key=key,
+        content_type="audio/webm",
+        sha256=sha256_of_file(source),
+    )
+
+    assert uri == f"s3://{BUCKET}/{key}"
+    assert len(attempts) == 2
+    assert len(delays) == 1
+
+
+@mock_aws
+def test_upload_file_retries_wrapped_slowdown_then_succeeds(
+    tmp_path: Path, monkeypatch
+) -> None:
+    storage = _make_storage()
+    source = tmp_path / "track.webm"
+    source.write_bytes(b"opus-bytes")
+    key = "sessions/s1/raw_track/aaa/track.webm"
+    original_upload = storage._client.upload_file
+    attempts = []
+
+    def _flaky_upload(*args, **kwargs):
+        attempts.append(args)
+        if len(attempts) == 1:
+            raise _wrapped_upload_error(code="SlowDown", status=503)
+        return original_upload(*args, **kwargs)
+
+    monkeypatch.setattr(storage._client, "upload_file", _flaky_upload)
+    monkeypatch.setattr("time.sleep", lambda _delay: None)
+
+    uri = storage.upload_file(
+        local_path=source,
+        key=key,
+        content_type="audio/webm",
+        sha256=sha256_of_file(source),
+    )
+
+    assert uri == f"s3://{BUCKET}/{key}"
+    assert len(attempts) == 2
+
+
+@mock_aws
+def test_upload_file_accepts_ambiguous_success_without_uploading_again(
+    tmp_path: Path, monkeypatch
+) -> None:
+    storage = _make_storage()
+    source = tmp_path / "track.webm"
+    source.write_bytes(b"opus-bytes")
+    key = "sessions/s1/raw_track/aaa/track.webm"
+    original_upload = storage._client.upload_file
+    attempts = []
+    delays = []
+
+    def _store_then_disconnect(*args, **kwargs):
+        attempts.append(args)
+        original_upload(*args, **kwargs)
+        raise ConnectionClosedError(
+            endpoint_url="https://s3.test/upload?uploadId=secret-id&partNumber=7"
+        )
+
+    monkeypatch.setattr(storage._client, "upload_file", _store_then_disconnect)
+    monkeypatch.setattr("time.sleep", delays.append)
+
+    uri = storage.upload_file(
+        local_path=source,
+        key=key,
+        content_type="audio/webm",
+        sha256=sha256_of_file(source),
+    )
+
+    assert uri == f"s3://{BUCKET}/{key}"
+    assert len(attempts) == 1
+    assert delays == []
+
+
+@mock_aws
+def test_upload_file_exhausts_transient_retries_as_storage_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    storage = _make_storage()
+    source = tmp_path / "track.webm"
+    source.write_bytes(b"opus-bytes")
+    attempts = []
+    delays = []
+
+    def _unavailable(*args, **kwargs):
+        attempts.append(args)
+        raise EndpointConnectionError(endpoint_url="https://s3.test/upload")
+
+    monkeypatch.setattr(storage._client, "upload_file", _unavailable)
+    monkeypatch.setattr("time.sleep", delays.append)
+
+    with pytest.raises(StorageError, match="after 3 attempts"):
+        storage.upload_file(
+            local_path=source,
+            key="sessions/s1/raw_track/aaa/track.webm",
+            content_type="audio/webm",
+            sha256=sha256_of_file(source),
+        )
+
+    assert len(attempts) == 3
+    assert len(delays) == 2
+
+
+@mock_aws
+def test_upload_file_does_not_retry_permanent_access_denied(
+    tmp_path: Path, monkeypatch
+) -> None:
+    storage = _make_storage()
+    source = tmp_path / "track.webm"
+    source.write_bytes(b"opus-bytes")
+    attempts = []
+    delays = []
 
     def _denied(*_args, **_kwargs):
-        raise S3UploadFailedError("AccessDenied while uploading")
+        attempts.append(_args)
+        raise _wrapped_upload_error(code="AccessDenied", status=403)
 
     monkeypatch.setattr(storage._client, "upload_file", _denied)
+    monkeypatch.setattr("time.sleep", delays.append)
     with pytest.raises(StorageError, match="S3 upload failed"):
         storage.upload_file(
             local_path=source,
@@ -230,6 +377,44 @@ def test_upload_file_wraps_transfer_errors(tmp_path: Path, monkeypatch) -> None:
             content_type="audio/webm",
             sha256=sha256_of_file(source),
         )
+
+    assert len(attempts) == 1
+    assert delays == []
+
+
+@mock_aws
+def test_upload_file_redacts_endpoint_queries_from_logs_and_final_error(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    storage = _make_storage()
+    source = tmp_path / "track.webm"
+    source.write_bytes(b"opus-bytes")
+    endpoint = (
+        "https://bucket.s3.test/track.webm"
+        "?uploadId=secret-multipart-id&partNumber=42&X-Amz-Signature=secret-signature"
+    )
+
+    def _disconnect(*_args, **_kwargs):
+        raise ConnectionClosedError(endpoint_url=endpoint)
+
+    monkeypatch.setattr(storage._client, "upload_file", _disconnect)
+    monkeypatch.setattr("time.sleep", lambda _delay: None)
+    caplog.set_level(logging.WARNING, logger="podline")
+
+    with pytest.raises(StorageError) as exc_info:
+        storage.upload_file(
+            local_path=source,
+            key="sessions/s1/raw_track/aaa/track.webm",
+            content_type="audio/webm",
+            sha256=sha256_of_file(source),
+        )
+
+    visible_text = f"{caplog.text}\n{exc_info.value}"
+    assert "uploadId" not in visible_text
+    assert "partNumber" not in visible_text
+    assert "secret-multipart-id" not in visible_text
+    assert "secret-signature" not in visible_text
+    assert "https://bucket.s3.test/track.webm?<redacted>" in str(exc_info.value)
 
 
 @mock_aws
