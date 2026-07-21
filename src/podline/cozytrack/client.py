@@ -11,12 +11,25 @@ class CozytrackError(RuntimeError):
     pass
 
 
+_HOST_PARTICIPANT_ID = "host"
+_HOST_LOCAL_PARTICIPANT_PREFIX = "host-local-ch-"
+
+
+def is_host_participant(participant_id: str) -> bool:
+    """Return whether a stable Cozytrack participant id is host-local."""
+    normalized = participant_id.strip()
+    return normalized == _HOST_PARTICIPANT_ID or normalized.startswith(
+        _HOST_LOCAL_PARTICIPANT_PREFIX
+    )
+
+
 @dataclass(frozen=True)
 class CozytrackTrack:
     id: str
     participant_name: Optional[str]
     status: Optional[str]
     created_at: Optional[str]
+    participant_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -137,6 +150,7 @@ def _parse_track(payload: Dict[str, Any]) -> CozytrackTrack:
         participant_name=_optional_str(payload.get("participantName")),
         status=_optional_str(payload.get("status")),
         created_at=_optional_str(payload.get("createdAt")),
+        participant_id=_optional_str(payload.get("participantId")),
     )
 
 

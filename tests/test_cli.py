@@ -11,6 +11,7 @@ from podline.auphonic import (
     AuphonicError,
     AuphonicOffsetPlan,
     AuphonicOffsetResult,
+    AuphonicOffsetTarget,
 )
 from podline.cli import app
 from podline.db import connect, initialize_database
@@ -420,6 +421,7 @@ def test_auphonic_offset_command_prints_dry_run_plan(
     calls = []
     tr1 = AssetRecord("host1", "Tr1.webm", 9, "/tmp/source2/Tr1.webm")
     tr2 = AssetRecord("host2", "Tr2.webm", 9, "/tmp/source2/Tr2.webm")
+    tr3 = AssetRecord("guest1", "Tr3.webm", 9, "/tmp/source2/Tr3.webm")
 
     def fake_offset(*, config, runtime_paths, db_file, session, apply):
         calls.append((session.session_uid, apply))
@@ -429,15 +431,22 @@ def test_auphonic_offset_command_prints_dry_run_plan(
                 asset_durations=[
                     AuphonicAssetDuration(tr1, 101.234),
                     AuphonicAssetDuration(tr2, 99.433),
+                    AuphonicAssetDuration(tr3, 101.234),
                 ],
-                target_asset=tr2,
-                longer_asset=tr1,
-                target_track_id="Pasha",
-                target_input_file="Tr2.webm",
-                offset_seconds=1.801,
+                reference_assets=[tr1],
+                reference_asset=tr1,
+                targets=[
+                    AuphonicOffsetTarget(
+                        asset=tr2,
+                        track_id="Pasha",
+                        input_file="Tr2.webm",
+                        offset_seconds=1.801,
+                    )
+                ],
+                aligned_assets=[tr3],
             ),
             applied=False,
-            track_state=None,
+            track_states=[],
         )
 
     monkeypatch.setattr(cli_module, "offset_session_auphonic_production", fake_offset)
@@ -452,6 +461,8 @@ def test_auphonic_offset_command_prints_dry_run_plan(
     assert "Tr2.webm" in result.stdout
     assert "offset_seconds" in result.stdout
     assert "1.801" in result.stdout
+    assert "Already Aligned" in result.stdout
+    assert "Tr3.webm" in result.stdout
     assert "applied" in result.stdout
 
 

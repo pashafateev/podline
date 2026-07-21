@@ -175,6 +175,8 @@ def artifact_registrar():
         role: str = "",
         duration_seconds=None,
         bucket: str = TEST_BUCKET,
+        source_provider: str = "test",
+        source_id=None,
     ):
         sha256 = sha256_of_file(path)
         record = register_media_artifact(
@@ -188,8 +190,8 @@ def artifact_registrar():
             sha256=sha256,
             duration_seconds=duration_seconds,
             s3_uri=f"s3://{bucket}/sessions/{session_uid}/{kind}/{sha256}/{path.name}",
-            source_provider="test",
-            source_id=None,
+            source_provider=source_provider,
+            source_id=source_id,
             timestamp="now",
         )
         seed_cache(runtime_paths, source_path=path, sha256=sha256)

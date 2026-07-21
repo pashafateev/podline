@@ -10,6 +10,7 @@ from podline.cozytrack.client import (
     CozytrackError,
     CozytrackSession,
     CozytrackTrack,
+    is_host_participant,
 )
 from podline.cozytrack.ingest import (
     CozytrackIngestError,
@@ -64,6 +65,22 @@ class FakeCozytrackClient:
         self.downloaded_paths.append(destination)
 
 
+@pytest.mark.parametrize(
+    ("participant_id", "expected"),
+    [
+        ("host", True),
+        ("host-local-ch-1", True),
+        ("host-local-ch-2", True),
+        ("guest-1", False),
+        ("", False),
+    ],
+)
+def test_is_host_participant_uses_cozytrack_identity_contract(
+    participant_id: str, expected: bool
+) -> None:
+    assert is_host_participant(participant_id) is expected
+
+
 def _make_session(
     *,
     session_id: str,
@@ -115,6 +132,7 @@ def test_client_list_ready_sessions_uses_api_key_header(
                         {
                             "id": "tr-1",
                             "participantName": "Pasha",
+                            "participantId": "host-local-ch-1",
                             "status": "complete",
                             "createdAt": "2026-04-24T12:00:01Z",
                         }
@@ -138,6 +156,7 @@ def test_client_list_ready_sessions_uses_api_key_header(
     assert sessions[0].id == "sess-1"
     assert sessions[0].finalized_at == "2026-04-24T12:00:00Z"
     assert sessions[0].tracks[0].participant_name == "Pasha"
+    assert sessions[0].tracks[0].participant_id == "host-local-ch-1"
 
 
 def test_client_get_track_download_url_returns_presigned_url(

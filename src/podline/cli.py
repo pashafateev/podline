@@ -1332,26 +1332,57 @@ def auphonic_offset_command(
         ],
     )
     _print_section(
-        "Target",
+        "Reference",
         [
             ("session_uid", session.session_uid),
             ("production_id", plan.production_id),
-            ("target_asset", plan.target_asset.filename),
-            ("longer_asset", plan.longer_asset.filename),
-            ("track_id", plan.target_track_id),
-            ("input_file", plan.target_input_file or "none"),
-            ("offset_seconds", _format_seconds(plan.offset_seconds)),
+            (
+                "local_assets",
+                ", ".join(asset.filename for asset in plan.reference_assets),
+            ),
+            ("reference_asset", plan.reference_asset.filename),
             ("applied", "yes" if result.applied else "no"),
         ],
     )
-    if result.track_state is not None:
+    _print_section(
+        "Targets",
+        [
+            (
+                target.asset.filename,
+                "  ".join(
+                    [
+                        f"track_id={target.track_id}",
+                        f"input_file={target.input_file or 'none'}",
+                        f"offset_seconds={_format_seconds(target.offset_seconds)}",
+                    ]
+                ),
+            )
+            for target in plan.targets
+        ],
+    )
+    if plan.aligned_assets:
         _print_section(
-            "Updated Track",
+            "Already Aligned",
             [
-                ("id", result.track_state.get("id", "none")),
-                ("type", result.track_state.get("type", "none")),
-                ("input_file", result.track_state.get("input_file") or "none"),
-                ("offset", _format_track_offset(result.track_state.get("offset"))),
+                (asset.filename, "offset_seconds=0  update=skipped")
+                for asset in plan.aligned_assets
+            ],
+        )
+    if result.track_states:
+        _print_section(
+            "Updated Tracks",
+            [
+                (
+                    str(track_state.get("id", "none")),
+                    "  ".join(
+                        [
+                            f"type={track_state.get('type', 'none')}",
+                            f"input_file={track_state.get('input_file') or 'none'}",
+                            f"offset={_format_track_offset(track_state.get('offset'))}",
+                        ]
+                    ),
+                )
+                for track_state in result.track_states
             ],
         )
 
