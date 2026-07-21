@@ -23,6 +23,7 @@ from podline.cozytrack.client import (
     CozytrackClient,
     CozytrackClientProtocol,
     CozytrackError,
+    is_host_participant,
 )
 from podline.models import (
     ArtifactKind,
@@ -97,6 +98,7 @@ class AuphonicOffsetPlan:
     reference_assets: List[MediaArtifactRecord]
     reference_asset: MediaArtifactRecord
     targets: List[AuphonicOffsetTarget]
+    aligned_assets: List[MediaArtifactRecord]
 
 
 @dataclass(frozen=True)
@@ -1179,7 +1181,7 @@ def _partition_cozytrack_offset_tracks(
             raise AuphonicError(
                 f"Cozytrack track {source_track.id} for {item.asset.filename} has no participantId; local/remote topology is required for sessions with more than 2 tracks"
             )
-        if participant_id == "host" or participant_id.startswith("host-local-ch-"):
+        if is_host_participant(participant_id):
             local_durations.append(item)
         else:
             remote_durations.append(item)
@@ -1228,6 +1230,8 @@ def plan_session_auphonic_offset(
         for artifact in tracks
     ]
     if len(asset_durations) == 2:
+        # Preserve the original duration-only behavior for two-track sessions;
+        # topology is only required to disambiguate sessions with more tracks.
         sorted_durations = sorted(
             asset_durations, key=lambda item: item.duration_seconds
         )
@@ -1248,14 +1252,18 @@ def plan_session_auphonic_offset(
     _validate_offset_production_state(details)
     inspected_tracks = details.get("multi_input_files") or []
     targets = []
+    aligned_assets = []
     for remote in remote_durations:
         offset_decimal = Decimal(str(reference.duration_seconds)) - Decimal(
             str(remote.duration_seconds)
         )
-        if offset_decimal <= 0:
+        if offset_decimal < 0:
             raise AuphonicError(
                 f"Remote asset {remote.asset.filename} is not shorter than local reference {reference.asset.filename}; no positive Auphonic offset can be computed"
             )
+        if offset_decimal == 0:
+            aligned_assets.append(remote.asset)
+            continue
         target_track = _find_multi_input_track_for_asset(
             inspected_tracks, remote.asset
         )
@@ -1279,6 +1287,7 @@ def plan_session_auphonic_offset(
         reference_assets=[item.asset for item in local_durations],
         reference_asset=reference.asset,
         targets=targets,
+        aligned_assets=aligned_assets,
     )
 
 

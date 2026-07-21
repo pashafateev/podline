@@ -1360,6 +1360,14 @@ def auphonic_offset_command(
             for target in plan.targets
         ],
     )
+    if plan.aligned_assets:
+        _print_section(
+            "Already Aligned",
+            [
+                (asset.filename, "offset_seconds=0  update=skipped")
+                for asset in plan.aligned_assets
+            ],
+        )
     if result.track_states:
         _print_section(
             "Updated Tracks",

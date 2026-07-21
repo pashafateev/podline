@@ -89,7 +89,7 @@ pod auphonic-preview @1
 pod auphonic-inspect --session @1
 ```
 
-Run `pod auphonic-offset` before preview/start. Durations come from audio packet timing recorded at ingest. For mixed Cozytrack sessions, stable participant identity distinguishes host-local tracks from remote tracks: local tracks remain at zero, while every shorter remote track is offset against the longest local reference. The command updates the prepared production and does not start processing.
+Run `pod auphonic-offset` before preview/start. Durations come from audio packet timing recorded at ingest. For mixed Cozytrack sessions, stable participant identity distinguishes host-local tracks from remote tracks: local tracks remain at zero, while every shorter remote track is offset against the longest local reference. Remote tracks already equal to the reference are reported as aligned and skipped. The command updates the prepared production and does not start processing.
 
 3. Start Auphonic after previewing the edit page
 ```bash
