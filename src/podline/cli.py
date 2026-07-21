@@ -24,6 +24,7 @@ from podline.auphonic import (
     process_session_with_auphonic,
     reconcile_production_to_session,
     refresh_transcript_with_auphonic,
+    reset_session_auphonic_production,
     start_prepared_session_with_auphonic,
 )
 from podline.config import load_config
@@ -1149,6 +1150,52 @@ def auphonic_preview_command(
         ]
     )
     _print_auphonic_tracks(details["multi_input_files"])
+
+
+@app.command("auphonic-reset")
+def auphonic_reset_command(
+    session_uid: str,
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
+    config: Optional[Path] = typer.Option(
+        None, "--config", help="Path to config.yaml."
+    ),
+) -> None:
+    """Abandon the prepared Auphonic production and requeue the session.
+
+    Use after track roles or durations changed (e.g. an ingest role
+    reconciliation): the abandoned production keeps its old wiring, so
+    requeue and run auphonic-prepare/offset/preview again.
+    """
+    config_path = _resolve_config_path(config)
+    _loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
+    session = _resolve_session_arg(runtime_paths, session_uid)
+    if session is None:
+        typer.secho(
+            f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
+        )
+        raise typer.Exit(code=1)
+
+    abandoned_production_id = session.auphonic_production_id or "none"
+    try:
+        refreshed = reset_session_auphonic_production(
+            db_file=runtime_paths.db_file,
+            session=session,
+            logger=logger,
+        )
+    except AuphonicError as exc:
+        logger.error("Auphonic reset failed for %s: %s", session_uid, exc)
+        typer.echo(f"Auphonic error: {exc}")
+        raise typer.Exit(code=1)
+
+    _print_header("Auphonic Reset")
+    _print_key_values(
+        [
+            ("session_uid", refreshed.session_uid),
+            ("status", _format_status(refreshed.status)),
+            ("abandoned_production", abandoned_production_id),
+            ("next", f"pod auphonic-prepare {refreshed.session_uid}"),
+        ]
+    )
 
 
 @app.command("auphonic-start")

@@ -10,6 +10,7 @@ from podline.cozytrack.client import (
     CozytrackError,
     CozytrackSession,
     CozytrackTrack,
+    host_channel_number,
     is_host_participant,
 )
 from podline.cozytrack.ingest import (
@@ -18,8 +19,10 @@ from podline.cozytrack.ingest import (
     list_ready_sessions_for_ingest,
     slugify,
 )
+from podline.db import connect
 from podline.repository import (
     get_session_by_cozytrack_id,
+    list_assets_for_session,
     list_cozytrack_session_ids,
     list_media_artifacts,
 )
@@ -79,6 +82,26 @@ def test_is_host_participant_uses_cozytrack_identity_contract(
     participant_id: str, expected: bool
 ) -> None:
     assert is_host_participant(participant_id) is expected
+
+
+@pytest.mark.parametrize(
+    ("participant_id", "expected"),
+    [
+        ("host", 1),
+        ("host-local-ch-1", 1),
+        ("host-local-ch-2", 2),
+        ("host-local-ch-12", 12),
+        ("host-local-ch-", None),
+        ("host-local-ch-x", None),
+        ("host-local-ch-0", None),
+        ("guest-1", None),
+        ("", None),
+    ],
+)
+def test_host_channel_number_parses_identity_contract(
+    participant_id: str, expected
+) -> None:
+    assert host_channel_number(participant_id) == expected
 
 
 def _make_session(
@@ -279,6 +302,599 @@ def test_ingest_session_uploads_artifacts_and_cleans_staging(
         assert cache_path_for(
             runtime_paths, artifact.sha256, artifact.filename
         ).exists()
+
+
+def _make_identified_session(
+    *,
+    session_id: str,
+    name: str = "Mixed Session",
+    tracks,
+) -> CozytrackSession:
+    """Session whose tracks carry stable participant ids, created in the
+    given order (Cozytrack creates rows in recorder start order)."""
+    return CozytrackSession(
+        id=session_id,
+        name=name,
+        status="ready",
+        finalized_at="2026-07-18T17:00:00.000Z",
+        tracks=[
+            CozytrackTrack(
+                id=track_id,
+                participant_name=participant_name,
+                status="complete",
+                created_at=f"2026-07-18T16:52:{39 + index:02d}Z",
+                participant_id=participant_id,
+            )
+            for index, (track_id, participant_id, participant_name) in enumerate(
+                tracks
+            )
+        ],
+    )
+
+
+def test_ingest_session_derives_roles_from_participant_ids(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    """A guest recorder interleaved between the host-local channels must not
+    shift naming or roles: files follow recorder order (host channels, then
+    guests) and roles follow participant identity."""
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+
+    fake = FakeCozytrackClient(
+        sessions=[
+            _make_identified_session(
+                session_id="sess-mixed",
+                tracks=[
+                    ("ct-ch-1", "host-local-ch-1", "Local Ch 1"),
+                    ("ct-guest", "guest_df6e4c0f", "J"),
+                    ("ct-ch-2", "host-local-ch-2", "Local Ch 2"),
+                ],
+            )
+        ]
+    )
+
+    record = ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-mixed",
+        client=fake,
+        duration_probe=_probe,
+    )
+
+    assert fake.requested_track_ids == ["ct-ch-1", "ct-ch-2", "ct-guest"]
+    artifacts = list_media_artifacts(runtime_paths.db_file, record.session_uid)
+    assert [(a.role, a.filename, a.source_id) for a in artifacts] == [
+        ("guest1", "Tr3.webm", "ct-guest"),
+        ("host1", "Tr1.webm", "ct-ch-1"),
+        ("host2", "Tr2.webm", "ct-ch-2"),
+    ]
+
+
+def test_ingest_session_rejects_partially_identified_tracks(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+
+    fake = FakeCozytrackClient(
+        sessions=[
+            _make_identified_session(
+                session_id="sess-partial",
+                tracks=[
+                    ("ct-ch-1", "host-local-ch-1", "Local Ch 1"),
+                    ("ct-guest", None, "J"),
+                ],
+            )
+        ]
+    )
+
+    with pytest.raises(CozytrackIngestError, match="missing participantId: ct-guest"):
+        ingest_session(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            cozytrack_session_id="sess-partial",
+            client=fake,
+            duration_probe=_probe,
+        )
+
+    assert fake.requested_track_ids == []
+    assert get_session_by_cozytrack_id(runtime_paths.db_file, "sess-partial") is None
+
+
+def test_ingest_session_rejects_duplicate_participant_roles(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+
+    fake = FakeCozytrackClient(
+        sessions=[
+            _make_identified_session(
+                session_id="sess-dup",
+                tracks=[
+                    ("ct-host", "host", "Host"),
+                    ("ct-ch-1", "host-local-ch-1", "Local Ch 1"),
+                    ("ct-guest", "guest_a", "A"),
+                ],
+            )
+        ]
+    )
+
+    with pytest.raises(CozytrackIngestError, match="duplicate role 'host1'"):
+        ingest_session(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            cozytrack_session_id="sess-dup",
+            client=fake,
+            duration_probe=_probe,
+        )
+
+
+def _reconcile_event_count(db_file: str, session_uid: str) -> int:
+    with connect(db_file) as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) AS n FROM events WHERE session_uid = ? AND detail LIKE 'reconciled raw track roles%'",
+            (session_uid,),
+        ).fetchone()
+    return row["n"]
+
+
+def test_reingest_reconciles_roles_of_previously_mislabeled_session(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    """Sessions ingested before participant-derived roles keep download-order
+    labels; re-running ingest migrates them once identity is available."""
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+
+    # Ingested while Cozytrack exposed no participant ids: creation order
+    # [ch-1, guest, ch-2] mislabels the guest as host2 and ch-2 as guest1.
+    fake = FakeCozytrackClient(
+        sessions=[
+            _make_session(
+                session_id="sess-legacy",
+                track_ids=["ct-ch-1", "ct-guest", "ct-ch-2"],
+            )
+        ]
+    )
+    record = ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-legacy",
+        client=fake,
+        duration_probe=_probe,
+    )
+    artifacts = list_media_artifacts(runtime_paths.db_file, record.session_uid)
+    assert [(a.role, a.filename, a.source_id) for a in artifacts] == [
+        ("guest1", "Tr3.webm", "ct-ch-2"),
+        ("host1", "Tr1.webm", "ct-ch-1"),
+        ("host2", "Tr2.webm", "ct-guest"),
+    ]
+
+    # Cozytrack now exposes participant ids for the same tracks.
+    fake.sessions["sess-legacy"] = _make_identified_session(
+        session_id="sess-legacy",
+        tracks=[
+            ("ct-ch-1", "host-local-ch-1", "Local Ch 1"),
+            ("ct-guest", "guest_j", "J"),
+            ("ct-ch-2", "host-local-ch-2", "Local Ch 2"),
+        ],
+    )
+
+    again = ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-legacy",
+        client=fake,
+        duration_probe=_probe,
+    )
+
+    assert again.session_uid == record.session_uid
+    artifacts = list_media_artifacts(runtime_paths.db_file, record.session_uid)
+    assert [(a.role, a.filename, a.source_id) for a in artifacts] == [
+        ("guest1", "Tr2.webm", "ct-guest"),
+        ("host1", "Tr1.webm", "ct-ch-1"),
+        ("host2", "Tr3.webm", "ct-ch-2"),
+    ]
+    # S3-native registration writes no legacy assets rows; reconciliation
+    # must not invent any.
+    assert list_assets_for_session(runtime_paths.db_file, record.session_uid) == []
+    assert _reconcile_event_count(runtime_paths.db_file, record.session_uid) == 1
+
+    # Re-running once roles already match is a no-op.
+    ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-legacy",
+        client=fake,
+        duration_probe=_probe,
+    )
+    assert _reconcile_event_count(runtime_paths.db_file, record.session_uid) == 1
+
+
+def test_reingest_leaves_roles_alone_when_tracks_cannot_be_mapped(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+
+    fake = FakeCozytrackClient(
+        sessions=[
+            _make_session(
+                session_id="sess-unmappable",
+                track_ids=["ct-a", "ct-b"],
+            )
+        ]
+    )
+    record = ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-unmappable",
+        client=fake,
+        duration_probe=_probe,
+    )
+
+    # Identity arrives, but under track ids that do not match the stored
+    # source ids — reconciliation must refuse to guess.
+    fake.sessions["sess-unmappable"] = _make_identified_session(
+        session_id="sess-unmappable",
+        tracks=[
+            ("other-1", "host-local-ch-1", "Local Ch 1"),
+            ("other-2", "guest_x", "X"),
+        ],
+    )
+
+    again = ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-unmappable",
+        client=fake,
+        duration_probe=_probe,
+    )
+
+    assert again.session_uid == record.session_uid
+    artifacts = list_media_artifacts(runtime_paths.db_file, record.session_uid)
+    assert [(a.role, a.filename) for a in artifacts] == [
+        ("host1", "Tr1.webm"),
+        ("host2", "Tr2.webm"),
+    ]
+    assert _reconcile_event_count(runtime_paths.db_file, record.session_uid) == 0
+
+
+def test_deduplicated_ingest_backfills_source_ids_and_roles(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    """Same audio imported locally first, then ingested from Cozytrack with
+    participant identity: the surviving session must gain source ids
+    (paired by content hash — a local import stores none) and
+    participant-derived roles, or offset topology can never resolve."""
+    from podline.ingest import import_local_folder
+
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+
+    tr1_bytes = b"webm-host-channel-data" * 32
+    tr2_bytes = b"webm-remote-guest-data" * 32
+    import_dir = tmp_path / "riverside" / "2026-07-18_demo"
+    import_dir.mkdir(parents=True)
+    (import_dir / "Tr1.webm").write_bytes(tr1_bytes)
+    (import_dir / "Tr2.webm").write_bytes(tr2_bytes)
+    imported, created = import_local_folder(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        folder=import_dir,
+        duration_probe=_probe,
+    )
+    assert created is True
+    artifacts = list_media_artifacts(runtime_paths.db_file, imported.session_uid)
+    assert [(a.role, a.source_id) for a in artifacts] == [
+        ("host1", None),
+        ("host2", None),
+    ]
+
+    fake = FakeCozytrackClient(
+        sessions=[
+            _make_identified_session(
+                session_id="sess-import-dup",
+                tracks=[
+                    ("ct-host", "host", "Host"),
+                    ("ct-guest", "guest_x", "X"),
+                ],
+            )
+        ],
+        downloads={"ct-host": tr1_bytes, "ct-guest": tr2_bytes},
+    )
+
+    record = ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-import-dup",
+        client=fake,
+        duration_probe=_probe,
+    )
+
+    assert record.session_uid == imported.session_uid
+    assert record.cozytrack_session_id == "sess-import-dup"
+    artifacts = list_media_artifacts(runtime_paths.db_file, record.session_uid)
+    assert [(a.role, a.filename, a.source_id, a.source_provider) for a in artifacts] == [
+        ("guest1", "Tr2.webm", "ct-guest", "local_import"),
+        ("host1", "Tr1.webm", "ct-host", "local_import"),
+    ]
+    assert _reconcile_event_count(runtime_paths.db_file, record.session_uid) == 1
+
+    # The healed session behaves like a native ct-ingest on later re-runs.
+    ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-import-dup",
+        client=fake,
+        duration_probe=_probe,
+    )
+    assert _reconcile_event_count(runtime_paths.db_file, record.session_uid) == 1
+
+
+def test_reingest_resumes_interrupted_source_id_migration(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    """A session associated with Cozytrack but left without source ids (an
+    interrupted or pre-migration run) must not be stranded behind the
+    idempotent return: re-running ct-ingest re-downloads, joins the ids by
+    content, and reconciles roles — converging on the healed state."""
+    from podline.ingest import import_local_folder
+    from podline.repository import set_cozytrack_session_id
+
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+
+    tr1_bytes = b"webm-host-channel-data" * 32
+    tr2_bytes = b"webm-remote-guest-data" * 32
+    import_dir = tmp_path / "riverside" / "2026-07-18_interrupted"
+    import_dir.mkdir(parents=True)
+    (import_dir / "Tr1.webm").write_bytes(tr1_bytes)
+    (import_dir / "Tr2.webm").write_bytes(tr2_bytes)
+    imported, _created = import_local_folder(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        folder=import_dir,
+        duration_probe=_probe,
+    )
+
+    # The stuck state the old code (or a crash before the atomic backfill
+    # existed) leaves behind: association persisted, source ids never were.
+    assert set_cozytrack_session_id(
+        runtime_paths.db_file,
+        session_uid=imported.session_uid,
+        cozytrack_session_id="sess-interrupted",
+        status=imported.status,
+        timestamp="2026-07-18T00:00:00+00:00",
+    )
+    artifacts = list_media_artifacts(runtime_paths.db_file, imported.session_uid)
+    assert [(a.role, a.source_id) for a in artifacts] == [
+        ("host1", None),
+        ("host2", None),
+    ]
+
+    fake = FakeCozytrackClient(
+        sessions=[
+            _make_identified_session(
+                session_id="sess-interrupted",
+                tracks=[
+                    ("ct-host", "host", "Host"),
+                    ("ct-guest", "guest_x", "X"),
+                ],
+            )
+        ],
+        downloads={"ct-host": tr1_bytes, "ct-guest": tr2_bytes},
+    )
+
+    record = ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-interrupted",
+        client=fake,
+        duration_probe=_probe,
+    )
+
+    assert record.session_uid == imported.session_uid
+    assert fake.requested_track_ids == ["ct-host", "ct-guest"]
+    artifacts = list_media_artifacts(runtime_paths.db_file, record.session_uid)
+    assert [(a.role, a.filename, a.source_id) for a in artifacts] == [
+        ("guest1", "Tr2.webm", "ct-guest"),
+        ("host1", "Tr1.webm", "ct-host"),
+    ]
+    assert _reconcile_event_count(runtime_paths.db_file, record.session_uid) == 1
+
+    # Healed: the next run takes the cheap idempotent path again.
+    downloads_after_heal = len(fake.requested_track_ids)
+    ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-interrupted",
+        client=fake,
+        duration_probe=_probe,
+    )
+    assert len(fake.requested_track_ids) == downloads_after_heal
+    assert _reconcile_event_count(runtime_paths.db_file, record.session_uid) == 1
+
+
+def test_resume_heals_legacy_ordered_session_without_fingerprint(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    """A legacy three-track import named in creation order (guest on Tr2)
+    that was associated without source ids: healing re-downloads in recorder
+    order, so filename/content pairing — and therefore the fingerprint —
+    differs from what is stored. Recovery must join by content hash against
+    the associated session instead of re-registering, which would collide
+    with the unique Cozytrack association on every retry."""
+    from podline.ingest import import_local_folder
+    from podline.repository import list_sessions, set_cozytrack_session_id
+
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+
+    ch1_bytes = b"webm-host-channel-one-data" * 32
+    guest_bytes = b"webm-remote-guest-data" * 32
+    ch2_bytes = b"webm-host-channel-two-data" * 32
+    import_dir = tmp_path / "riverside" / "2026-07-18_legacy-order"
+    import_dir.mkdir(parents=True)
+    (import_dir / "Tr1.webm").write_bytes(ch1_bytes)
+    (import_dir / "Tr2.webm").write_bytes(guest_bytes)
+    (import_dir / "Tr3.webm").write_bytes(ch2_bytes)
+    imported, _created = import_local_folder(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        folder=import_dir,
+        duration_probe=_probe,
+    )
+    assert set_cozytrack_session_id(
+        runtime_paths.db_file,
+        session_uid=imported.session_uid,
+        cozytrack_session_id="sess-legacy-order",
+        status=imported.status,
+        timestamp="2026-07-18T00:00:00+00:00",
+    )
+
+    fake = FakeCozytrackClient(
+        sessions=[
+            _make_identified_session(
+                session_id="sess-legacy-order",
+                tracks=[
+                    ("ct-ch-1", "host-local-ch-1", "Local Ch 1"),
+                    ("ct-guest", "guest_j", "J"),
+                    ("ct-ch-2", "host-local-ch-2", "Local Ch 2"),
+                ],
+            )
+        ],
+        downloads={
+            "ct-ch-1": ch1_bytes,
+            "ct-guest": guest_bytes,
+            "ct-ch-2": ch2_bytes,
+        },
+    )
+
+    record = ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-legacy-order",
+        client=fake,
+        duration_probe=_probe,
+    )
+
+    assert record.session_uid == imported.session_uid
+    assert len(list_sessions(runtime_paths.db_file)) == 1
+    artifacts = list_media_artifacts(runtime_paths.db_file, record.session_uid)
+    assert [(a.role, a.filename, a.source_id) for a in artifacts] == [
+        ("guest1", "Tr2.webm", "ct-guest"),
+        ("host1", "Tr1.webm", "ct-ch-1"),
+        ("host2", "Tr3.webm", "ct-ch-2"),
+    ]
+    assert _reconcile_event_count(runtime_paths.db_file, record.session_uid) == 1
+
+    downloads_after_heal = len(fake.requested_track_ids)
+    ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-legacy-order",
+        client=fake,
+        duration_probe=_probe,
+    )
+    assert len(fake.requested_track_ids) == downloads_after_heal
+    assert len(list_sessions(runtime_paths.db_file)) == 1
+
+
+def test_resume_reports_content_mismatch_without_crashing(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    """If the stored audio does not content-match the Cozytrack downloads,
+    healing must leave the ids unset and complete — a loud warning on each
+    explicit re-run, never an error loop or a guessed mapping."""
+    from podline.ingest import import_local_folder
+    from podline.repository import set_cozytrack_session_id
+
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+
+    import_dir = tmp_path / "riverside" / "2026-07-18_mismatch"
+    import_dir.mkdir(parents=True)
+    (import_dir / "Tr1.webm").write_bytes(b"stored-bytes-one" * 32)
+    (import_dir / "Tr2.webm").write_bytes(b"stored-bytes-two" * 32)
+    imported, _created = import_local_folder(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        folder=import_dir,
+        duration_probe=_probe,
+    )
+    assert set_cozytrack_session_id(
+        runtime_paths.db_file,
+        session_uid=imported.session_uid,
+        cozytrack_session_id="sess-mismatch",
+        status=imported.status,
+        timestamp="2026-07-18T00:00:00+00:00",
+    )
+
+    fake = FakeCozytrackClient(
+        sessions=[
+            _make_identified_session(
+                session_id="sess-mismatch",
+                tracks=[
+                    ("ct-host", "host", "Host"),
+                    ("ct-guest", "guest_x", "X"),
+                ],
+            )
+        ],
+        downloads={
+            "ct-host": b"different-bytes-one" * 32,
+            "ct-guest": b"different-bytes-two" * 32,
+        },
+    )
+
+    record = ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-mismatch",
+        client=fake,
+        duration_probe=_probe,
+    )
+
+    assert record.session_uid == imported.session_uid
+    artifacts = list_media_artifacts(runtime_paths.db_file, record.session_uid)
+    assert [(a.role, a.source_id) for a in artifacts] == [
+        ("host1", None),
+        ("host2", None),
+    ]
+    assert _reconcile_event_count(runtime_paths.db_file, record.session_uid) == 0
+
+    # Still unhealed, so an explicit re-run tries again instead of giving up.
+    downloads_before = len(fake.requested_track_ids)
+    ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id="sess-mismatch",
+        client=fake,
+        duration_probe=_probe,
+    )
+    assert len(fake.requested_track_ids) > downloads_before
 
 
 def test_ingest_session_is_idempotent(

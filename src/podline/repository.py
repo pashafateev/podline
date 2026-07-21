@@ -1,7 +1,8 @@
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from podline.db import connect
 from podline.models import (
+    ArtifactKind,
     AssetRecord,
     EpisodeRecord,
     MediaArtifactRecord,
@@ -241,6 +242,138 @@ def update_session_status(
         connection.commit()
 
 
+def reconcile_artifact_roles(
+    db_file: str,
+    *,
+    session_uid: str,
+    status: str,
+    role_updates: Dict[str, str],
+    timestamp: str,
+    detail: str,
+) -> None:
+    """Rewrite raw-track roles in place (media_artifacts and legacy assets).
+
+    role_updates maps current role -> corrected role. All renames go through
+    a temporary phase inside one transaction so pure swaps neither trip the
+    (session_uid, kind, role) unique index nor cascade into each other.
+    """
+    if not role_updates:
+        return
+    items = sorted(role_updates.items())
+    kind = ArtifactKind.RAW_TRACK.value
+    with connect(db_file) as connection:
+        for index, (old_role, _new_role) in enumerate(items):
+            placeholder = f"__reconcile_{index}__"
+            cursor = connection.execute(
+                """
+                UPDATE media_artifacts
+                SET role = ?, updated_at = ?
+                WHERE session_uid = ? AND kind = ? AND role = ?
+                """,
+                (placeholder, timestamp, session_uid, kind, old_role),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    f"Expected exactly one {kind} artifact with role {old_role!r} "
+                    f"for {session_uid}; found {cursor.rowcount}"
+                )
+            connection.execute(
+                "UPDATE assets SET role = ? WHERE session_uid = ? AND role = ?",
+                (placeholder, session_uid, old_role),
+            )
+        for index, (_old_role, new_role) in enumerate(items):
+            placeholder = f"__reconcile_{index}__"
+            connection.execute(
+                """
+                UPDATE media_artifacts
+                SET role = ?
+                WHERE session_uid = ? AND kind = ? AND role = ?
+                """,
+                (new_role, session_uid, kind, placeholder),
+            )
+            connection.execute(
+                "UPDATE assets SET role = ? WHERE session_uid = ? AND role = ?",
+                (new_role, session_uid, placeholder),
+            )
+        connection.execute(
+            """
+            INSERT INTO events (session_uid, from_state, to_state, timestamp, detail)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (session_uid, status, status, timestamp, detail),
+        )
+        connection.commit()
+
+
+def backfill_artifact_source_ids(
+    db_file: str,
+    *,
+    session_uid: str,
+    source_ids_by_sha256: Dict[str, str],
+    timestamp: str,
+) -> int:
+    """Fill missing raw-track source ids by content hash.
+
+    Only artifacts without a source id are touched — an existing id is
+    provenance and never overwritten. Returns the number of updated rows.
+    """
+    if not source_ids_by_sha256:
+        return 0
+    updated = 0
+    kind = ArtifactKind.RAW_TRACK.value
+    with connect(db_file) as connection:
+        for sha256, source_id in sorted(source_ids_by_sha256.items()):
+            cursor = connection.execute(
+                """
+                UPDATE media_artifacts
+                SET source_id = ?, updated_at = ?
+                WHERE session_uid = ? AND kind = ? AND sha256 = ?
+                  AND (source_id IS NULL OR source_id = '')
+                """,
+                (source_id, timestamp, session_uid, kind, sha256),
+            )
+            updated += cursor.rowcount
+        connection.commit()
+    return updated
+
+
+def reset_session_to_queued(
+    db_file: str,
+    *,
+    session_uid: str,
+    from_state: str,
+    timestamp: str,
+    detail: str,
+) -> None:
+    """Requeue a session and clear its Auphonic production id.
+
+    Guarded by the caller's view of the current status so a concurrent
+    transition fails loudly instead of silently resetting the wrong state.
+    """
+    with connect(db_file) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE sessions
+            SET status = ?, auphonic_production_id = NULL, updated_at = ?
+            WHERE session_uid = ? AND status = ?
+            """,
+            (SessionStatus.QUEUED.value, timestamp, session_uid, from_state),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                f"Could not reset session {session_uid} from {from_state} to queued; "
+                "its status changed underneath the reset"
+            )
+        connection.execute(
+            """
+            INSERT INTO events (session_uid, from_state, to_state, timestamp, detail)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (session_uid, from_state, SessionStatus.QUEUED.value, timestamp, detail),
+        )
+        connection.commit()
+
+
 def record_transcript_refresh_production(
     db_file: str,
     *,
@@ -395,11 +528,16 @@ def set_cozytrack_session_id(
     cozytrack_session_id: str,
     status: str,
     timestamp: str,
+    source_ids_by_sha256: Optional[Dict[str, str]] = None,
 ) -> bool:
     """Associate a Cozytrack session with an existing unassociated session.
 
     Guarded so an already-associated session is never rewritten; returns
-    False in that case.
+    False in that case. When source_ids_by_sha256 is given, the raw-track
+    source ids are persisted in the same transaction as the association —
+    an interrupted run must never leave an associated session without its
+    source ids, because later ingests skip downloading and would have
+    nothing left to join on.
     """
     with connect(db_file) as connection:
         cursor = connection.execute(
@@ -412,18 +550,30 @@ def set_cozytrack_session_id(
         )
         if cursor.rowcount != 1:
             return False
+        backfilled = 0
+        kind = ArtifactKind.RAW_TRACK.value
+        for sha256, source_id in sorted((source_ids_by_sha256 or {}).items()):
+            id_cursor = connection.execute(
+                """
+                UPDATE media_artifacts
+                SET source_id = ?, updated_at = ?
+                WHERE session_uid = ? AND kind = ? AND sha256 = ?
+                  AND (source_id IS NULL OR source_id = '')
+                """,
+                (source_id, timestamp, session_uid, kind, sha256),
+            )
+            backfilled += id_cursor.rowcount
+        detail = (
+            f"associated Cozytrack session {cozytrack_session_id} with existing content"
+        )
+        if backfilled:
+            detail += f"; backfilled source ids for {backfilled} raw tracks"
         connection.execute(
             """
             INSERT INTO events (session_uid, from_state, to_state, timestamp, detail)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (
-                session_uid,
-                status,
-                status,
-                timestamp,
-                f"associated Cozytrack session {cozytrack_session_id} with existing content",
-            ),
+            (session_uid, status, status, timestamp, detail),
         )
         connection.commit()
     return True

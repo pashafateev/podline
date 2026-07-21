@@ -9,7 +9,7 @@ Current scope
 - The working manual-assisted path is implemented end to end through Podbean draft creation, with a Podline-owned S3 bucket as the authoritative store for all new session media.
 - Core inspection commands: `pod init`, `pod health`, `pod list`, `pod status`, `pod cache-clear`.
 - Ingest commands: `pod ct-list`, `pod ct-ingest` (Cozytrack) and `pod import <folder>` (Riverside/local). `pod scan` and `pod refresh` are retired — they registered drive-path sessions the S3 pipeline cannot process.
-- Auphonic commands: `pod auphonic-prepare`, `pod auphonic-preview`, `pod auphonic-offset`, `pod auphonic-start`, `pod auphonic-inspect`, `pod auphonic-sync`. Productions read audio directly from S3 through the Auphonic external service — there are no local uploads.
+- Auphonic commands: `pod auphonic-prepare`, `pod auphonic-preview`, `pod auphonic-offset`, `pod auphonic-start`, `pod auphonic-reset`, `pod auphonic-inspect`, `pod auphonic-sync`. Productions read audio directly from S3 through the Auphonic external service — there are no local uploads. `auphonic-reset` abandons a prepared/previewed production and requeues the session for a fresh prepare (e.g. after a role reconciliation).
 - Editing and post-edit commands: `pod workspace`, `pod finalize`, `pod transcript-refresh`, `pod episode-meta`, `pod podbean-draft`.
 - The external drive is no longer required for the pipeline; it remains readable history for pre-S3 sessions. File-touching commands on those old sessions fail with a clear "no artifacts registered" error.
 - `recorded_at` is best-effort metadata. The recorder date is not always reliable, so this value may reflect filesystem timing rather than a true recording timestamp.
@@ -78,6 +78,9 @@ pod list
 
 Notes on ingest:
 - Tracks are hashed and uploaded to `s3://<bucket>/sessions/<uid>/raw_track/...`; packet-derived durations are stored for the offset step. Nothing is written to the external drive.
+- Cozytrack roles come from stable participant ids (`host-local-ch-N` → hostN, guests numbered by recorder start order), and files are named in recorder order — not row-creation order, which can interleave a guest between host channels. Sessions without participant ids keep the legacy creation-order naming.
+- Re-running `pod ct-ingest` on an already-ingested session reconciles its stored roles against Cozytrack participant ids (the migration path for sessions ingested before identity-based roles). If roles change on a session that already has a prepared production, run `pod auphonic-reset` and re-run `pod auphonic-prepare`/`auphonic-offset` so the preset wiring picks up the corrected roles.
+- When `pod ct-ingest` dedups onto a session that was first registered via `pod import`, the surviving session gains the Cozytrack source ids (tracks paired by content hash) before roles are reconciled — without them, multitrack offset topology cannot resolve. The ids are persisted in the same transaction as the association, and a session left half-migrated by an interrupted or pre-migration run is detected on the next `pod ct-ingest`, which re-downloads and heals it in place by content hash — recovery never depends on fingerprints or file naming, and content that matches nothing is reported rather than guessed at.
 - Cozytrack downloads land in a disposable staging folder that is removed after registration; re-running `pod ct-ingest <id>` is a no-op, and re-importing an identical folder is detected by content fingerprint.
 - WebM/Opus stems are passed through to Auphonic as-is via the S3 service reference.
 
@@ -85,12 +88,12 @@ Notes on ingest:
 ```bash
 pod auphonic-prepare @1 --debug   # creates the production and attaches S3 tracks
 pod auphonic-offset @1            # dry run; uses durations stored at ingest
-pod auphonic-offset @1 --apply    # offset remote track(s); keep local tracks at zero
+pod auphonic-offset @1 --apply    # offset every track shorter than the reference
 pod auphonic-preview @1
 pod auphonic-inspect --session @1
 ```
 
-Run `pod auphonic-offset` before preview/start. Durations come from audio packet timing recorded at ingest. For mixed Cozytrack sessions, stable participant identity distinguishes host-local tracks from remote tracks: local tracks remain at zero, while every shorter remote track is offset against the longest local reference. Remote tracks already equal to the reference are reported as aligned and skipped. The command updates the prepared production and does not start processing.
+Run `pod auphonic-offset` before preview/start. Durations come from audio packet timing recorded at ingest. Cozytrack starts each track's recorder sequentially and stops them all together, so a track's start offset equals its duration shortfall against the reference (the longest host-local track). Every shorter track is offset — remote tracks and additional host-local channels alike; for sessions with more than 2 tracks, stable participant identity picks the local reference and validates the topology. Tracks already equal to the reference are reported as aligned and skipped. The command updates the prepared production and does not start processing.
 
 3. Start Auphonic after previewing the edit page
 ```bash

@@ -11,7 +11,7 @@ never modified or removed.
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from podline.artifacts import content_type_for, seed_cache
 from podline.config import AppConfig
@@ -47,6 +47,31 @@ def _default_duration_probe(path: Path) -> float:
     return probe_audio_duration_from_packets(path)
 
 
+def source_ids_by_content(
+    tracks: Iterable[Tuple[Path, str]]
+) -> Dict[str, str]:
+    """Map (file, provider source id) pairs to a content-hash -> id join.
+
+    Pairing by content instead of filename keeps the join correct when the
+    stored artifacts were named differently than the staged downloads.
+    Pairs without a source id are ignored; files with byte-identical
+    content cannot be told apart and are skipped rather than guessed at.
+    """
+    by_sha: Dict[str, str] = {}
+    duplicates = set()
+    for path, source_id in tracks:
+        if not source_id:
+            continue
+        sha256 = sha256_of_file(path)
+        if sha256 in by_sha:
+            duplicates.add(sha256)
+            continue
+        by_sha[sha256] = source_id
+    for sha256 in duplicates:
+        by_sha.pop(sha256, None)
+    return by_sha
+
+
 def register_candidate_with_storage(
     *,
     config: AppConfig,
@@ -78,12 +103,19 @@ def register_candidate_with_storage(
             # Same content was registered without a Cozytrack association
             # (e.g. via pod import). Backfill it so ct-list stops offering
             # the session and re-ingest short-circuits before downloading.
+            # The source ids ride in the same transaction: once the
+            # association is visible, retries stop downloading, so this is
+            # the only moment the ids can be joined from files on disk.
             set_cozytrack_session_id(
                 db_file,
                 session_uid=existing.session_uid,
                 cozytrack_session_id=cozytrack_session_id,
                 status=existing.status,
                 timestamp=datetime.now(timezone.utc).isoformat(),
+                source_ids_by_sha256=source_ids_by_content(
+                    (track.path, (track_source_ids or {}).get(track.path.name, ""))
+                    for track in candidate.spoken_tracks
+                ),
             )
             _log(
                 logger,

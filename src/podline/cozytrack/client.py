@@ -23,6 +23,23 @@ def is_host_participant(participant_id: str) -> bool:
     )
 
 
+def host_channel_number(participant_id: str) -> Optional[int]:
+    """Host-local channel number for a stable Cozytrack participant id.
+
+    The plain host id maps to channel 1. Returns None for remote
+    participants and for host-local ids without a positive integer
+    channel suffix.
+    """
+    normalized = participant_id.strip()
+    if normalized == _HOST_PARTICIPANT_ID:
+        return 1
+    if normalized.startswith(_HOST_LOCAL_PARTICIPANT_PREFIX):
+        suffix = normalized[len(_HOST_LOCAL_PARTICIPANT_PREFIX) :]
+        if suffix.isdigit() and int(suffix) > 0:
+            return int(suffix)
+    return None
+
+
 @dataclass(frozen=True)
 class CozytrackTrack:
     id: str
