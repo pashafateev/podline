@@ -1151,9 +1151,10 @@ def _partition_cozytrack_offset_tracks(
     Cozytrack starts every recorder sequentially and stops them together, so
     offsets come from duration shortfalls alone — local channels need them
     too. Topology still matters for sessions with more than two tracks: the
-    alignment reference must be a host-local channel (the host machine
-    records from session start), and a remote track outlasting every local
-    channel means the registered assets do not match the Cozytrack session.
+    topology must still contain both host-local and remote channels and every
+    registered asset must match a Cozytrack track. The longest validated track
+    becomes the alignment reference because remote recording can begin before
+    the host-local recorders.
     """
     if not session.cozytrack_session_id:
         raise AuphonicError(
@@ -1249,7 +1250,7 @@ def plan_session_auphonic_offset(
             cozytrack_client=cozytrack_client,
         )
 
-    reference = max(local_durations, key=lambda item: item.duration_seconds)
+    reference = max(asset_durations, key=lambda item: item.duration_seconds)
 
     client = client or AuphonicClient(config)
     details = inspect_production(config, session.auphonic_production_id, client=client)
@@ -1269,7 +1270,7 @@ def plan_session_auphonic_offset(
         )
         if offset_decimal < 0:
             raise AuphonicError(
-                f"Asset {item.asset.filename} is not shorter than the local reference {reference.asset.filename}; no positive Auphonic offset can be computed"
+                f"Asset {item.asset.filename} is longer than the selected reference {reference.asset.filename}; no positive Auphonic offset can be computed"
             )
         if offset_decimal == 0:
             aligned_assets.append(item.asset)

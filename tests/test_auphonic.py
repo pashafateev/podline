@@ -1142,7 +1142,7 @@ def test_session_offset_requires_both_local_and_remote_tracks(
         )
 
 
-def test_session_offset_rejects_remote_longer_than_local_reference(
+def test_session_offset_uses_remote_reference_when_remote_started_first(
     app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
 ) -> None:
     config = app_config_factory(tmp_path)
@@ -1154,20 +1154,38 @@ def test_session_offset_rejects_remote_longer_than_local_reference(
         artifact_registrar,
         tracks=[
             ("host1", "Tr1.webm", 100.0, "host"),
-            ("host2", "Tr2.webm", 101.0, "guest-a"),
-            ("guest1", "Tr3.webm", 98.0, "guest-b"),
+            ("host2", "Tr2.webm", 99.0, "host-local-ch-2"),
+            ("guest1", "Tr3.webm", 101.0, "guest-a"),
         ],
     )
+    client = FakeOffsetAuphonicClient(tracks=_three_auphonic_tracks())
 
-    with pytest.raises(AuphonicError, match="Tr2.webm is not shorter"):
-        plan_session_auphonic_offset(
-            config=config,
-            runtime_paths=runtime_paths,
-            db_file=runtime_paths.db_file,
-            session=session,
-            client=FakeOffsetAuphonicClient(tracks=_three_auphonic_tracks()),
-            cozytrack_client=cozytrack_client,
-        )
+    result = offset_session_auphonic_production(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        apply=True,
+        client=client,
+        cozytrack_client=cozytrack_client,
+    )
+
+    assert [asset.filename for asset in result.plan.reference_assets] == [
+        "Tr1.webm",
+        "Tr2.webm",
+    ]
+    assert result.plan.reference_asset.filename == "Tr3.webm"
+    assert [target.asset.filename for target in result.plan.targets] == [
+        "Tr1.webm",
+        "Tr2.webm",
+    ]
+    assert [target.offset_seconds for target in result.plan.targets] == pytest.approx(
+        [1.0, 2.0]
+    )
+    assert client.offset_updates == [
+        ("prod-123", "Host", pytest.approx(1.0)),
+        ("prod-123", "Remote 1", pytest.approx(2.0)),
+    ]
 
 
 def test_session_offset_plan_uses_stored_durations(
