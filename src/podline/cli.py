@@ -1385,7 +1385,8 @@ def auphonic_offset_command(
             ("production_id", plan.production_id),
             (
                 "local_assets",
-                ", ".join(asset.filename for asset in plan.reference_assets),
+                ", ".join(asset.filename for asset in plan.local_assets)
+                or "not validated",
             ),
             ("reference_asset", plan.reference_asset.filename),
             ("applied", "yes" if result.applied else "no"),

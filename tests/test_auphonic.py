@@ -740,6 +740,7 @@ def _cozytrack_offset_session(
     *,
     tracks,
     cozytrack_session_id="ct-session-1",
+    created_at_offsets=None,
 ):
     session = session_factory(
         runtime_paths.db_file,
@@ -749,6 +750,9 @@ def _cozytrack_offset_session(
         cozytrack_session_id=cozytrack_session_id,
     )
     cozytrack_tracks = []
+    reference_duration = max(
+        duration for _role, _filename, duration, _participant in tracks
+    )
     for index, (role, filename, duration, participant_id) in enumerate(tracks, start=1):
         path = tmp_path / filename
         path.write_bytes(f"track-{index}".encode())
@@ -764,12 +768,19 @@ def _cozytrack_offset_session(
             source_provider="cozytrack",
             source_id=source_id,
         )
+        created_at_offset = (
+            created_at_offsets[index - 1]
+            if created_at_offsets is not None
+            else reference_duration - duration
+        )
         cozytrack_tracks.append(
             CozytrackTrack(
                 id=source_id,
                 participant_name=role,
                 status="complete",
-                created_at=f"2026-07-18T00:00:0{index}Z",
+                created_at=(
+                    f"2026-07-18T00:00:{created_at_offset:06.3f}Z"
+                ),
                 participant_id=participant_id,
             )
         )
@@ -833,7 +844,7 @@ def test_session_offset_targets_late_local_channel_and_remote(
     plan = result.plan
 
     assert cozytrack_client.requested_session_ids == ["ct-session-1"]
-    assert [asset.filename for asset in plan.reference_assets] == [
+    assert [asset.filename for asset in plan.local_assets] == [
         "Tr1.webm",
         "Tr3.webm",
     ]
@@ -1170,7 +1181,7 @@ def test_session_offset_uses_remote_reference_when_remote_started_first(
         cozytrack_client=cozytrack_client,
     )
 
-    assert [asset.filename for asset in result.plan.reference_assets] == [
+    assert [asset.filename for asset in result.plan.local_assets] == [
         "Tr1.webm",
         "Tr2.webm",
     ]
@@ -1186,6 +1197,69 @@ def test_session_offset_uses_remote_reference_when_remote_started_first(
         ("prod-123", "Host", pytest.approx(1.0)),
         ("prod-123", "Remote 1", pytest.approx(2.0)),
     ]
+
+
+def test_session_offset_rejects_duration_offsets_that_disagree_with_created_at(
+    app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session, cozytrack_client = _cozytrack_offset_session(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        tracks=[
+            ("host1", "Tr1.webm", 100.0, "host"),
+            ("host2", "Tr2.webm", 99.0, "host-local-ch-2"),
+            ("guest1", "Tr3.webm", 101.0, "guest-a"),
+        ],
+        # The guest actually started last but ran long enough to appear first
+        # by duration, modeling a delayed stop signal rather than a head start.
+        created_at_offsets=[0.0, 1.0, 2.0],
+    )
+
+    with pytest.raises(AuphonicError, match="createdAt.*exceeds"):
+        plan_session_auphonic_offset(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=session,
+            client=FakeOffsetAuphonicClient(tracks=_three_auphonic_tracks()),
+            cozytrack_client=cozytrack_client,
+        )
+
+
+def test_session_offset_allows_created_at_difference_at_tolerance(
+    app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session, cozytrack_client = _cozytrack_offset_session(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        tracks=[
+            ("host1", "Tr1.webm", 101.573, "host"),
+            ("host2", "Tr2.webm", 100.0, "guest-a"),
+            ("guest1", "Tr3.webm", 99.573, "host-local-ch-2"),
+        ],
+        created_at_offsets=[0.0, 1.073, 2.0],
+    )
+
+    plan = plan_session_auphonic_offset(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        client=FakeOffsetAuphonicClient(tracks=_three_auphonic_tracks()),
+        cozytrack_client=cozytrack_client,
+    )
+
+    assert [target.offset_seconds for target in plan.targets] == pytest.approx(
+        [1.573, 2.0]
+    )
 
 
 def test_session_offset_plan_uses_stored_durations(
@@ -1211,6 +1285,7 @@ def test_session_offset_plan_uses_stored_durations(
     )
 
     assert plan.targets[0].asset.filename == "Tr2.webm"
+    assert plan.local_assets == []
     assert plan.reference_asset.filename == "Tr1.webm"
     assert plan.targets[0].track_id == "Pasha"
     assert plan.targets[0].offset_seconds == pytest.approx(1.801)
