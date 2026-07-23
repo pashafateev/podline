@@ -3,10 +3,11 @@
 Drives one session through every stage with no external drive paths at all:
 import → auphonic prepare/offset/preview/start → workspace → finalize →
 transcript refresh → episode metadata → Podbean draft. Auphonic, Podbean,
-and opencode are faked; S3 is moto; everything else is real.
+and the OpenAI API are faked; S3 is moto; everything else is real.
 """
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from podline.artifacts import workspace_path_for
 from podline.auphonic import (
@@ -19,7 +20,7 @@ from podline.auphonic import (
     refresh_transcript_with_auphonic,
     start_prepared_session_with_auphonic,
 )
-from podline.episode_meta import generate_episode_metadata_with_opencode
+from podline.episode_meta import EpisodeMetadataDraft, generate_episode_metadata
 from podline.finalize import finalize_session
 from podline.ingest import import_local_folder
 from podline.podbean import create_podbean_draft
@@ -157,11 +158,38 @@ class WorkflowPodbeanClient:
         return {"episode": {"id": "pb-flow", "url": "https://podbean.test/pb-flow"}}
 
 
+class WorkflowOpenAIClient:
+    def __init__(self) -> None:
+        self.responses = self
+
+    def parse(self, **kwargs):
+        transcript_input = kwargs["input"][1]
+        assert transcript_input["role"] == "user"
+        assert "Final cut transcript" in transcript_input["content"]
+        return SimpleNamespace(
+            status="completed",
+            incomplete_details=None,
+            output=[
+                SimpleNamespace(
+                    type="message",
+                    content=[
+                        SimpleNamespace(
+                            type="output_text",
+                            parsed=EpisodeMetadataDraft(
+                                title="Flow",
+                                description="Full S3 pipeline.",
+                            ),
+                        )
+                    ],
+                )
+            ],
+        )
+
+
 def test_full_s3_pipeline_without_any_drive_paths(
     moto_s3,
     app_config_factory,
     runtime_factory,
-    monkeypatch,
     tmp_path: Path,
 ) -> None:
     config = app_config_factory(tmp_path, podbean_enabled=True)
@@ -253,19 +281,12 @@ def test_full_s3_pipeline_without_any_drive_paths(
     assert client.single_created[0].endswith("/sexdrunks_ep99_master.wav")
 
     # 7. Metadata generation reads the refreshed transcript artifact.
-    monkeypatch.setattr(
-        "podline.episode_meta._resolve_opencode_binary", lambda: "/bin/opencode"
-    )
-
-    def fake_opencode(opencode_binary, project_dir, transcript_text):
-        assert "Final cut transcript" in transcript_text
-        return "**Title:** Flow\n\n**Description:**\nFull S3 pipeline."
-
-    monkeypatch.setattr(
-        "podline.episode_meta._run_opencode_episode_meta", fake_opencode
-    )
-    generate_episode_metadata_with_opencode(
-        config=config, runtime_paths=runtime_paths, db_file=db_file, session=refreshed
+    generate_episode_metadata(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=db_file,
+        session=refreshed,
+        client=WorkflowOpenAIClient(),
     )
 
     # 8. Podbean draft uploads materialized artifacts.

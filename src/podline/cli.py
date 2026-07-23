@@ -38,7 +38,7 @@ from podline.cozytrack.ingest import (
 from podline.db import initialize_database
 from podline.episode_meta import (
     EpisodeMetaError,
-    generate_episode_metadata_with_opencode,
+    generate_episode_metadata,
 )
 from podline.finalize import (
     FinalizeError,
@@ -857,7 +857,7 @@ def episode_meta_command(
         None, "--config", help="Path to config.yaml."
     ),
 ) -> None:
-    """Generate episode title and description using the local /episode-meta OpenCode command."""
+    """Generate episode title and description with the OpenAI API."""
     config_path = _resolve_config_path(config)
     loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
     session = _resolve_session_arg(runtime_paths, session_uid)
@@ -868,7 +868,7 @@ def episode_meta_command(
         raise typer.Exit(code=1)
 
     try:
-        episode = generate_episode_metadata_with_opencode(
+        episode = generate_episode_metadata(
             config=loaded_config,
             runtime_paths=runtime_paths,
             db_file=runtime_paths.db_file,

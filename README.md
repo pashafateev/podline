@@ -122,11 +122,18 @@ Notes:
 - If polling or downloading is interrupted after Auphonic starts, re-running the command resumes the stored refresh production instead of creating a duplicate.
 - A successful refresh invalidates previously generated episode metadata, so run `pod episode-meta @1` again before creating the Podbean draft.
 
-6. Generate episode metadata using the local OpenCode command
+6. Generate episode metadata with the OpenAI API
 ```bash
+export OPENAI_API_KEY=...
 pod episode-meta @1
 pod status @1
 ```
+
+`pod episode-meta` remains a manual step. It sends the current registered VTT
+transcript to the Responses API and saves the structured title and description.
+The model defaults to `gpt-5.6` with low reasoning effort and a 120-second
+timeout; override those values in the optional `episode_metadata` config section.
+The API key is read only from `OPENAI_API_KEY`, never from YAML.
 
 7. Create the Podbean draft
 ```bash
