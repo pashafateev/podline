@@ -981,15 +981,10 @@ def _persist_outputs(
             )
             result["stems"] = stems
         except Exception as exc:
-            delete_media_artifacts(
-                db_file,
-                session_uid=session_uid,
-                kind=ArtifactKind.PRE_EDIT_STEM.value,
-            )
             warning_logger = logger or logging.getLogger("podline")
             warning_logger.warning(
                 "Could not persist optional Auphonic stems for %s; "
-                "cleared any existing stem set: %s",
+                "preserved any existing stem set: %s",
                 session_uid,
                 exc,
             )
@@ -1461,6 +1456,19 @@ def resolve_stem_workspace_metadata(
     if not stems:
         raise AuphonicError(
             f"Session {session.session_uid} has no persisted Auphonic stems"
+        )
+    stem_production_ids = {stem.source_id for stem in stems}
+    if stem_production_ids != {session.auphonic_production_id}:
+        stored_ids = ", ".join(
+            sorted(
+                str(production_id or "unknown")
+                for production_id in stem_production_ids
+            )
+        )
+        raise AuphonicError(
+            f"Persisted repair stems belong to Auphonic production {stored_ids}, "
+            f"not the newer Auphonic production {session.auphonic_production_id}; "
+            "rerun auphonic-sync before creating a stem workspace"
         )
     client = client or AuphonicClient(config)
     details = inspect_production(
