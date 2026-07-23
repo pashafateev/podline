@@ -353,14 +353,20 @@ def create_workspace(
 
 
 def _remove_obsolete_stem_workspace_outputs(workspace: Path) -> None:
-    (workspace / "repair-manifest.json").unlink(missing_ok=True)
+    repair_manifest_path = workspace / "repair-manifest.json"
+    previous_manifest = _read_json_object(repair_manifest_path)
+    managed_filenames = {
+        Path(str(entry.get("filename") or "")).name
+        for entry in previous_manifest.get("stems", [])
+        if isinstance(entry, dict) and entry.get("filename")
+    }
+    repair_manifest_path.unlink(missing_ok=True)
     stems_dir = workspace / "stems"
     if not stems_dir.is_dir():
         return
-    for entry in stems_dir.iterdir():
-        if entry.suffix.casefold() == ".flac" and (
-            entry.is_file() or entry.is_symlink()
-        ):
+    for filename in managed_filenames:
+        entry = stems_dir / filename
+        if entry.is_file() or entry.is_symlink():
             entry.unlink()
     try:
         stems_dir.rmdir()
