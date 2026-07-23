@@ -433,7 +433,7 @@ def test_auphonic_offset_command_prints_dry_run_plan(
                     AuphonicAssetDuration(tr2, 99.433),
                     AuphonicAssetDuration(tr3, 101.234),
                 ],
-                reference_assets=[tr1],
+                local_assets=[tr1],
                 reference_asset=tr1,
                 targets=[
                     AuphonicOffsetTarget(

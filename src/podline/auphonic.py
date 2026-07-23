@@ -96,7 +96,7 @@ class AuphonicOffsetTarget:
 class AuphonicOffsetPlan:
     production_id: str
     asset_durations: List[AuphonicAssetDuration]
-    reference_assets: List[MediaArtifactRecord]
+    local_assets: List[MediaArtifactRecord]
     reference_asset: MediaArtifactRecord
     targets: List[AuphonicOffsetTarget]
     aligned_assets: List[MediaArtifactRecord]
@@ -109,7 +109,18 @@ class AuphonicOffsetResult:
     track_states: List[Dict]
 
 
+@dataclass(frozen=True)
+class _CozytrackOffsetTopology:
+    local_assets: List[AuphonicAssetDuration]
+    created_at_by_source_id: Dict[str, datetime]
+
+
 DurationProbe = Callable[[Path], float]
+
+
+# Allow recorder setup and container packet-timing jitter while still rejecting
+# whole-second stop overhangs that duration-only alignment would misinterpret.
+_OFFSET_CREATED_AT_TOLERANCE_SECONDS = 0.5
 
 
 class AuphonicClientProtocol(Protocol):
@@ -1139,21 +1150,21 @@ def probe_audio_duration_from_packets(path: Path) -> float:
     return _duration_from_ffprobe_packet_data(payload, source=path)
 
 
-def _partition_cozytrack_offset_tracks(
+def _load_cozytrack_offset_topology(
     *,
     config: AppConfig,
     session: SessionRecord,
     asset_durations: List[AuphonicAssetDuration],
     cozytrack_client: Optional[CozytrackClientProtocol],
-) -> Tuple[List[AuphonicAssetDuration], List[AuphonicAssetDuration]]:
-    """Split host-local tracks from remote tracks using Cozytrack identity.
+) -> _CozytrackOffsetTopology:
+    """Load and validate the Cozytrack identity and timing topology.
 
     Cozytrack starts every recorder sequentially and stops them together, so
     offsets come from duration shortfalls alone — local channels need them
-    too. Topology still matters for sessions with more than two tracks: the
-    alignment reference must be a host-local channel (the host machine
-    records from session start), and a remote track outlasting every local
-    channel means the registered assets do not match the Cozytrack session.
+    too. For sessions with more than two tracks, every registered asset must
+    match a Cozytrack track and the topology must contain both host-local and
+    remote channels. Host-local assets are retained for display, while track
+    creation times independently validate the duration-derived offsets.
     """
     if not session.cozytrack_session_id:
         raise AuphonicError(
@@ -1171,8 +1182,9 @@ def _partition_cozytrack_offset_tracks(
         ) from exc
 
     tracks_by_id = {track.id: track for track in cozytrack_session.tracks}
-    local_durations = []
-    remote_durations = []
+    local_assets = []
+    remote_count = 0
+    created_at_by_source_id = {}
     for item in asset_durations:
         source_id = (item.asset.source_id or "").strip()
         source_track = tracks_by_id.get(source_id)
@@ -1185,16 +1197,70 @@ def _partition_cozytrack_offset_tracks(
             raise AuphonicError(
                 f"Cozytrack track {source_track.id} for {item.asset.filename} has no participantId; local/remote topology is required for sessions with more than 2 tracks"
             )
+        raw_created_at = (source_track.created_at or "").strip()
+        if not raw_created_at:
+            raise AuphonicError(
+                f"Cozytrack track {source_track.id} for {item.asset.filename} has no createdAt; recorder timing is required for sessions with more than 2 tracks"
+            )
+        try:
+            created_at = datetime.fromisoformat(
+                raw_created_at.replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise AuphonicError(
+                f"Cozytrack track {source_track.id} for {item.asset.filename} has invalid createdAt={raw_created_at!r}"
+            ) from exc
+        if created_at.tzinfo is None:
+            raise AuphonicError(
+                f"Cozytrack track {source_track.id} for {item.asset.filename} has timezone-less createdAt={raw_created_at!r}"
+            )
+        created_at_by_source_id[source_id] = created_at.astimezone(timezone.utc)
         if is_host_participant(participant_id):
-            local_durations.append(item)
+            local_assets.append(item)
         else:
-            remote_durations.append(item)
+            remote_count += 1
 
-    if not local_durations or not remote_durations:
+    if not local_assets or not remote_count:
         raise AuphonicError(
-            f"Session {session.session_uid} must contain at least one host-local and one remote Cozytrack track to compute multitrack offsets; found {len(local_durations)} local and {len(remote_durations)} remote"
+            f"Session {session.session_uid} must contain at least one host-local and one remote Cozytrack track to compute multitrack offsets; found {len(local_assets)} local and {remote_count} remote"
         )
-    return local_durations, remote_durations
+    return _CozytrackOffsetTopology(
+        local_assets=local_assets,
+        created_at_by_source_id=created_at_by_source_id,
+    )
+
+
+def _validate_offset_timing_against_created_at(
+    *,
+    asset_durations: List[AuphonicAssetDuration],
+    reference: AuphonicAssetDuration,
+    created_at_by_source_id: Dict[str, datetime],
+) -> None:
+    reference_source_id = (reference.asset.source_id or "").strip()
+    reference_created_at = created_at_by_source_id[reference_source_id]
+    tolerance = Decimal(str(_OFFSET_CREATED_AT_TOLERANCE_SECONDS))
+    for item in asset_durations:
+        source_id = (item.asset.source_id or "").strip()
+        duration_offset = Decimal(str(reference.duration_seconds)) - Decimal(
+            str(item.duration_seconds)
+        )
+        created_at_offset = Decimal(
+            str(
+                (
+                    created_at_by_source_id[source_id] - reference_created_at
+                ).total_seconds()
+            )
+        )
+        difference = abs(duration_offset - created_at_offset)
+        if difference > tolerance:
+            raise AuphonicError(
+                f"Duration-derived offset for {item.asset.filename} "
+                f"({duration_offset:.3f}s) disagrees with Cozytrack createdAt "
+                f"offset ({created_at_offset:.3f}s) relative to "
+                f"{reference.asset.filename}; difference {difference:.3f}s "
+                f"exceeds {_OFFSET_CREATED_AT_TOLERANCE_SECONDS:.3f}s "
+                "tolerance. Recorder stop times may not match."
+            )
 
 
 def plan_session_auphonic_offset(
@@ -1233,23 +1299,25 @@ def plan_session_auphonic_offset(
         )
         for artifact in tracks
     ]
-    if len(asset_durations) == 2:
-        # Two-track sessions may have no Cozytrack topology (e.g. pod
-        # import); with a shared stop time the longer track started first
-        # and anchors the alignment.
-        sorted_durations = sorted(
-            asset_durations, key=lambda item: item.duration_seconds
-        )
-        local_durations = [sorted_durations[-1]]
-    else:
-        local_durations, _remote_durations = _partition_cozytrack_offset_tracks(
+    local_assets = []
+    created_at_by_source_id = {}
+    if len(asset_durations) > 2:
+        topology = _load_cozytrack_offset_topology(
             config=config,
             session=session,
             asset_durations=asset_durations,
             cozytrack_client=cozytrack_client,
         )
+        local_assets = topology.local_assets
+        created_at_by_source_id = topology.created_at_by_source_id
 
-    reference = max(local_durations, key=lambda item: item.duration_seconds)
+    reference = max(asset_durations, key=lambda item: item.duration_seconds)
+    if created_at_by_source_id:
+        _validate_offset_timing_against_created_at(
+            asset_durations=asset_durations,
+            reference=reference,
+            created_at_by_source_id=created_at_by_source_id,
+        )
 
     client = client or AuphonicClient(config)
     details = inspect_production(config, session.auphonic_production_id, client=client)
@@ -1267,10 +1335,6 @@ def plan_session_auphonic_offset(
         offset_decimal = Decimal(str(reference.duration_seconds)) - Decimal(
             str(item.duration_seconds)
         )
-        if offset_decimal < 0:
-            raise AuphonicError(
-                f"Asset {item.asset.filename} is not shorter than the local reference {reference.asset.filename}; no positive Auphonic offset can be computed"
-            )
         if offset_decimal == 0:
             aligned_assets.append(item.asset)
             continue
@@ -1294,7 +1358,7 @@ def plan_session_auphonic_offset(
     return AuphonicOffsetPlan(
         production_id=session.auphonic_production_id,
         asset_durations=asset_durations,
-        reference_assets=[item.asset for item in local_durations],
+        local_assets=[item.asset for item in local_assets],
         reference_asset=reference.asset,
         targets=targets,
         aligned_assets=aligned_assets,
