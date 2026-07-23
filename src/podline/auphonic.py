@@ -668,6 +668,7 @@ def start_prepared_session_with_auphonic(
             runtime_paths=runtime_paths,
             db_file=db_file,
             session_uid=session.session_uid,
+            expected_auphonic_production_id=production.production_id,
         )
 
         update_session_status(
@@ -1903,6 +1904,7 @@ def reconcile_production_to_session(
             runtime_paths=runtime_paths,
             db_file=db_file,
             session_uid=session.session_uid,
+            expected_auphonic_production_id=production_id,
         )
         update_session_status(
             db_file,

@@ -287,6 +287,7 @@ def create_workspace(
     storage: Optional[MediaStorage] = None,
     include_stems: bool = False,
     stem_metadata: Optional[Dict[str, Dict[str, object]]] = None,
+    expected_auphonic_production_id: Optional[str] = None,
 ) -> Path:
     """Materialize the current pre-edit master and transcript for editing.
 
@@ -337,10 +338,12 @@ def create_workspace(
     registered_stems = list_media_artifacts(
         db_file, session_uid, kind=ArtifactKind.PRE_EDIT_STEM.value
     )
-    session = get_session(db_file, session_uid)
-    current_production_id = (
-        session.auphonic_production_id if session is not None else None
-    )
+    current_production_id = expected_auphonic_production_id
+    if current_production_id is None:
+        session = get_session(db_file, session_uid)
+        current_production_id = (
+            session.auphonic_production_id if session is not None else None
+        )
     if not registered_stems or (
         not include_stems
         and not _stem_workspace_matches_registered(
