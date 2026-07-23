@@ -328,7 +328,7 @@ def _queued_session_with_tracks(
     tr1.write_bytes(b"track-one-bytes")
     tr2 = tmp_path / "Tr2.webm"
     tr2.write_bytes(b"track-two-bytes!")
-    artifact_registrar(
+    stale_record = artifact_registrar(
         runtime_paths.db_file,
         runtime_paths,
         session_uid=session.session_uid,
@@ -728,7 +728,7 @@ def test_sync_continues_when_optional_stem_archive_is_unmappable(
     )
     stale_stem = tmp_path / "stale.flac"
     stale_stem.write_bytes(b"older-production-stem")
-    artifact_registrar(
+    stale_record = artifact_registrar(
         runtime_paths.db_file,
         runtime_paths,
         session_uid=session.session_uid,
@@ -737,6 +737,28 @@ def test_sync_continues_when_optional_stem_archive_is_unmappable(
         path=stale_stem,
         source_provider="auphonic",
         source_id="older-production",
+    )
+    workspace = workspace_path_for(runtime_paths, session.session_uid)
+    stems_dir = workspace / "stems"
+    stems_dir.mkdir(parents=True)
+    materialized_stale_stem = stems_dir / "stale.flac"
+    materialized_stale_stem.write_bytes(b"materialized-stale-stem")
+    user_export = stems_dir / "manual-repair-export.flac"
+    user_export.write_bytes(b"user-created-flac")
+    (workspace / "repair-manifest.json").write_text(
+        json.dumps(
+            {
+                "auphonic_production_id": "older-production",
+                "stems": [
+                    {
+                        "role": "host1",
+                        "filename": "stale.flac",
+                        "source_sha256": stale_record.sha256,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
     )
     client = FakeStemAuphonicClient(
         archive_entries={"1.flac": b"one", "2.flac": b"two"}
@@ -772,6 +794,9 @@ def test_sync_continues_when_optional_stem_archive_is_unmappable(
             session=updated,
             client=client,
         )
+    assert not materialized_stale_stem.exists()
+    assert not (workspace / "repair-manifest.json").exists()
+    assert user_export.read_bytes() == b"user-created-flac"
     assert "Could not persist optional Auphonic stems" in caplog.text
 
 
