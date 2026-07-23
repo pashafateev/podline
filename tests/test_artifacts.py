@@ -602,6 +602,17 @@ def test_create_stem_workspace_aligns_when_offsets_improve_sync_and_preserves_us
         include_stems=True,
         stem_metadata=metadata,
     )
+    assert len(calls) == 2
+
+    metadata["host1"]["offset_seconds"] = 1.0
+    create_workspace(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session_uid=session_uid,
+        include_stems=True,
+        stem_metadata=metadata,
+    )
 
     assert created == workspace
     assert project.read_bytes() == b"cubase-project"
@@ -610,6 +621,8 @@ def test_create_stem_workspace_aligns_when_offsets_improve_sync_and_preserves_us
     assert (workspace / "stems" / "Pasha.flac").exists()
     assert calls[0] == ("Jonathan.flac", 0.0, pytest.approx(10.0))
     assert calls[1] == ("Pasha.flac", 1.8, pytest.approx(10.0))
+    assert calls[2] == ("Jonathan.flac", 1.0, pytest.approx(11.0))
+    assert calls[3] == ("Pasha.flac", 1.8, pytest.approx(11.0))
 
     repair_manifest = json.loads(
         (workspace / "repair-manifest.json").read_text(encoding="utf-8")
@@ -618,6 +631,7 @@ def test_create_stem_workspace_aligns_when_offsets_improve_sync_and_preserves_us
     assert repair_manifest["loudness_normalized"] is False
     assert repair_manifest["final_loudness_check_required"] is True
     assert repair_manifest["offsets_rendered_by_auphonic"] is False
+    assert repair_manifest["target_duration_seconds"] == pytest.approx(11.0)
     assert [stem["role"] for stem in repair_manifest["stems"]] == ["host1", "host2"]
     assert repair_manifest["stems"][1]["podline_offset_applied_seconds"] == 1.8
     assert repair_manifest["stems"][1]["sha256"] == sha256_of_file(
@@ -675,6 +689,66 @@ def test_create_stem_workspace_does_not_double_apply_offsets_already_rendered(
     )
     assert manifest["offsets_rendered_by_auphonic"] is True
     assert all(stem["podline_offset_applied_seconds"] == 0 for stem in manifest["stems"])
+
+
+@pytest.mark.parametrize(
+    ("durations", "offsets"),
+    [
+        ((10.0, 10.0), (0.0, 0.0)),
+        ((10.0, 9.98), (0.0, 0.03)),
+    ],
+)
+def test_stem_manifest_does_not_claim_auphonic_rendered_ambiguous_offsets(
+    app_config_factory,
+    runtime_factory,
+    artifact_registrar,
+    tmp_path: Path,
+    monkeypatch,
+    durations,
+    offsets,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    for kind, role, filename, duration in (
+        ("pre_edit_master", "", "pre.mp3", None),
+        ("transcript", "", "episode.vtt", None),
+        ("pre_edit_stem", "host1", "Jonathan.flac", durations[0]),
+        ("pre_edit_stem", "host2", "Pasha.flac", durations[1]),
+    ):
+        path = tmp_path / filename
+        path.write_bytes(filename.encode())
+        artifact_registrar(
+            runtime_paths.db_file,
+            runtime_paths,
+            session_uid="s-ambiguous",
+            kind=kind,
+            role=role,
+            path=path,
+            duration_seconds=duration,
+            source_provider="auphonic",
+            source_id="prod-123",
+        )
+    monkeypatch.setattr(
+        "podline.artifacts._materialize_aligned_stem",
+        lambda *_args, **_kwargs: pytest.fail("ambiguous offsets must not be applied"),
+    )
+
+    workspace = create_workspace(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session_uid="s-ambiguous",
+        include_stems=True,
+        stem_metadata={
+            "host1": {"track_id": "Jonathan", "offset_seconds": offsets[0]},
+            "host2": {"track_id": "Pasha", "offset_seconds": offsets[1]},
+        },
+    )
+
+    manifest = json.loads(
+        (workspace / "repair-manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["offsets_rendered_by_auphonic"] is False
 
 
 def test_store_artifact_files_keeps_previous_set_when_an_upload_fails(

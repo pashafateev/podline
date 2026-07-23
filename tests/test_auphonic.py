@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import logging
 import zipfile
 
 import httpx
@@ -178,6 +179,29 @@ class FakeStemAuphonicClient(FakeDoneAuphonicClient):
             }
         )
         return payload
+
+    def wait_for_production(self, production_id: str) -> AuphonicProduction:
+        assert production_id == "prod-123"
+        return AuphonicProduction(
+            production_id=production_id,
+            output_files=[
+                AuphonicOutputFile(
+                    kind="mp3",
+                    download_url="https://example.test/master.mp3",
+                    extension="mp3",
+                ),
+                AuphonicOutputFile(
+                    kind="vtt",
+                    download_url="https://example.test/transcript.vtt",
+                    extension="vtt",
+                ),
+                AuphonicOutputFile(
+                    kind="tracks",
+                    download_url="https://example.test/individual.flac.zip",
+                    extension="flac.zip",
+                ),
+            ],
+        )
 
     def download_file(self, url: str, destination: Path) -> None:
         if url.endswith(".flac.zip"):
@@ -663,6 +687,93 @@ def test_sync_without_tracks_output_clears_only_a_stale_optional_stem_set(
     assert list_media_artifacts(
         runtime_paths.db_file, session.session_uid, kind="raw_track"
     ) == raw_before
+
+
+def test_sync_continues_when_optional_stem_archive_is_unmappable(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
+    caplog,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _queued_session_with_tracks(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        status="auphonic_started",
+    )
+    client = FakeStemAuphonicClient(
+        archive_entries={"1.flac": b"one", "2.flac": b"two"}
+    )
+    caplog.set_level(logging.WARNING, logger="podline")
+
+    updated = reconcile_production_to_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        production_id="prod-123",
+        client=client,
+    )
+
+    assert updated.status == "waiting_for_finalize"
+    assert get_media_artifact(
+        runtime_paths.db_file, session.session_uid, kind="pre_edit_master"
+    )
+    assert get_media_artifact(
+        runtime_paths.db_file, session.session_uid, kind="transcript"
+    )
+    assert list_media_artifacts(
+        runtime_paths.db_file, session.session_uid, kind="pre_edit_stem"
+    ) == []
+    assert "Could not persist optional Auphonic stems" in caplog.text
+
+
+def test_start_continues_when_optional_stem_archive_is_unmappable(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
+    caplog,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _queued_session_with_tracks(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        status="auphonic_previewed",
+    )
+    client = FakeStemAuphonicClient(
+        archive_entries={"1.flac": b"one", "2.flac": b"two"}
+    )
+    caplog.set_level(logging.WARNING, logger="podline")
+
+    updated = start_prepared_session_with_auphonic(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        client=client,
+    )
+
+    assert updated.status == "waiting_for_finalize"
+    assert updated.failure_reason is None
+    assert get_media_artifact(
+        runtime_paths.db_file, session.session_uid, kind="pre_edit_master"
+    )
+    assert get_media_artifact(
+        runtime_paths.db_file, session.session_uid, kind="transcript"
+    )
+    assert "Could not persist optional Auphonic stems" in caplog.text
 
 
 def test_inspect_production_returns_verification_details(
