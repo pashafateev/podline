@@ -673,6 +673,8 @@ def test_sync_without_tracks_output_clears_only_a_stale_optional_stem_set(
     stems_dir = workspace / "stems"
     stems_dir.mkdir(parents=True)
     (stems_dir / "stale.flac").write_bytes(b"materialized-stale-stem")
+    user_export = stems_dir / "manual-repair-export.flac"
+    user_export.write_bytes(b"user-created-flac")
     (stems_dir / "notes.txt").write_text("keep me", encoding="utf-8")
     (workspace / "repair-manifest.json").write_text(
         json.dumps({"stems": [{"filename": "stale.flac"}]}),
@@ -701,6 +703,7 @@ def test_sync_without_tracks_output_clears_only_a_stale_optional_stem_set(
     ) == raw_before
     assert not (stems_dir / "stale.flac").exists()
     assert not (workspace / "repair-manifest.json").exists()
+    assert user_export.read_bytes() == b"user-created-flac"
     assert (stems_dir / "notes.txt").read_text(encoding="utf-8") == "keep me"
     assert project.read_bytes() == b"cubase-project"
 
