@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict
 
@@ -62,6 +62,13 @@ class StorageConfig:
 
 
 @dataclass(frozen=True)
+class EpisodeMetadataConfig:
+    model: str = "gpt-5.6"
+    reasoning_effort: str = "low"
+    request_timeout_seconds: int = 120
+
+
+@dataclass(frozen=True)
 class AppConfig:
     runtime_home: Path
     paths: PathsConfig
@@ -72,6 +79,9 @@ class AppConfig:
     cozytrack: CozytrackConfig
     storage: StorageConfig
     config_file: Path
+    episode_metadata: EpisodeMetadataConfig = field(
+        default_factory=EpisodeMetadataConfig
+    )
 
 
 def load_config(config_path: Path) -> AppConfig:
@@ -122,6 +132,18 @@ def load_config(config_path: Path) -> AppConfig:
         cozytrack=_load_cozytrack_config(data),
         storage=_load_storage_config(data),
         config_file=config_path,
+        episode_metadata=_load_episode_metadata_config(data),
+    )
+
+
+def _load_episode_metadata_config(data: Dict[str, Any]) -> EpisodeMetadataConfig:
+    section = data.get("episode_metadata") or {}
+    if not isinstance(section, dict):
+        section = {}
+    return EpisodeMetadataConfig(
+        model=str(section.get("model", "gpt-5.6")),
+        reasoning_effort=str(section.get("reasoning_effort", "low")),
+        request_timeout_seconds=int(section.get("request_timeout_seconds", 120)),
     )
 
 

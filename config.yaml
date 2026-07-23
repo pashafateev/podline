@@ -35,3 +35,7 @@ storage:
   bucket: ""
   region: ""
   key_prefix: ""
+episode_metadata:
+  model: gpt-5.6
+  reasoning_effort: low
+  request_timeout_seconds: 120

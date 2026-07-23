@@ -190,7 +190,6 @@ def test_full_s3_pipeline_without_any_drive_paths(
     moto_s3,
     app_config_factory,
     runtime_factory,
-    monkeypatch,
     tmp_path: Path,
 ) -> None:
     config = app_config_factory(tmp_path, podbean_enabled=True)

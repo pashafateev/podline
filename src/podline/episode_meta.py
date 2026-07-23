@@ -1,7 +1,9 @@
-from pathlib import Path
-import re
-import shutil
-import subprocess
+from importlib import resources
+import os
+from typing import Any, Optional
+
+from openai import APITimeoutError, OpenAI, OpenAIError
+from pydantic import BaseModel
 
 from podline.artifacts import ArtifactError, materialize_artifact
 from podline.config import AppConfig
@@ -14,19 +16,29 @@ from podline.models import (
 )
 from podline.repository import upsert_episode_metadata
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+EPISODE_METADATA_PROMPT = (
+    resources.files("podline")
+    .joinpath("prompts/episode_metadata.md")
+    .read_text(encoding="utf-8")
+)
 
 
 class EpisodeMetaError(RuntimeError):
     pass
 
 
-def generate_episode_metadata_with_opencode(
+class EpisodeMetadataDraft(BaseModel):
+    title: str
+    description: str
+
+
+def generate_episode_metadata(
     *,
     config: AppConfig,
     runtime_paths: RuntimePaths,
     db_file: str,
     session: SessionRecord,
+    client: Optional[Any] = None,
 ) -> EpisodeRecord:
     if session.status not in {
         SessionStatus.READY_FOR_DRAFT.value,
@@ -47,57 +59,97 @@ def generate_episode_metadata_with_opencode(
     except ArtifactError as exc:
         raise EpisodeMetaError(str(exc)) from exc
 
-    opencode_binary = _resolve_opencode_binary()
-    project_dir = PROJECT_ROOT
     transcript_text = transcript_path.read_text(encoding="utf-8-sig")
-    output = _run_opencode_episode_meta(opencode_binary, project_dir, transcript_text)
-    title, description = _parse_episode_meta_output(output)
+    openai_client = client or _build_openai_client(config)
+    draft = _request_episode_metadata(
+        client=openai_client,
+        config=config,
+        transcript_text=transcript_text,
+    )
     return upsert_episode_metadata(
         db_file,
         session_uid=session.session_uid,
-        title=title,
-        description=description,
+        title=draft.title,
+        description=draft.description,
     )
 
 
-def _resolve_opencode_binary() -> str:
-    resolved = shutil.which("opencode")
-    if resolved is None:
-        raise EpisodeMetaError("opencode is required for episode metadata generation")
-    return resolved
-
-
-def _run_opencode_episode_meta(
-    opencode_binary: str, project_dir: Path, transcript_text: str
-) -> str:
-    command = [
-        opencode_binary,
-        "run",
-        "--dir",
-        str(project_dir),
-        "--command",
-        "episode-meta",
-        transcript_text,
-    ]
-    result = subprocess.run(command, capture_output=True, text=True)
-    if result.returncode != 0:
+def _build_openai_client(config: AppConfig) -> OpenAI:
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
         raise EpisodeMetaError(
-            f"opencode episode-meta failed with exit code {result.returncode}: {result.stderr[:300]}"
+            "OPENAI_API_KEY is required for episode metadata generation"
         )
-    return result.stdout.strip()
+    return OpenAI(
+        api_key=api_key,
+        timeout=config.episode_metadata.request_timeout_seconds,
+    )
 
 
-def _parse_episode_meta_output(output: str) -> tuple[str, str]:
-    title_match = re.search(r"\*\*Title:\*\*\s*(.+)", output)
-    description_match = re.search(r"\*\*Description:\*\*\s*(.+)", output, re.DOTALL)
-    if not title_match or not description_match:
-        raise EpisodeMetaError(
-            "Could not parse title/description from opencode episode-meta output"
+def _request_episode_metadata(
+    *,
+    client: Any,
+    config: AppConfig,
+    transcript_text: str,
+) -> EpisodeMetadataDraft:
+    try:
+        response = client.responses.parse(
+            model=config.episode_metadata.model,
+            input=[
+                {
+                    "role": "developer",
+                    "content": EPISODE_METADATA_PROMPT,
+                },
+                {
+                    "role": "user",
+                    "content": transcript_text,
+                },
+            ],
+            text_format=EpisodeMetadataDraft,
+            reasoning={"effort": config.episode_metadata.reasoning_effort},
+            store=False,
+            tools=[],
         )
-    title = title_match.group(1).strip()
-    description = description_match.group(1).strip()
-    if not title or not description:
+    except APITimeoutError as exc:
         raise EpisodeMetaError(
-            "opencode episode-meta returned empty title or description"
+            "OpenAI episode metadata request timed out after "
+            f"{config.episode_metadata.request_timeout_seconds} seconds"
+        ) from exc
+    except OpenAIError as exc:
+        raise EpisodeMetaError(f"OpenAI API request failed: {exc}") from exc
+
+    status = getattr(response, "status", None)
+    if status != "completed":
+        detail = _response_failure_detail(response)
+        raise EpisodeMetaError(
+            f"OpenAI episode metadata response was {status or 'not completed'}{detail}"
         )
-    return title, description
+
+    for output in getattr(response, "output", []):
+        if getattr(output, "type", None) != "message":
+            continue
+        for item in getattr(output, "content", []):
+            if getattr(item, "type", None) == "refusal":
+                refusal = getattr(item, "refusal", "No refusal reason provided")
+                raise EpisodeMetaError(
+                    f"OpenAI refused episode metadata generation: {refusal}"
+                )
+            parsed = getattr(item, "parsed", None)
+            if parsed is not None:
+                return EpisodeMetadataDraft.model_validate(parsed)
+
+    raise EpisodeMetaError(
+        "OpenAI episode metadata response was missing parsed structured output"
+    )
+
+
+def _response_failure_detail(response: Any) -> str:
+    incomplete_details = getattr(response, "incomplete_details", None)
+    reason = getattr(incomplete_details, "reason", None)
+    if reason:
+        return f": {reason}"
+    error = getattr(response, "error", None)
+    message = getattr(error, "message", None)
+    if message:
+        return f": {message}"
+    return ""
