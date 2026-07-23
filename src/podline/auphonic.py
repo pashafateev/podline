@@ -53,6 +53,11 @@ from podline.scanner import recorder_track_number
 from podline.storage import parse_s3_uri, redact_url
 
 
+_MAX_STEM_ENTRY_BYTES = 2 * 1024**3
+_MAX_STEM_TOTAL_BYTES = 8 * 1024**3
+_MAX_STEM_COMPRESSION_RATIO = 200
+
+
 class AuphonicError(RuntimeError):
     pass
 
@@ -976,9 +981,15 @@ def _persist_outputs(
             )
             result["stems"] = stems
         except Exception as exc:
+            delete_media_artifacts(
+                db_file,
+                session_uid=session_uid,
+                kind=ArtifactKind.PRE_EDIT_STEM.value,
+            )
             warning_logger = logger or logging.getLogger("podline")
             warning_logger.warning(
-                "Could not persist optional Auphonic stems for %s: %s",
+                "Could not persist optional Auphonic stems for %s; "
+                "cleared any existing stem set: %s",
                 session_uid,
                 exc,
             )
@@ -1134,6 +1145,7 @@ def _extract_stem_archive(
 
     with archive:
         members = archive.infolist()
+        _validate_stem_archive_expansion(members)
         seen_names = set()
         mapped = {}
         for member in members:
@@ -1209,6 +1221,29 @@ def _extract_stem_archive(
                 )
             )
     return extracted
+
+
+def _validate_stem_archive_expansion(members: List[zipfile.ZipInfo]) -> None:
+    total_expanded_bytes = 0
+    for member in members:
+        if member.file_size > _MAX_STEM_ENTRY_BYTES:
+            raise AuphonicError(
+                "Auphonic tracks archive entry exceeds expanded size limit: "
+                f"{member.filename!r}"
+            )
+        total_expanded_bytes += member.file_size
+        if total_expanded_bytes > _MAX_STEM_TOTAL_BYTES:
+            raise AuphonicError(
+                "Auphonic tracks archive total expanded size exceeds limit"
+            )
+        if member.file_size <= 0:
+            continue
+        compression_ratio = member.file_size / max(member.compress_size, 1)
+        if compression_ratio > _MAX_STEM_COMPRESSION_RATIO:
+            raise AuphonicError(
+                "Auphonic tracks archive entry has suspicious compression ratio: "
+                f"{member.filename!r}"
+            )
 
 
 def _normalize_stem_token(value: str) -> str:
