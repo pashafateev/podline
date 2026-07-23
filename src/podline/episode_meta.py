@@ -3,7 +3,7 @@ import os
 from typing import Any, Optional
 
 from openai import APITimeoutError, OpenAI, OpenAIError
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from podline.artifacts import ArtifactError, materialize_artifact
 from podline.config import AppConfig
@@ -28,8 +28,15 @@ class EpisodeMetaError(RuntimeError):
 
 
 class EpisodeMetadataDraft(BaseModel):
-    title: str
-    description: str
+    title: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+
+    @field_validator("title", "description")
+    @classmethod
+    def reject_empty_fields(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be empty or whitespace-only")
+        return value
 
 
 def generate_episode_metadata(
@@ -117,6 +124,8 @@ def _request_episode_metadata(
         ) from exc
     except OpenAIError as exc:
         raise EpisodeMetaError(f"OpenAI API request failed: {exc}") from exc
+    except ValidationError as exc:
+        raise _invalid_structured_output_error() from exc
 
     status = getattr(response, "status", None)
     if status != "completed":
@@ -136,10 +145,20 @@ def _request_episode_metadata(
                 )
             parsed = getattr(item, "parsed", None)
             if parsed is not None:
-                return EpisodeMetadataDraft.model_validate(parsed)
+                try:
+                    return EpisodeMetadataDraft.model_validate(parsed)
+                except ValidationError as exc:
+                    raise _invalid_structured_output_error() from exc
 
     raise EpisodeMetaError(
         "OpenAI episode metadata response was missing parsed structured output"
+    )
+
+
+def _invalid_structured_output_error() -> EpisodeMetaError:
+    return EpisodeMetaError(
+        "OpenAI episode metadata response contained invalid structured output: "
+        "title and description must not be empty or whitespace-only"
     )
 
 
