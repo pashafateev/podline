@@ -30,6 +30,7 @@ from podline.auphonic import (
     reset_session_auphonic_production,
     resolve_auphonic_service_id,
     resolve_preset_id,
+    resolve_stem_workspace_metadata,
     start_prepared_session_with_auphonic,
 )
 from podline.cozytrack.client import CozytrackSession, CozytrackTrack
@@ -740,9 +741,19 @@ def test_sync_continues_when_optional_stem_archive_is_unmappable(
     assert get_media_artifact(
         runtime_paths.db_file, session.session_uid, kind="transcript"
     )
-    assert list_media_artifacts(
+    stems = list_media_artifacts(
         runtime_paths.db_file, session.session_uid, kind="pre_edit_stem"
-    ) == []
+    )
+    assert [(stem.source_id, stem.filename) for stem in stems] == [
+        ("older-production", "stale.flac")
+    ]
+    with pytest.raises(AuphonicError, match="newer Auphonic production"):
+        resolve_stem_workspace_metadata(
+            config=config,
+            db_file=runtime_paths.db_file,
+            session=updated,
+            client=client,
+        )
     assert "Could not persist optional Auphonic stems" in caplog.text
 
 
