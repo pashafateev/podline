@@ -314,21 +314,28 @@ class FakeResumableTranscriptRefreshClient(FakeTranscriptRefreshClient):
 
 
 def _queued_session_with_tracks(
-    tmp_path, runtime_paths, session_factory, artifact_registrar, *, status="queued"
+    tmp_path,
+    runtime_paths,
+    session_factory,
+    artifact_registrar,
+    *,
+    status="queued",
+    auphonic_production_id=None,
 ):
+    stored_production_id = auphonic_production_id
+    if stored_production_id is None and status != "queued":
+        stored_production_id = "prod-123"
     session = session_factory(
         runtime_paths.db_file,
         session_uid="session-auphonic-1",
         status=status,
-        auphonic_production_id=(
-            "prod-123" if status not in {"queued"} else None
-        ),
+        auphonic_production_id=stored_production_id,
     )
     tr1 = tmp_path / "Tr1.webm"
     tr1.write_bytes(b"track-one-bytes")
     tr2 = tmp_path / "Tr2.webm"
     tr2.write_bytes(b"track-two-bytes!")
-    stale_record = artifact_registrar(
+    artifact_registrar(
         runtime_paths.db_file,
         runtime_paths,
         session_uid=session.session_uid,
@@ -725,6 +732,7 @@ def test_sync_continues_when_optional_stem_archive_is_unmappable(
         session_factory,
         artifact_registrar,
         status="auphonic_started",
+        auphonic_production_id="older-production",
     )
     stale_stem = tmp_path / "stale.flac"
     stale_stem.write_bytes(b"older-production-stem")
