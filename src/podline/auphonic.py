@@ -981,11 +981,28 @@ def _persist_outputs(
             )
             result["stems"] = stems
         except Exception as exc:
+            existing_stems = list_media_artifacts(
+                db_file,
+                session_uid,
+                kind=ArtifactKind.PRE_EDIT_STEM.value,
+            )
+            if any(
+                stem.source_id == production.production_id
+                for stem in existing_stems
+            ):
+                delete_media_artifacts(
+                    db_file,
+                    session_uid=session_uid,
+                    kind=ArtifactKind.PRE_EDIT_STEM.value,
+                )
+                disposition = "invalidated stems from the reprocessed production"
+            else:
+                disposition = "preserved any stems from an older production"
             warning_logger = logger or logging.getLogger("podline")
             warning_logger.warning(
-                "Could not persist optional Auphonic stems for %s; "
-                "preserved any existing stem set: %s",
+                "Could not persist optional Auphonic stems for %s; %s: %s",
                 session_uid,
+                disposition,
                 exc,
             )
     else:
