@@ -334,6 +334,11 @@ def create_workspace(
         + "\n",
         encoding="utf-8",
     )
+    registered_stems = list_media_artifacts(
+        db_file, session_uid, kind=ArtifactKind.PRE_EDIT_STEM.value
+    )
+    if not registered_stems:
+        _remove_obsolete_stem_workspace_outputs(workspace)
     if include_stems:
         _materialize_workspace_stems(
             config=config,
@@ -345,6 +350,22 @@ def create_workspace(
             storage=storage,
         )
     return workspace
+
+
+def _remove_obsolete_stem_workspace_outputs(workspace: Path) -> None:
+    (workspace / "repair-manifest.json").unlink(missing_ok=True)
+    stems_dir = workspace / "stems"
+    if not stems_dir.is_dir():
+        return
+    for entry in stems_dir.iterdir():
+        if entry.suffix.casefold() == ".flac" and (
+            entry.is_file() or entry.is_symlink()
+        ):
+            entry.unlink()
+    try:
+        stems_dir.rmdir()
+    except OSError:
+        pass
 
 
 def _materialize_workspace_stems(
