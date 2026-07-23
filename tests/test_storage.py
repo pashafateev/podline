@@ -234,6 +234,35 @@ def test_upload_file_refuses_same_size_object_with_different_content(
 
 
 @mock_aws
+def test_upload_file_limits_multipart_concurrency(
+    tmp_path: Path, monkeypatch
+) -> None:
+    storage = _make_storage()
+    source = tmp_path / "track.webm"
+    source.write_bytes(b"opus-bytes")
+    key = "sessions/s1/raw_track/aaa/track.webm"
+    original_upload = storage._client.upload_file
+    transfer_configs = []
+
+    def _capture_config(*args, **kwargs):
+        transfer_configs.append(kwargs.get("Config"))
+        return original_upload(*args, **kwargs)
+
+    monkeypatch.setattr(storage._client, "upload_file", _capture_config)
+
+    storage.upload_file(
+        local_path=source,
+        key=key,
+        content_type="audio/webm",
+        sha256=sha256_of_file(source),
+    )
+
+    assert len(transfer_configs) == 1
+    assert transfer_configs[0] is not None
+    assert transfer_configs[0].max_concurrency == 4
+
+
+@mock_aws
 def test_upload_file_retries_connection_closed_then_succeeds(
     tmp_path: Path, monkeypatch, caplog
 ) -> None:
@@ -266,7 +295,7 @@ def test_upload_file_retries_connection_closed_then_succeeds(
     assert len(attempts) == 2
     assert len(delays) == 1
     assert key in caplog.text
-    assert "attempt 1/3" in caplog.text
+    assert "attempt 1/5" in caplog.text
     assert "retrying the full transfer in" in caplog.text
 
 
@@ -351,8 +380,9 @@ def test_upload_file_exhausts_transient_retries_as_storage_error(
 
     monkeypatch.setattr(storage._client, "upload_file", _unavailable)
     monkeypatch.setattr("time.sleep", delays.append)
+    monkeypatch.setattr("podline.storage.random.uniform", lambda _low, high: high)
 
-    with pytest.raises(StorageError, match="after 3 attempts"):
+    with pytest.raises(StorageError, match="after 5 attempts"):
         storage.upload_file(
             local_path=source,
             key="sessions/s1/raw_track/aaa/track.webm",
@@ -360,8 +390,8 @@ def test_upload_file_exhausts_transient_retries_as_storage_error(
             sha256=sha256_of_file(source),
         )
 
-    assert len(attempts) == 3
-    assert len(delays) == 2
+    assert len(attempts) == 5
+    assert delays == [5.0, 10.0, 20.0, 30.0]
 
 
 @mock_aws

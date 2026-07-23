@@ -20,6 +20,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import boto3
 from boto3.exceptions import Boto3Error
+from boto3.s3.transfer import TransferConfig
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import (
     BotoCoreError,
@@ -37,9 +38,10 @@ from podline.config import StorageConfig
 # must catch all three families or errors escape unwrapped.
 _S3_ERRORS = (BotoCoreError, ClientError, Boto3Error)
 
-_UPLOAD_ATTEMPTS = 3
-_UPLOAD_BACKOFF_BASE_SECONDS = 1.0
-_UPLOAD_BACKOFF_CAP_SECONDS = 4.0
+_UPLOAD_ATTEMPTS = 5
+_UPLOAD_BACKOFF_BASE_SECONDS = 5.0
+_UPLOAD_BACKOFF_CAP_SECONDS = 30.0
+_UPLOAD_MAX_CONCURRENCY = 4
 _RETRYABLE_HTTP_STATUS_CODES = {408, 429}
 _RETRYABLE_S3_ERROR_CODES = {
     "internalerror",
@@ -212,6 +214,9 @@ class MediaStorage:
                 "s3",
                 config=BotoConfig(retries={"max_attempts": 5, "mode": "standard"}),
             )
+            self._upload_transfer_config = TransferConfig(
+                max_concurrency=_UPLOAD_MAX_CONCURRENCY
+            )
         except _S3_ERRORS as exc:
             raise StorageError(
                 f"Could not create S3 client: {_sanitize_error_text(exc)}"
@@ -295,6 +300,7 @@ class MediaStorage:
                         "ContentType": content_type,
                         "Metadata": {"sha256": sha256},
                     },
+                    Config=self._upload_transfer_config,
                 )
                 break
             except _S3_ERRORS as exc:
