@@ -337,9 +337,17 @@ def create_workspace(
     registered_stems = list_media_artifacts(
         db_file, session_uid, kind=ArtifactKind.PRE_EDIT_STEM.value
     )
+    session = get_session(db_file, session_uid)
+    current_production_id = (
+        session.auphonic_production_id if session is not None else None
+    )
     if not registered_stems or (
         not include_stems
-        and not _stem_workspace_matches_registered(workspace, registered_stems)
+        and not _stem_workspace_matches_registered(
+            workspace,
+            registered_stems,
+            current_production_id=current_production_id,
+        )
     ):
         _remove_obsolete_stem_workspace_outputs(workspace)
     if include_stems:
@@ -356,13 +364,16 @@ def create_workspace(
 
 
 def _stem_workspace_matches_registered(
-    workspace: Path, stems: List[MediaArtifactRecord]
+    workspace: Path,
+    stems: List[MediaArtifactRecord],
+    *,
+    current_production_id: Optional[str],
 ) -> bool:
     manifest = _read_json_object(workspace / "repair-manifest.json")
     production_ids = {stem.source_id for stem in stems}
     if (
-        len(production_ids) != 1
-        or None in production_ids
+        production_ids != {current_production_id}
+        or current_production_id is None
         or manifest.get("auphonic_production_id") not in production_ids
     ):
         return False
