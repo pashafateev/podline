@@ -817,6 +817,64 @@ def test_start_continues_when_optional_stem_archive_is_unmappable(
     assert "Could not persist optional Auphonic stems" in caplog.text
 
 
+def test_sync_invalidates_same_production_stems_when_refresh_fails(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _queued_session_with_tracks(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        status="auphonic_started",
+    )
+    stale_stem = tmp_path / "stale.flac"
+    stale_stem.write_bytes(b"same-production-stale-stem")
+    artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid=session.session_uid,
+        kind="pre_edit_stem",
+        role="host1",
+        path=stale_stem,
+        source_provider="auphonic",
+        source_id="prod-123",
+    )
+    workspace = workspace_path_for(runtime_paths, session.session_uid)
+    stems_dir = workspace / "stems"
+    stems_dir.mkdir(parents=True)
+    materialized_stem = stems_dir / "stale.flac"
+    materialized_stem.write_bytes(b"materialized-stale-stem")
+    (workspace / "repair-manifest.json").write_text(
+        json.dumps({"stems": [{"filename": "stale.flac"}]}),
+        encoding="utf-8",
+    )
+
+    updated = reconcile_production_to_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        production_id="prod-123",
+        client=FakeStemAuphonicClient(
+            archive_entries={"1.flac": b"one", "2.flac": b"two"}
+        ),
+    )
+
+    assert updated.status == "waiting_for_finalize"
+    assert list_media_artifacts(
+        runtime_paths.db_file, session.session_uid, kind="pre_edit_stem"
+    ) == []
+    assert not materialized_stem.exists()
+    assert not (workspace / "repair-manifest.json").exists()
+
+
 def test_inspect_production_returns_verification_details(
     app_config_factory, tmp_path
 ) -> None:
