@@ -1,6 +1,8 @@
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from time import sleep
 from typing import Dict, List, Optional, Protocol
 
 import httpx
@@ -15,6 +17,12 @@ from podline.models import (
     SessionStatus,
 )
 from podline.repository import get_episode, update_session_status
+
+
+logger = logging.getLogger("podline")
+
+_PRESIGNED_UPLOAD_ATTEMPTS = 3
+_PRESIGNED_UPLOAD_BACKOFF_BASE_SECONDS = 2.0
 
 
 class PodbeanError(RuntimeError):
@@ -106,15 +114,36 @@ class PodbeanClient:
     def upload_presigned_file(
         self, presigned_url: str, file_path: Path, content_type: str
     ) -> None:
-        with file_path.open("rb") as handle:
-            response = self._client.put(
-                presigned_url,
-                content=handle,
-                headers={"Content-Type": content_type},
-            )
-        self._raise_for_status(
-            response, f"Podbean presigned upload for {file_path.name}"
-        )
+        context = f"Podbean presigned upload for {file_path.name}"
+        for attempt in range(1, _PRESIGNED_UPLOAD_ATTEMPTS + 1):
+            try:
+                with file_path.open("rb") as handle:
+                    response = self._client.put(
+                        presigned_url,
+                        content=handle,
+                        headers={"Content-Type": content_type},
+                    )
+            except httpx.TransportError as exc:
+                if attempt == _PRESIGNED_UPLOAD_ATTEMPTS:
+                    raise PodbeanError(
+                        f"{context} failed after {_PRESIGNED_UPLOAD_ATTEMPTS} "
+                        f"attempts: {exc}"
+                    ) from exc
+                delay = _PRESIGNED_UPLOAD_BACKOFF_BASE_SECONDS * 2 ** (attempt - 1)
+                logger.warning(
+                    "%s failed transiently on attempt %d/%d: %s; "
+                    "retrying in %.1fs",
+                    context,
+                    attempt,
+                    _PRESIGNED_UPLOAD_ATTEMPTS,
+                    exc,
+                    delay,
+                )
+                sleep(delay)
+                continue
+
+            self._raise_for_status(response, context)
+            return
 
     def create_draft_episode(
         self,
