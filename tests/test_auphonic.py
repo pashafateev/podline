@@ -669,6 +669,17 @@ def test_sync_without_tracks_output_clears_only_a_stale_optional_stem_set(
         source_provider="auphonic",
         source_id="older-production",
     )
+    workspace = workspace_path_for(runtime_paths, session.session_uid)
+    stems_dir = workspace / "stems"
+    stems_dir.mkdir(parents=True)
+    (stems_dir / "stale.flac").write_bytes(b"materialized-stale-stem")
+    (stems_dir / "notes.txt").write_text("keep me", encoding="utf-8")
+    (workspace / "repair-manifest.json").write_text(
+        json.dumps({"stems": [{"filename": "stale.flac"}]}),
+        encoding="utf-8",
+    )
+    project = workspace / "repair.cpr"
+    project.write_bytes(b"cubase-project")
     raw_before = list_media_artifacts(
         runtime_paths.db_file, session.session_uid, kind="raw_track"
     )
@@ -688,6 +699,10 @@ def test_sync_without_tracks_output_clears_only_a_stale_optional_stem_set(
     assert list_media_artifacts(
         runtime_paths.db_file, session.session_uid, kind="raw_track"
     ) == raw_before
+    assert not (stems_dir / "stale.flac").exists()
+    assert not (workspace / "repair-manifest.json").exists()
+    assert (stems_dir / "notes.txt").read_text(encoding="utf-8") == "keep me"
+    assert project.read_bytes() == b"cubase-project"
 
 
 def test_sync_continues_when_optional_stem_archive_is_unmappable(
