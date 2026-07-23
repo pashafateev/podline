@@ -170,3 +170,71 @@ def test_podbean_client_wraps_http_status_errors(
         assert "unauthorized" in str(exc)
     else:
         raise AssertionError("Expected PodbeanError for wrapped HTTP failure")
+
+
+def test_podbean_presigned_upload_retries_after_connection_reset(
+    app_config_factory, tmp_path: Path, monkeypatch
+) -> None:
+    config = app_config_factory(tmp_path, podbean_enabled=True)
+    attempts = 0
+    uploaded_bodies = []
+    delays = []
+
+    def handle_upload(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        uploaded_bodies.append(request.read())
+        if attempts == 1:
+            raise httpx.ReadError("Connection reset by peer", request=request)
+        return httpx.Response(200, request=request)
+
+    client = PodbeanClient(config)
+    client._client = httpx.Client(transport=httpx.MockTransport(handle_upload))
+    media_file = tmp_path / "final.mp3"
+    media_file.write_bytes(b"final audio")
+    monkeypatch.setattr(
+        "podline.podbean.sleep",
+        lambda seconds: delays.append(seconds),
+    )
+
+    client.upload_presigned_file(
+        "https://uploads.podbean.test/final.mp3",
+        media_file,
+        "audio/mpeg",
+    )
+
+    assert attempts == 2
+    assert uploaded_bodies == [b"final audio", b"final audio"]
+    assert delays == [2.0]
+
+
+def test_podbean_presigned_upload_stops_after_bounded_transport_retries(
+    app_config_factory, tmp_path: Path, monkeypatch
+) -> None:
+    config = app_config_factory(tmp_path, podbean_enabled=True)
+    attempts = 0
+    delays = []
+
+    def fail_upload(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        request.read()
+        raise httpx.ReadError("Connection reset by peer", request=request)
+
+    client = PodbeanClient(config)
+    client._client = httpx.Client(transport=httpx.MockTransport(fail_upload))
+    media_file = tmp_path / "final.mp3"
+    media_file.write_bytes(b"final audio")
+    monkeypatch.setattr(
+        "podline.podbean.sleep", lambda seconds: delays.append(seconds)
+    )
+
+    with pytest.raises(PodbeanError, match="failed after 3 attempts"):
+        client.upload_presigned_file(
+            "https://uploads.podbean.test/final.mp3",
+            media_file,
+            "audio/mpeg",
+        )
+
+    assert attempts == 3
+    assert delays == [2.0, 4.0]
