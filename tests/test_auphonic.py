@@ -707,6 +707,18 @@ def test_sync_continues_when_optional_stem_archive_is_unmappable(
         artifact_registrar,
         status="auphonic_started",
     )
+    stale_stem = tmp_path / "stale.flac"
+    stale_stem.write_bytes(b"older-production-stem")
+    artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid=session.session_uid,
+        kind="pre_edit_stem",
+        role="host1",
+        path=stale_stem,
+        source_provider="auphonic",
+        source_id="older-production",
+    )
     client = FakeStemAuphonicClient(
         archive_entries={"1.flac": b"one", "2.flac": b"two"}
     )
@@ -919,6 +931,73 @@ def test_extract_stem_archive_rejects_duplicate_names(tmp_path: Path) -> None:
                 StemTrackBinding("host2", "Pasha", "Tr2.webm", 1.801),
             ],
         )
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "limit", "entries", "message"),
+    [
+        (
+            "_MAX_STEM_ENTRY_BYTES",
+            3,
+            {"Jonathan.flac": b"four", "Pasha.flac": b"two"},
+            "entry exceeds",
+        ),
+        (
+            "_MAX_STEM_TOTAL_BYTES",
+            5,
+            {"Jonathan.flac": b"one", "Pasha.flac": b"two"},
+            "total expanded size",
+        ),
+    ],
+)
+def test_extract_stem_archive_rejects_expanded_size_limits_before_extraction(
+    tmp_path: Path,
+    monkeypatch,
+    limit_name,
+    limit,
+    entries,
+    message,
+) -> None:
+    archive_path = tmp_path / "tracks.flac.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        for name, content in entries.items():
+            archive.writestr(name, content)
+    monkeypatch.setattr(
+        f"podline.auphonic.{limit_name}", limit, raising=False
+    )
+    destination = tmp_path / "extracted"
+
+    with pytest.raises(AuphonicError, match=message):
+        _extract_stem_archive(
+            archive_path=archive_path,
+            destination_dir=destination,
+            bindings=[
+                StemTrackBinding("host1", "Jonathan", "Tr1.webm", 0),
+                StemTrackBinding("host2", "Pasha", "Tr2.webm", 1.801),
+            ],
+        )
+
+    assert not destination.exists()
+
+
+def test_extract_stem_archive_rejects_compression_bomb_before_extraction(
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "tracks.flac.zip"
+    with zipfile.ZipFile(
+        archive_path, "w", compression=zipfile.ZIP_DEFLATED
+    ) as archive:
+        archive.writestr("Jonathan.flac", b"\0" * (1024 * 1024))
+    destination = tmp_path / "extracted"
+
+    with pytest.raises(AuphonicError, match="compression ratio"):
+        _extract_stem_archive(
+            archive_path=archive_path,
+            destination_dir=destination,
+            bindings=[StemTrackBinding("host1", "Jonathan", "Tr1.webm", 0)],
+        )
+
+    assert not destination.exists()
 
 
 def test_reconcile_persists_role_complete_stems_idempotently_without_touching_raw(
