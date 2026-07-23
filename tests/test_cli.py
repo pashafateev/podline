@@ -22,6 +22,14 @@ from podline.models import AssetRecord
 runner = CliRunner()
 
 
+def test_episode_meta_help_describes_openai_without_opencode() -> None:
+    result = runner.invoke(app, ["episode-meta", "--help"])
+
+    assert result.exit_code == 0
+    assert "OpenAI" in result.stdout
+    assert "OpenCode" not in result.stdout
+
+
 def _write_config(config_file: Path, runtime_home: Path, raw_root: Path) -> None:
     config_file.write_text(
         (

@@ -48,6 +48,9 @@ podbean:
     assert config.auphonic.max_poll_attempts == 180
     assert config.auphonic.request_timeout_seconds == 600
     assert config.podbean.base_url == "https://api.podbean.example/v1"
+    assert config.episode_metadata.model == "gpt-5.6"
+    assert config.episode_metadata.reasoning_effort == "low"
+    assert config.episode_metadata.request_timeout_seconds == 120
 
 
 def test_load_config_overlays_local_config(tmp_path: Path) -> None:
@@ -109,6 +112,48 @@ podbean:
     assert config.auphonic.preset_ids["speakers_2"] == "preset-2"
     assert config.auphonic.preset_ids["speakers_3"] == ""
     assert config.podbean.podcast_id == "my-podcast-id"
+
+
+def test_load_config_overrides_episode_metadata_defaults(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        """
+runtime_home: /tmp/podline
+paths:
+  raw_root: /tmp/raw
+  deliverables_root: /tmp/deliverables
+polling:
+  interval_seconds: 30
+notifications:
+  enabled: true
+auphonic:
+  enabled: false
+  api_key: ""
+  base_url: https://auphonic.example/api
+  request_timeout_seconds: 600
+  poll_interval_seconds: 10
+  max_poll_attempts: 180
+  preset_ids: {}
+podbean:
+  enabled: false
+  client_id: ""
+  client_secret: ""
+  base_url: https://api.podbean.example/v1
+  podcast_id: ""
+episode_metadata:
+  model: gpt-5.6-terra
+  reasoning_effort: medium
+  request_timeout_seconds: 45
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_file)
+
+    assert config.episode_metadata.model == "gpt-5.6-terra"
+    assert config.episode_metadata.reasoning_effort == "medium"
+    assert config.episode_metadata.request_timeout_seconds == 45
 
 
 _BASE_CONFIG = """
