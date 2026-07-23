@@ -337,7 +337,10 @@ def create_workspace(
     registered_stems = list_media_artifacts(
         db_file, session_uid, kind=ArtifactKind.PRE_EDIT_STEM.value
     )
-    if not registered_stems:
+    if not registered_stems or (
+        not include_stems
+        and not _stem_workspace_matches_registered(workspace, registered_stems)
+    ):
         _remove_obsolete_stem_workspace_outputs(workspace)
     if include_stems:
         _materialize_workspace_stems(
@@ -350,6 +353,31 @@ def create_workspace(
             storage=storage,
         )
     return workspace
+
+
+def _stem_workspace_matches_registered(
+    workspace: Path, stems: List[MediaArtifactRecord]
+) -> bool:
+    manifest = _read_json_object(workspace / "repair-manifest.json")
+    production_ids = {stem.source_id for stem in stems}
+    if (
+        len(production_ids) != 1
+        or None in production_ids
+        or manifest.get("auphonic_production_id") not in production_ids
+    ):
+        return False
+    manifest_by_role = {
+        str(entry.get("role")): entry
+        for entry in manifest.get("stems", [])
+        if isinstance(entry, dict) and entry.get("role")
+    }
+    if set(manifest_by_role) != {stem.role for stem in stems}:
+        return False
+    return all(
+        manifest_by_role[stem.role].get("filename") == stem.filename
+        and manifest_by_role[stem.role].get("source_sha256") == stem.sha256
+        for stem in stems
+    )
 
 
 def _remove_obsolete_stem_workspace_outputs(workspace: Path) -> None:
