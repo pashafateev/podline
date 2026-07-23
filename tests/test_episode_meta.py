@@ -324,3 +324,58 @@ def test_generation_failures_do_not_overwrite_existing_metadata(
 
     saved = get_episode(runtime_paths.db_file, session.session_uid)
     assert saved == original
+
+
+@pytest.mark.parametrize(
+    ("case", "title", "description"),
+    [
+        ("empty-title", "", "A valid description."),
+        ("blank-title", " \t", "A valid description."),
+        ("empty-description", "A Valid Title", ""),
+        ("blank-description", "A Valid Title", " \n"),
+    ],
+)
+def test_empty_structured_fields_do_not_overwrite_existing_metadata(
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path: Path,
+    case: str,
+    title: str,
+    description: str,
+) -> None:
+    config, runtime_paths, session = _ready_session_with_transcript(
+        app_config_factory=app_config_factory,
+        runtime_factory=runtime_factory,
+        session_factory=session_factory,
+        artifact_registrar=artifact_registrar,
+        tmp_path=tmp_path,
+        session_uid=f"session-meta-{case}",
+    )
+    original = upsert_episode_metadata(
+        runtime_paths.db_file,
+        session_uid=session.session_uid,
+        title="Existing title",
+        description="Existing description.",
+    )
+    response = _response_with_content(
+        [
+            SimpleNamespace(
+                type="output_text",
+                parsed={"title": title, "description": description},
+            )
+        ]
+    )
+
+    with pytest.raises(EpisodeMetaError, match="empty or whitespace-only"):
+        generate_episode_metadata(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=session,
+            client=FakeOpenAIClient(response=response),
+        )
+
+    saved = get_episode(runtime_paths.db_file, session.session_uid)
+    assert saved == original
