@@ -875,6 +875,86 @@ def test_sync_invalidates_same_production_stems_when_refresh_fails(
     assert not (workspace / "repair-manifest.json").exists()
 
 
+def test_successful_stem_refresh_invalidates_older_managed_workspace(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _queued_session_with_tracks(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        status="waiting_for_finalize",
+    )
+    old_stem = tmp_path / "old-stem.flac"
+    old_stem.write_bytes(b"older-production-stem")
+    artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid=session.session_uid,
+        kind="pre_edit_stem",
+        role="host1",
+        path=old_stem,
+        source_provider="auphonic",
+        source_id="older-production",
+    )
+    workspace = workspace_path_for(runtime_paths, session.session_uid)
+    stems_dir = workspace / "stems"
+    stems_dir.mkdir(parents=True)
+    materialized_old_stem = stems_dir / "old-stem.flac"
+    materialized_old_stem.write_bytes(b"materialized-old-stem")
+    user_export = stems_dir / "manual-repair-export.flac"
+    user_export.write_bytes(b"user-created-flac")
+    (workspace / "repair-manifest.json").write_text(
+        json.dumps(
+            {
+                "auphonic_production_id": "older-production",
+                "stems": [
+                    {
+                        "role": "host1",
+                        "filename": "old-stem.flac",
+                        "source_sha256": "old-source",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "podline.auphonic.probe_audio_duration_from_packets",
+        lambda path: 10.0 if path.name == "Jonathan.flac" else 8.199,
+    )
+
+    updated = reconcile_production_to_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        production_id="prod-123",
+        client=FakeStemAuphonicClient(),
+    )
+
+    assert updated.status == "waiting_for_finalize"
+    assert {
+        (stem.role, stem.source_id)
+        for stem in list_media_artifacts(
+            runtime_paths.db_file,
+            session.session_uid,
+            kind="pre_edit_stem",
+        )
+    } == {("host1", "prod-123"), ("host2", "prod-123")}
+    assert not materialized_old_stem.exists()
+    assert not (workspace / "repair-manifest.json").exists()
+    assert user_export.read_bytes() == b"user-created-flac"
+
+
 def test_inspect_production_returns_verification_details(
     app_config_factory, tmp_path
 ) -> None:
