@@ -404,9 +404,14 @@ def _materialize_workspace_stems(
     raw_spread = max(raw_values) - min(raw_values)
     shifted_spread = max(shifted_values) - min(shifted_values)
     alignment_tolerance_seconds = 0.05
+    has_offsets = any(offset > 0 for offset in offsets.values())
     apply_offsets = (
-        any(offset > 0 for offset in offsets.values())
+        has_offsets
         and shifted_spread + alignment_tolerance_seconds < raw_spread
+    )
+    offsets_rendered_by_auphonic = (
+        has_offsets
+        and raw_spread + alignment_tolerance_seconds < shifted_spread
     )
     target_duration = max(shifted_values) if apply_offsets else None
 
@@ -442,6 +447,7 @@ def _materialize_workspace_stems(
             target.exists()
             and previous.get("source_sha256") == stem.sha256
             and previous.get("podline_offset_applied_seconds") == podline_offset
+            and previous_manifest.get("target_duration_seconds") == target_duration
             and previous.get("sha256") == sha256_of_file(target)
         )
         if not reusable:
@@ -476,7 +482,8 @@ def _materialize_workspace_stems(
                 "auphonic_production_id": production_id,
                 "loudness_normalized": False,
                 "final_loudness_check_required": True,
-                "offsets_rendered_by_auphonic": not apply_offsets,
+                "offsets_rendered_by_auphonic": offsets_rendered_by_auphonic,
+                "target_duration_seconds": target_duration,
                 "stems": manifest_stems,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             },

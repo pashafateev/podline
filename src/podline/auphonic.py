@@ -656,6 +656,7 @@ def start_prepared_session_with_auphonic(
             db_file=db_file,
             session_uid=session.session_uid,
             production=production,
+            logger=logger,
         )
         workspace = create_workspace(
             config=config,
@@ -901,6 +902,7 @@ def _persist_outputs(
     session_uid: str,
     production: AuphonicProduction,
     production_details: Optional[Dict] = None,
+    logger: Optional[logging.Logger] = None,
 ) -> Dict[str, object]:
     staging_dir = Path(runtime_paths.staging_dir) / session_uid
     staging_dir.mkdir(parents=True, exist_ok=True)
@@ -958,20 +960,28 @@ def _persist_outputs(
         None,
     )
     if tracks_output is not None:
-        details = production_details or inspect_production(
-            config, production.production_id, client=client
-        )
-        stems = _persist_stem_archive(
-            client=client,
-            config=config,
-            runtime_paths=runtime_paths,
-            db_file=db_file,
-            session_uid=session_uid,
-            production_id=production.production_id,
-            tracks_output=tracks_output,
-            multi_input_files=details.get("multi_input_files") or [],
-        )
-        result["stems"] = stems
+        try:
+            details = production_details or inspect_production(
+                config, production.production_id, client=client
+            )
+            stems = _persist_stem_archive(
+                client=client,
+                config=config,
+                runtime_paths=runtime_paths,
+                db_file=db_file,
+                session_uid=session_uid,
+                production_id=production.production_id,
+                tracks_output=tracks_output,
+                multi_input_files=details.get("multi_input_files") or [],
+            )
+            result["stems"] = stems
+        except Exception as exc:
+            warning_logger = logger or logging.getLogger("podline")
+            warning_logger.warning(
+                "Could not persist optional Auphonic stems for %s: %s",
+                session_uid,
+                exc,
+            )
     else:
         # The completed production is authoritative. Do not leave a stem set
         # from an earlier reprocess current when Individual Tracks is absent.
@@ -1826,6 +1836,7 @@ def reconcile_production_to_session(
             session_uid=session.session_uid,
             production=production,
             production_details=details,
+            logger=logger,
         )
         workspace = create_workspace(
             config=config,

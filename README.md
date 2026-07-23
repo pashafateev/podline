@@ -126,7 +126,7 @@ The second command keeps the session in `waiting_for_finalize` and creates:
 
 The stem ZIP is optional. When present, Podline safely validates it, maps every FLAC to the exact prepared Auphonic track and persisted speaker role, and stores one immutable `pre_edit_stem` artifact per role without replacing any `raw_track`. Missing, extra, duplicate, non-FLAC, symlink, absolute-path, and path-traversal entries are rejected before extraction.
 
-`repair-manifest.json` records the role, workspace and source checksums, Auphonic production and track IDs, configured offset, any offset Podline applied, and the loudness status. If the exported durations show that Auphonic already rendered the offsets, Podline copies the stems unchanged; otherwise it applies the production offsets while constructing the workspace. Re-running `pod workspace @1 --stems` refreshes Podline-managed master, transcript, stem, and manifest files but preserves Cubase projects, exported masters, and other user-created files.
+`repair-manifest.json` records the role, workspace and source checksums, Auphonic production and track IDs, configured offset, any offset Podline applied, the shared target duration, and the loudness status. If the exported durations show that Auphonic already rendered the offsets, Podline copies the stems unchanged; otherwise it applies the production offsets while constructing the workspace. Re-running `pod workspace @1 --stems` refreshes Podline-managed master, transcript, stem, and manifest files but preserves Cubase projects, exported masters, and other user-created files.
 
 > Auphonic individual tracks are processed but are **not loudness-normalized**. Run a final loudness and true-peak check on the repaired Cubase mix before `pod finalize`.
 
