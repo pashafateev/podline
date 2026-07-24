@@ -232,6 +232,47 @@ def test_status_accepts_selector_index(tmp_path: Path) -> None:
     assert "session-2" in result.stdout
 
 
+def test_status_shows_persisted_guidance_with_exact_session_uid(tmp_path: Path) -> None:
+    runtime_home = tmp_path / "runtime"
+    raw_root = tmp_path / "raw"
+    config_file = tmp_path / "config.yaml"
+    _write_config(config_file, runtime_home, raw_root)
+
+    db_file = runtime_home / "state" / "state.db"
+    initialize_database(str(db_file))
+    with connect(str(db_file)) as connection:
+        connection.execute(
+            """
+            INSERT INTO sessions (
+                session_uid, source_path, fingerprint, status,
+                auphonic_production_id,
+                auphonic_offsets_verified_production_id,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "session-stable-id",
+                "/tmp/source",
+                "fingerprint-stable",
+                "auphonic_prepared",
+                "prod-current",
+                "prod-current",
+                "now",
+                "now",
+            ),
+        )
+        connection.commit()
+
+    result = runner.invoke(
+        app, ["status", "session-stable-id", "--config", str(config_file)]
+    )
+
+    assert result.exit_code == 0
+    assert "Next" in result.stdout
+    assert "pod auphonic-preview session-stable-id" in result.stdout
+    assert "@1" not in result.stdout
+
+
 def test_auphonic_inspect_accepts_selector_index(tmp_path: Path) -> None:
     runtime_home = tmp_path / "runtime"
     raw_root = tmp_path / "raw"
@@ -384,7 +425,8 @@ def test_auphonic_preview_accepts_selector_index_without_opening_browser(
     assert "Auphonic Preview" in result.stdout
     assert "https://example.test/edit/prod-111" in result.stdout
     assert "offset=1.612" in result.stdout
-    assert "pod auphonic-start @1" in result.stdout
+    assert "Waiting on you" in result.stdout
+    assert "pod auphonic-start session-1" in result.stdout
     assert browser_calls == []
 
 
@@ -471,6 +513,8 @@ def test_auphonic_offset_command_prints_dry_run_plan(
     assert "Already Aligned" in result.stdout
     assert "Tr3.webm" in result.stdout
     assert "applied" in result.stdout
+    assert "Waiting on you" in result.stdout
+    assert "pod auphonic-offset session-2 --apply" in result.stdout
 
 
 def test_auphonic_reset_command_requeues_session(tmp_path: Path) -> None:
@@ -1234,4 +1278,6 @@ def test_auphonic_prepare_survives_display_inspection_failure(
     )
 
     assert "Auphonic Prepared" in result.stdout
+    assert "pod auphonic-offset s-prep" in result.stdout
+    assert "pod auphonic-preview" not in result.stdout
     assert result.exit_code == 0

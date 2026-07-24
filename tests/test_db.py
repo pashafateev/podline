@@ -57,6 +57,8 @@ def test_initialize_database_applies_session_metadata_migrations(
     assert "recorded_at" in columns
     assert "recorded_at_source" in columns
     assert "transcript_refresh_production_id" in columns
+    assert "auphonic_offsets_verified_production_id" in columns
+    assert "transcript_refreshed_from_sha256" in columns
 
 
 def test_initialize_database_creates_media_artifacts_table(tmp_path: Path) -> None:

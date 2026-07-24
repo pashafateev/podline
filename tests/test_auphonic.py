@@ -39,6 +39,7 @@ from podline.repository import (
     get_media_artifact,
     get_session,
     list_media_artifacts,
+    record_auphonic_offsets_verified,
     upsert_episode_metadata,
 )
 
@@ -540,6 +541,15 @@ def test_prepare_preview_then_start_splits_the_auphonic_flow(
     )
     assert prepared.status == "auphonic_prepared"
     assert client.started == []
+    record_auphonic_offsets_verified(
+        runtime_paths.db_file,
+        session_uid=prepared.session_uid,
+        status=prepared.status,
+        production_id=prepared.auphonic_production_id,
+        timestamp="now",
+    )
+    prepared = get_session(runtime_paths.db_file, prepared.session_uid)
+    assert prepared is not None
 
     preview = preview_prepared_session_with_auphonic(
         config=config,
@@ -581,6 +591,26 @@ def test_prepare_preview_then_start_splits_the_auphonic_flow(
     assert (workspace / "manifest.json").exists()
 
 
+def test_preview_requires_offsets_verified_for_current_production(
+    app_config_factory, runtime_factory, session_factory, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = session_factory(
+        runtime_paths.db_file,
+        status="auphonic_prepared",
+        auphonic_production_id="prod-current",
+    )
+
+    with pytest.raises(AuphonicError, match="verified for production prod-current"):
+        preview_prepared_session_with_auphonic(
+            config=config,
+            db_file=runtime_paths.db_file,
+            session=session,
+            client=FakeAuphonicClient(),
+        )
+
+
 def test_split_start_requires_preview_first(
     moto_s3,
     app_config_factory,
@@ -617,7 +647,7 @@ def test_split_start_requires_preview_first(
     assert reloaded.status == "auphonic_prepared"
 
 
-def test_process_session_with_auphonic_runs_end_to_end(
+def test_combined_auphonic_processing_cannot_skip_verification_gates(
     moto_s3,
     app_config_factory,
     runtime_factory,
@@ -632,19 +662,17 @@ def test_process_session_with_auphonic_runs_end_to_end(
     )
     client = FakeDoneAuphonicClient()
 
-    updated = process_session_with_auphonic(
-        config=config,
-        runtime_paths=runtime_paths,
-        db_file=runtime_paths.db_file,
-        session=session,
-        client=client,
-    )
+    with pytest.raises(AuphonicError, match="offset verification and preview"):
+        process_session_with_auphonic(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=session,
+            client=client,
+        )
 
-    assert updated.status == "waiting_for_finalize"
-    assert updated.auphonic_production_id == "prod-123"
-    assert client.started == ["prod-123"]
-    workspace = workspace_path_for(runtime_paths, session.session_uid)
-    assert workspace.exists()
+    assert get_session(runtime_paths.db_file, session.session_uid).status == "queued"
+    assert client.started == []
 
 
 def test_sync_without_tracks_output_clears_only_a_stale_optional_stem_set(
@@ -2030,6 +2058,40 @@ def test_session_offset_apply_updates_matched_track_id(
     assert client.offset_updates == [("prod-123", "Pasha", pytest.approx(1.801))]
     assert result.track_states[0]["id"] == "Pasha"
     assert result.track_states[0]["offset"] == pytest.approx(1.801)
+    updated = get_session(runtime_paths.db_file, session.session_uid)
+    assert updated is not None
+    assert updated.auphonic_offsets_verified_production_id == "prod-123"
+
+
+def test_session_offset_apply_does_not_checkpoint_unverified_remote_value(
+    app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _offset_session(
+        tmp_path, runtime_paths, session_factory, artifact_registrar
+    )
+    client = FakeOffsetAuphonicClient()
+
+    def ignore_update(production_id: str, track_id: str, offset: float):
+        client.offset_updates.append((production_id, track_id, offset))
+        return {"status_code": 200, "data": {"id": track_id, "offset": offset}}
+
+    client.update_multi_input_file_offset = ignore_update
+
+    with pytest.raises(AuphonicError, match="could not be verified"):
+        offset_session_auphonic_production(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=session,
+            apply=True,
+            client=client,
+        )
+
+    updated = get_session(runtime_paths.db_file, session.session_uid)
+    assert updated is not None
+    assert updated.auphonic_offsets_verified_production_id is None
 
 
 def test_session_offset_fails_when_production_is_not_change_allowed(
@@ -2219,6 +2281,15 @@ def test_reconcile_preserves_previewed_status(
         session=session,
         client=client,
     )
+    record_auphonic_offsets_verified(
+        runtime_paths.db_file,
+        session_uid=prepared.session_uid,
+        status=prepared.status,
+        production_id=prepared.auphonic_production_id,
+        timestamp="now",
+    )
+    prepared = get_session(runtime_paths.db_file, prepared.session_uid)
+    assert prepared is not None
     preview = preview_prepared_session_with_auphonic(
         config=config,
         db_file=runtime_paths.db_file,
@@ -2326,6 +2397,11 @@ def test_refresh_transcript_replaces_transcript_artifact(
     assert client.started == ["prod-refresh"]
     assert get_episode(runtime_paths.db_file, session.session_uid) is None
     assert updated.transcript_refresh_production_id is None
+    final_master = get_media_artifact(
+        runtime_paths.db_file, session.session_uid, kind="final_master"
+    )
+    assert final_master is not None
+    assert updated.transcript_refreshed_from_sha256 == final_master.sha256
 
 
 def test_refresh_transcript_requires_final_master_artifact(
