@@ -1,5 +1,7 @@
 from pathlib import Path
 import json
+import logging
+import zipfile
 
 import httpx
 import pytest
@@ -11,7 +13,10 @@ from podline.auphonic import (
     AuphonicOutputFile,
     AuphonicPreparedProduction,
     AuphonicProduction,
+    StemTrackBinding,
     _duration_from_ffprobe_packet_data,
+    _extract_output_files,
+    _extract_stem_archive,
     _is_done_status,
     _is_failed_status,
     inspect_production,
@@ -25,6 +30,7 @@ from podline.auphonic import (
     reset_session_auphonic_production,
     resolve_auphonic_service_id,
     resolve_preset_id,
+    resolve_stem_workspace_metadata,
     start_prepared_session_with_auphonic,
 )
 from podline.cozytrack.client import CozytrackSession, CozytrackTrack
@@ -32,6 +38,7 @@ from podline.repository import (
     get_episode,
     get_media_artifact,
     get_session,
+    list_media_artifacts,
     upsert_episode_metadata,
 )
 
@@ -141,6 +148,72 @@ class FakeDoneAuphonicClient(FakeAuphonicClient):
         return payload
 
 
+class FakeStemAuphonicClient(FakeDoneAuphonicClient):
+    def __init__(self, archive_entries=None) -> None:
+        super().__init__()
+        self.tracks = [
+            {
+                "id": "Jonathan",
+                "type": "multitrack",
+                "input_file": "sessions/session-auphonic-1/raw_track/a/Tr1.webm",
+                "offset": 0,
+            },
+            {
+                "id": "Pasha",
+                "type": "multitrack",
+                "input_file": "sessions/session-auphonic-1/raw_track/b/Tr2.webm",
+                "offset": 1.801,
+            },
+        ]
+        self.archive_entries = archive_entries or {
+            "Jonathan.flac": b"processed-jonathan",
+            "Pasha.flac": b"processed-pasha",
+        }
+
+    def get_production(self, production_id: str):
+        payload = super().get_production(production_id)
+        payload["data"]["output_files"].append(
+            {
+                "format": "tracks",
+                "download_url": "https://example.test/individual.flac.zip",
+                "ending": "flac.zip",
+            }
+        )
+        return payload
+
+    def wait_for_production(self, production_id: str) -> AuphonicProduction:
+        assert production_id == "prod-123"
+        return AuphonicProduction(
+            production_id=production_id,
+            output_files=[
+                AuphonicOutputFile(
+                    kind="mp3",
+                    download_url="https://example.test/master.mp3",
+                    extension="mp3",
+                ),
+                AuphonicOutputFile(
+                    kind="vtt",
+                    download_url="https://example.test/transcript.vtt",
+                    extension="vtt",
+                ),
+                AuphonicOutputFile(
+                    kind="tracks",
+                    download_url="https://example.test/individual.flac.zip",
+                    extension="flac.zip",
+                ),
+            ],
+        )
+
+    def download_file(self, url: str, destination: Path) -> None:
+        if url.endswith(".flac.zip"):
+            self.downloads.append((url, destination))
+            with zipfile.ZipFile(destination, "w") as archive:
+                for name, content in self.archive_entries.items():
+                    archive.writestr(name, content)
+            return
+        super().download_file(url, destination)
+
+
 class FakeOffsetAuphonicClient:
     def __init__(
         self,
@@ -241,15 +314,22 @@ class FakeResumableTranscriptRefreshClient(FakeTranscriptRefreshClient):
 
 
 def _queued_session_with_tracks(
-    tmp_path, runtime_paths, session_factory, artifact_registrar, *, status="queued"
+    tmp_path,
+    runtime_paths,
+    session_factory,
+    artifact_registrar,
+    *,
+    status="queued",
+    auphonic_production_id=None,
 ):
+    stored_production_id = auphonic_production_id
+    if stored_production_id is None and status != "queued":
+        stored_production_id = "prod-123"
     session = session_factory(
         runtime_paths.db_file,
         session_uid="session-auphonic-1",
         status=status,
-        auphonic_production_id=(
-            "prod-123" if status not in {"queued"} else None
-        ),
+        auphonic_production_id=stored_production_id,
     )
     tr1 = tmp_path / "Tr1.webm"
     tr1.write_bytes(b"track-one-bytes")
@@ -491,6 +571,9 @@ def test_prepare_preview_then_start_splits_the_auphonic_flow(
     )
     assert master is not None and master.source_id == "prod-123"
     assert transcript is not None and transcript.source_provider == "auphonic"
+    assert list_media_artifacts(
+        runtime_paths.db_file, session.session_uid, kind="pre_edit_stem"
+    ) == []
 
     workspace = workspace_path_for(runtime_paths, session.session_uid)
     assert (workspace / master.filename).exists()
@@ -564,6 +647,347 @@ def test_process_session_with_auphonic_runs_end_to_end(
     assert workspace.exists()
 
 
+def test_sync_without_tracks_output_clears_only_a_stale_optional_stem_set(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _queued_session_with_tracks(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        status="waiting_for_finalize",
+    )
+    stale_stem = tmp_path / "stale.flac"
+    stale_stem.write_bytes(b"stale-processed-track")
+    artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid=session.session_uid,
+        kind="pre_edit_stem",
+        role="host1",
+        path=stale_stem,
+        source_provider="auphonic",
+        source_id="older-production",
+    )
+    workspace = workspace_path_for(runtime_paths, session.session_uid)
+    stems_dir = workspace / "stems"
+    stems_dir.mkdir(parents=True)
+    (stems_dir / "stale.flac").write_bytes(b"materialized-stale-stem")
+    user_export = stems_dir / "manual-repair-export.flac"
+    user_export.write_bytes(b"user-created-flac")
+    (stems_dir / "notes.txt").write_text("keep me", encoding="utf-8")
+    (workspace / "repair-manifest.json").write_text(
+        json.dumps({"stems": [{"filename": "stale.flac"}]}),
+        encoding="utf-8",
+    )
+    project = workspace / "repair.cpr"
+    project.write_bytes(b"cubase-project")
+    raw_before = list_media_artifacts(
+        runtime_paths.db_file, session.session_uid, kind="raw_track"
+    )
+
+    reconcile_production_to_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        production_id="prod-123",
+        client=FakeDoneAuphonicClient(),
+    )
+
+    assert list_media_artifacts(
+        runtime_paths.db_file, session.session_uid, kind="pre_edit_stem"
+    ) == []
+    assert list_media_artifacts(
+        runtime_paths.db_file, session.session_uid, kind="raw_track"
+    ) == raw_before
+    assert not (stems_dir / "stale.flac").exists()
+    assert not (workspace / "repair-manifest.json").exists()
+    assert user_export.read_bytes() == b"user-created-flac"
+    assert (stems_dir / "notes.txt").read_text(encoding="utf-8") == "keep me"
+    assert project.read_bytes() == b"cubase-project"
+
+
+def test_sync_continues_when_optional_stem_archive_is_unmappable(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
+    caplog,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _queued_session_with_tracks(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        status="auphonic_started",
+        auphonic_production_id="older-production",
+    )
+    stale_stem = tmp_path / "stale.flac"
+    stale_stem.write_bytes(b"older-production-stem")
+    stale_record = artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid=session.session_uid,
+        kind="pre_edit_stem",
+        role="host1",
+        path=stale_stem,
+        source_provider="auphonic",
+        source_id="older-production",
+    )
+    workspace = workspace_path_for(runtime_paths, session.session_uid)
+    stems_dir = workspace / "stems"
+    stems_dir.mkdir(parents=True)
+    materialized_stale_stem = stems_dir / "stale.flac"
+    materialized_stale_stem.write_bytes(b"materialized-stale-stem")
+    user_export = stems_dir / "manual-repair-export.flac"
+    user_export.write_bytes(b"user-created-flac")
+    (workspace / "repair-manifest.json").write_text(
+        json.dumps(
+            {
+                "auphonic_production_id": "older-production",
+                "stems": [
+                    {
+                        "role": "host1",
+                        "filename": "stale.flac",
+                        "source_sha256": stale_record.sha256,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    client = FakeStemAuphonicClient(
+        archive_entries={"1.flac": b"one", "2.flac": b"two"}
+    )
+    caplog.set_level(logging.WARNING, logger="podline")
+
+    updated = reconcile_production_to_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        production_id="prod-123",
+        client=client,
+    )
+
+    assert updated.status == "waiting_for_finalize"
+    assert get_media_artifact(
+        runtime_paths.db_file, session.session_uid, kind="pre_edit_master"
+    )
+    assert get_media_artifact(
+        runtime_paths.db_file, session.session_uid, kind="transcript"
+    )
+    stems = list_media_artifacts(
+        runtime_paths.db_file, session.session_uid, kind="pre_edit_stem"
+    )
+    assert [(stem.source_id, stem.filename) for stem in stems] == [
+        ("older-production", "stale.flac")
+    ]
+    with pytest.raises(AuphonicError, match="newer Auphonic production"):
+        resolve_stem_workspace_metadata(
+            config=config,
+            db_file=runtime_paths.db_file,
+            session=updated,
+            client=client,
+        )
+    assert not materialized_stale_stem.exists()
+    assert not (workspace / "repair-manifest.json").exists()
+    assert user_export.read_bytes() == b"user-created-flac"
+    assert "Could not persist optional Auphonic stems" in caplog.text
+
+
+def test_start_continues_when_optional_stem_archive_is_unmappable(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
+    caplog,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _queued_session_with_tracks(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        status="auphonic_previewed",
+    )
+    client = FakeStemAuphonicClient(
+        archive_entries={"1.flac": b"one", "2.flac": b"two"}
+    )
+    caplog.set_level(logging.WARNING, logger="podline")
+
+    updated = start_prepared_session_with_auphonic(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        client=client,
+    )
+
+    assert updated.status == "waiting_for_finalize"
+    assert updated.failure_reason is None
+    assert get_media_artifact(
+        runtime_paths.db_file, session.session_uid, kind="pre_edit_master"
+    )
+    assert get_media_artifact(
+        runtime_paths.db_file, session.session_uid, kind="transcript"
+    )
+    assert "Could not persist optional Auphonic stems" in caplog.text
+
+
+def test_sync_invalidates_same_production_stems_when_refresh_fails(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _queued_session_with_tracks(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        status="auphonic_started",
+    )
+    stale_stem = tmp_path / "stale.flac"
+    stale_stem.write_bytes(b"same-production-stale-stem")
+    artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid=session.session_uid,
+        kind="pre_edit_stem",
+        role="host1",
+        path=stale_stem,
+        source_provider="auphonic",
+        source_id="prod-123",
+    )
+    workspace = workspace_path_for(runtime_paths, session.session_uid)
+    stems_dir = workspace / "stems"
+    stems_dir.mkdir(parents=True)
+    materialized_stem = stems_dir / "stale.flac"
+    materialized_stem.write_bytes(b"materialized-stale-stem")
+    (workspace / "repair-manifest.json").write_text(
+        json.dumps({"stems": [{"filename": "stale.flac"}]}),
+        encoding="utf-8",
+    )
+
+    updated = reconcile_production_to_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        production_id="prod-123",
+        client=FakeStemAuphonicClient(
+            archive_entries={"1.flac": b"one", "2.flac": b"two"}
+        ),
+    )
+
+    assert updated.status == "waiting_for_finalize"
+    assert list_media_artifacts(
+        runtime_paths.db_file, session.session_uid, kind="pre_edit_stem"
+    ) == []
+    assert not materialized_stem.exists()
+    assert not (workspace / "repair-manifest.json").exists()
+
+
+def test_successful_stem_refresh_invalidates_older_managed_workspace(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _queued_session_with_tracks(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        status="waiting_for_finalize",
+    )
+    old_stem = tmp_path / "old-stem.flac"
+    old_stem.write_bytes(b"older-production-stem")
+    artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid=session.session_uid,
+        kind="pre_edit_stem",
+        role="host1",
+        path=old_stem,
+        source_provider="auphonic",
+        source_id="older-production",
+    )
+    workspace = workspace_path_for(runtime_paths, session.session_uid)
+    stems_dir = workspace / "stems"
+    stems_dir.mkdir(parents=True)
+    materialized_old_stem = stems_dir / "old-stem.flac"
+    materialized_old_stem.write_bytes(b"materialized-old-stem")
+    user_export = stems_dir / "manual-repair-export.flac"
+    user_export.write_bytes(b"user-created-flac")
+    (workspace / "repair-manifest.json").write_text(
+        json.dumps(
+            {
+                "auphonic_production_id": "older-production",
+                "stems": [
+                    {
+                        "role": "host1",
+                        "filename": "old-stem.flac",
+                        "source_sha256": "old-source",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "podline.auphonic.probe_audio_duration_from_packets",
+        lambda path: 10.0 if path.name == "Jonathan.flac" else 8.199,
+    )
+
+    updated = reconcile_production_to_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        production_id="prod-123",
+        client=FakeStemAuphonicClient(),
+    )
+
+    assert updated.status == "waiting_for_finalize"
+    assert {
+        (stem.role, stem.source_id)
+        for stem in list_media_artifacts(
+            runtime_paths.db_file,
+            session.session_uid,
+            kind="pre_edit_stem",
+        )
+    } == {("host1", "prod-123"), ("host2", "prod-123")}
+    assert not materialized_old_stem.exists()
+    assert not (workspace / "repair-manifest.json").exists()
+    assert user_export.read_bytes() == b"user-created-flac"
+
+
 def test_inspect_production_returns_verification_details(
     app_config_factory, tmp_path
 ) -> None:
@@ -592,6 +1016,237 @@ def test_duration_from_ffprobe_packet_json_uses_last_packet() -> None:
     )
 
     assert duration == pytest.approx(12.323)
+
+
+def test_extract_output_files_recognizes_individual_flac_tracks() -> None:
+    outputs = _extract_output_files(
+        {
+            "output_files": [
+                {
+                    "format": "tracks",
+                    "ending": "flac.zip",
+                    "download_url": "https://example.test/result.flac.zip",
+                }
+            ]
+        }
+    )
+
+    assert outputs == [
+        AuphonicOutputFile(
+            kind="tracks",
+            extension="flac.zip",
+            download_url="https://example.test/result.flac.zip",
+        )
+    ]
+
+
+def test_extract_stem_archive_maps_exact_production_roles(tmp_path: Path) -> None:
+    archive_path = tmp_path / "tracks.flac.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("Jonathan.flac", b"jonathan")
+        archive.writestr("Pasha.flac", b"pasha")
+
+    extracted = _extract_stem_archive(
+        archive_path=archive_path,
+        destination_dir=tmp_path / "extracted",
+        bindings=[
+            StemTrackBinding(
+                role="host1",
+                track_id="Jonathan",
+                input_filename="Tr1.webm",
+                offset_seconds=0,
+            ),
+            StemTrackBinding(
+                role="host2",
+                track_id="Pasha",
+                input_filename="Tr2.webm",
+                offset_seconds=1.801,
+            ),
+        ],
+    )
+
+    assert [(item.role, item.path.name) for item in extracted] == [
+        ("host1", "Jonathan.flac"),
+        ("host2", "Pasha.flac"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("entries", "message"),
+    [
+        ({"Jonathan.flac": b"one"}, "missing"),
+        (
+            {
+                "Jonathan.flac": b"one",
+                "Pasha.flac": b"two",
+                "Guest.flac": b"three",
+            },
+            "extra",
+        ),
+        (
+            {
+                "Jonathan.flac": b"one",
+                "Pasha.flac": b"two",
+                "notes.txt": b"not audio",
+            },
+            "non-FLAC",
+        ),
+        ({"../Jonathan.flac": b"one", "Pasha.flac": b"two"}, "unsafe"),
+    ],
+)
+def test_extract_stem_archive_rejects_incomplete_extra_and_unsafe_entries(
+    tmp_path: Path, entries, message: str
+) -> None:
+    archive_path = tmp_path / "tracks.flac.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        for name, content in entries.items():
+            archive.writestr(name, content)
+
+    bindings = [
+        StemTrackBinding("host1", "Jonathan", "Tr1.webm", 0),
+        StemTrackBinding("host2", "Pasha", "Tr2.webm", 1.801),
+    ]
+    with pytest.raises(AuphonicError, match=message):
+        _extract_stem_archive(
+            archive_path=archive_path,
+            destination_dir=tmp_path / "extracted",
+            bindings=bindings,
+        )
+
+
+def test_extract_stem_archive_rejects_duplicate_names(tmp_path: Path) -> None:
+    archive_path = tmp_path / "tracks.flac.zip"
+    with pytest.warns(UserWarning, match="Duplicate name"):
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("Jonathan.flac", b"one")
+            archive.writestr("Jonathan.flac", b"duplicate")
+            archive.writestr("Pasha.flac", b"two")
+
+    with pytest.raises(AuphonicError, match="duplicate"):
+        _extract_stem_archive(
+            archive_path=archive_path,
+            destination_dir=tmp_path / "extracted",
+            bindings=[
+                StemTrackBinding("host1", "Jonathan", "Tr1.webm", 0),
+                StemTrackBinding("host2", "Pasha", "Tr2.webm", 1.801),
+            ],
+        )
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "limit", "entries", "message"),
+    [
+        (
+            "_MAX_STEM_ENTRY_BYTES",
+            3,
+            {"Jonathan.flac": b"four", "Pasha.flac": b"two"},
+            "entry exceeds",
+        ),
+        (
+            "_MAX_STEM_TOTAL_BYTES",
+            5,
+            {"Jonathan.flac": b"one", "Pasha.flac": b"two"},
+            "total expanded size",
+        ),
+    ],
+)
+def test_extract_stem_archive_rejects_expanded_size_limits_before_extraction(
+    tmp_path: Path,
+    monkeypatch,
+    limit_name,
+    limit,
+    entries,
+    message,
+) -> None:
+    archive_path = tmp_path / "tracks.flac.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        for name, content in entries.items():
+            archive.writestr(name, content)
+    monkeypatch.setattr(
+        f"podline.auphonic.{limit_name}", limit, raising=False
+    )
+    destination = tmp_path / "extracted"
+
+    with pytest.raises(AuphonicError, match=message):
+        _extract_stem_archive(
+            archive_path=archive_path,
+            destination_dir=destination,
+            bindings=[
+                StemTrackBinding("host1", "Jonathan", "Tr1.webm", 0),
+                StemTrackBinding("host2", "Pasha", "Tr2.webm", 1.801),
+            ],
+        )
+
+    assert not destination.exists()
+
+
+def test_extract_stem_archive_rejects_compression_bomb_before_extraction(
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "tracks.flac.zip"
+    with zipfile.ZipFile(
+        archive_path, "w", compression=zipfile.ZIP_DEFLATED
+    ) as archive:
+        archive.writestr("Jonathan.flac", b"\0" * (1024 * 1024))
+    destination = tmp_path / "extracted"
+
+    with pytest.raises(AuphonicError, match="compression ratio"):
+        _extract_stem_archive(
+            archive_path=archive_path,
+            destination_dir=destination,
+            bindings=[StemTrackBinding("host1", "Jonathan", "Tr1.webm", 0)],
+        )
+
+    assert not destination.exists()
+
+
+def test_reconcile_persists_role_complete_stems_idempotently_without_touching_raw(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _queued_session_with_tracks(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        status="waiting_for_finalize",
+    )
+    raw_before = list_media_artifacts(
+        runtime_paths.db_file, session.session_uid, kind="raw_track"
+    )
+    client = FakeStemAuphonicClient()
+    monkeypatch.setattr(
+        "podline.auphonic.probe_audio_duration_from_packets",
+        lambda path: 10.0 if path.name == "Jonathan.flac" else 8.199,
+    )
+
+    for _ in range(2):
+        session = reconcile_production_to_session(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=session,
+            production_id="prod-123",
+            client=client,
+        )
+
+    stems = list_media_artifacts(
+        runtime_paths.db_file, session.session_uid, kind="pre_edit_stem"
+    )
+    assert [(stem.role, stem.filename, stem.source_id) for stem in stems] == [
+        ("host1", "Jonathan.flac", "prod-123"),
+        ("host2", "Pasha.flac", "prod-123"),
+    ]
+    assert list_media_artifacts(
+        runtime_paths.db_file, session.session_uid, kind="raw_track"
+    ) == raw_before
 
 
 def test_auphonic_client_updates_multi_input_file_offset(

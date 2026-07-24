@@ -8,8 +8,9 @@ and the OpenAI API are faked; S3 is moto; everything else is real.
 
 from pathlib import Path
 from types import SimpleNamespace
+import zipfile
 
-from podline.artifacts import workspace_path_for
+from podline.artifacts import create_workspace, workspace_path_for
 from podline.auphonic import (
     AuphonicOutputFile,
     AuphonicPreparedProduction,
@@ -18,6 +19,7 @@ from podline.auphonic import (
     prepare_session_with_auphonic,
     preview_prepared_session_with_auphonic,
     refresh_transcript_with_auphonic,
+    resolve_stem_workspace_metadata,
     start_prepared_session_with_auphonic,
 )
 from podline.episode_meta import EpisodeMetadataDraft, generate_episode_metadata
@@ -92,12 +94,21 @@ class WorkflowAuphonicClient:
                     download_url="https://example.test/transcript.vtt",
                     extension="vtt",
                 ),
+                AuphonicOutputFile(
+                    kind="tracks",
+                    download_url="https://example.test/individual.flac.zip",
+                    extension="flac.zip",
+                ),
             ],
         )
 
     def download_file(self, url, destination):
         if url.endswith(".mp3"):
             destination.write_bytes(b"auphonic-pre-edit-master")
+        elif url.endswith(".flac.zip"):
+            with zipfile.ZipFile(destination, "w") as archive:
+                archive.writestr("Jonathan.flac", b"processed-jonathan")
+                archive.writestr("Pasha.flac", b"processed-pasha")
         elif url.endswith("refreshed.vtt"):
             destination.write_text(
                 "WEBVTT\n\n00:00.000 --> 00:01.000\nFinal cut transcript\n",
@@ -123,7 +134,23 @@ class WorkflowAuphonicClient:
                 "status_page": f"https://example.test/status/{production_id}",
                 "warning_message": "",
                 "multi_input_files": [dict(track) for track in self.tracks],
-                "output_files": [],
+                "output_files": [
+                    {
+                        "format": "mp3",
+                        "ending": "mp3",
+                        "download_url": "https://example.test/master.mp3",
+                    },
+                    {
+                        "format": "subtitle",
+                        "ending": "vtt",
+                        "download_url": "https://example.test/transcript.vtt",
+                    },
+                    {
+                        "format": "tracks",
+                        "ending": "flac.zip",
+                        "download_url": "https://example.test/individual.flac.zip",
+                    },
+                ],
             },
         }
 
@@ -190,6 +217,7 @@ def test_full_s3_pipeline_without_any_drive_paths(
     moto_s3,
     app_config_factory,
     runtime_factory,
+    monkeypatch,
     tmp_path: Path,
 ) -> None:
     config = app_config_factory(tmp_path, podbean_enabled=True)
@@ -212,6 +240,16 @@ def test_full_s3_pipeline_without_any_drive_paths(
     assert created is True
 
     client = WorkflowAuphonicClient()
+    monkeypatch.setattr(
+        "podline.auphonic.probe_audio_duration_from_packets",
+        lambda path: 101.5 if path.name == "Jonathan.flac" else 99.699,
+    )
+    monkeypatch.setattr(
+        "podline.artifacts._materialize_aligned_stem",
+        lambda source, destination, **_kwargs: destination.write_bytes(
+            b"aligned:" + source.read_bytes()
+        ),
+    )
 
     # 2. Prepare: attach S3 keys through the registered service.
     prepared = prepare_session_with_auphonic(
@@ -250,6 +288,23 @@ def test_full_s3_pipeline_without_any_drive_paths(
     workspace = workspace_path_for(runtime_paths, session.session_uid)
     pre_edit_name = f"{session.session_uid}_pre_edit.mp3"
     assert (workspace / pre_edit_name).read_bytes() == b"auphonic-pre-edit-master"
+
+    # The optional repair branch materializes aligned, processed stems while
+    # leaving the normal master/transcript workspace and workflow state intact.
+    stem_metadata = resolve_stem_workspace_metadata(
+        config=config, db_file=db_file, session=started, client=client
+    )
+    workspace = create_workspace(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=db_file,
+        session_uid=session.session_uid,
+        include_stems=True,
+        stem_metadata=stem_metadata,
+    )
+    assert (workspace / "stems" / "Jonathan.flac").exists()
+    assert (workspace / "stems" / "Pasha.flac").exists()
+    assert (workspace / "repair-manifest.json").exists()
 
     # 5. Finalize with a master exported into the workspace.
     exported_master = workspace / "sexdrunks_ep99_master.wav"
@@ -307,4 +362,10 @@ def test_full_s3_pipeline_without_any_drive_paths(
     final = get_session(db_file, session.session_uid)
     assert final.status == "draft_created"
     kinds = {a.kind for a in list_media_artifacts(db_file, session.session_uid)}
-    assert kinds == {"raw_track", "pre_edit_master", "transcript", "final_master"}
+    assert kinds == {
+        "raw_track",
+        "pre_edit_master",
+        "pre_edit_stem",
+        "transcript",
+        "final_master",
+    }

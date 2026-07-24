@@ -25,6 +25,7 @@ from podline.auphonic import (
     reconcile_production_to_session,
     refresh_transcript_with_auphonic,
     reset_session_auphonic_production,
+    resolve_stem_workspace_metadata,
     start_prepared_session_with_auphonic,
 )
 from podline.config import load_config
@@ -732,12 +733,17 @@ def import_command(
 @app.command()
 def workspace(
     session_uid: str,
+    stems: bool = typer.Option(
+        False,
+        "--stems",
+        help="Include Auphonic-processed individual FLAC tracks for repair editing.",
+    ),
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
         None, "--config", help="Path to config.yaml."
     ),
 ) -> None:
-    """Materialize the pre-edit master and transcript into a persistent editing folder."""
+    """Materialize a persistent editing folder, optionally with repair stems."""
     config_path = _resolve_config_path(config)
     loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
     session = _resolve_session_arg(runtime_paths, session_uid)
@@ -748,13 +754,24 @@ def workspace(
         raise typer.Exit(code=1)
 
     try:
+        stem_metadata = (
+            resolve_stem_workspace_metadata(
+                config=loaded_config,
+                db_file=runtime_paths.db_file,
+                session=session,
+            )
+            if stems
+            else None
+        )
         workspace_dir = create_workspace(
             config=loaded_config,
             runtime_paths=runtime_paths,
             db_file=runtime_paths.db_file,
             session_uid=session.session_uid,
+            include_stems=stems,
+            stem_metadata=stem_metadata,
         )
-    except ArtifactError as exc:
+    except (ArtifactError, AuphonicError) as exc:
         logger.error("Workspace creation failed for %s: %s", session.session_uid, exc)
         typer.echo(f"Workspace error: {exc}")
         raise typer.Exit(code=1)
@@ -768,8 +785,21 @@ def workspace(
             ("session_uid", session.session_uid),
             ("workspace", str(workspace_dir)),
             ("contents", ", ".join(contents) or "empty"),
+            (
+                "stems",
+                str(len(list((workspace_dir / "stems").glob("*.flac"))))
+                if stems
+                else "not requested",
+            ),
         ]
     )
+    if stems:
+        typer.secho(
+            "⚠ Auphonic individual tracks are not loudness-normalized. "
+            "Run a final loudness check on the Cubase master.",
+            fg=typer.colors.YELLOW,
+            bold=True,
+        )
 
 
 @app.command("finalize")
@@ -924,7 +954,7 @@ def transcript_refresh_command(
             preset_id=preset_id,
             logger=logger,
         )
-    except AuphonicError as exc:
+    except (AuphonicError, ArtifactError) as exc:
         logger.error("Transcript refresh failed for %s: %s", session.session_uid, exc)
         typer.echo(f"Auphonic error: {exc}")
         raise typer.Exit(code=1)
@@ -1013,7 +1043,7 @@ def auphonic_command(
             session=session,
             logger=logger,
         )
-    except AuphonicError as exc:
+    except (AuphonicError, ArtifactError) as exc:
         logger.error("Auphonic processing failed for %s: %s", session_uid, exc)
         typer.echo(f"Auphonic error: {exc}")
         raise typer.Exit(code=1)
@@ -1056,7 +1086,7 @@ def auphonic_prepare_command(
             session=session,
             logger=logger,
         )
-    except AuphonicError as exc:
+    except (AuphonicError, ArtifactError) as exc:
         logger.error("Auphonic prepare failed for %s: %s", session_uid, exc)
         typer.echo(f"Auphonic error: {exc}")
         raise typer.Exit(code=1)
@@ -1224,7 +1254,7 @@ def auphonic_start_command(
             session=session,
             logger=logger,
         )
-    except AuphonicError as exc:
+    except (AuphonicError, ArtifactError) as exc:
         logger.error("Auphonic start failed for %s: %s", session_uid, exc)
         typer.echo(f"Auphonic error: {exc}")
         raise typer.Exit(code=1)
@@ -1570,7 +1600,7 @@ def auphonic_sync_command(
             production_id=resolved_production_id,
             logger=logger,
         )
-    except AuphonicError as exc:
+    except (AuphonicError, ArtifactError) as exc:
         logger.error("Auphonic sync failed for %s: %s", session_uid, exc)
         typer.echo(f"Auphonic error: {exc}")
         raise typer.Exit(code=1)
@@ -1583,5 +1613,19 @@ def auphonic_sync_command(
             ("auphonic_production_id", updated.auphonic_production_id or "none"),
             ("pre_edit_master", _artifact_uri(runtime_paths, updated.session_uid, "pre_edit_master")),
             ("transcript", _artifact_uri(runtime_paths, updated.session_uid, "transcript")),
+            (
+                "pre_edit_stems",
+                str(
+                    len(
+                        [
+                            artifact
+                            for artifact in list_media_artifacts(
+                                runtime_paths.db_file, updated.session_uid
+                            )
+                            if artifact.kind == "pre_edit_stem"
+                        ]
+                    )
+                ),
+            ),
         ]
     )

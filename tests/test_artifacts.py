@@ -1,4 +1,7 @@
 from pathlib import Path
+import json
+import shutil
+import subprocess
 
 import boto3
 import pytest
@@ -6,11 +9,14 @@ from moto import mock_aws
 
 from podline.artifacts import (
     ArtifactError,
+    _materialize_aligned_stem,
     cache_path_for,
     cache_usage_bytes,
     clear_cache,
+    create_workspace,
     materialize_artifact,
     store_artifact_file,
+    store_artifact_files,
 )
 from podline.config import (
     AppConfig,
@@ -25,7 +31,8 @@ from podline.config import (
 from podline.db import initialize_database
 from podline.models import ArtifactKind, RuntimePaths
 from podline.repository import get_media_artifact, list_media_artifacts
-from podline.storage import parse_s3_uri
+from podline.storage import StorageError, parse_s3_uri
+from podline.storage import sha256_of_file
 
 BUCKET = "test-podline-media"
 
@@ -527,3 +534,332 @@ def test_create_workspace_refreshes_replaced_transcript(
     ).read_bytes() == b"WEBVTT\n\nrefreshed after transcript-refresh\n"
     manifest = json.loads((workspace / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["artifacts"]["transcript"]["sha256"] == sha256_of_file(refreshed)
+
+
+def test_create_stem_workspace_aligns_when_offsets_improve_sync_and_preserves_user_files(
+    app_config_factory,
+    runtime_factory,
+    artifact_registrar,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session_uid = "s-repair"
+    sources = {
+        "pre_edit_master": ("", "pre.mp3", b"master", None),
+        "transcript": ("", "episode.vtt", b"WEBVTT\n", None),
+        "pre_edit_stem:host1": ("host1", "Jonathan.flac", b"jonathan", 10.0),
+        "pre_edit_stem:host2": ("host2", "Pasha.flac", b"pasha", 8.2),
+    }
+    for label, (role, filename, content, duration) in sources.items():
+        path = tmp_path / "source" / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        artifact_registrar(
+            runtime_paths.db_file,
+            runtime_paths,
+            session_uid=session_uid,
+            kind=label.split(":", 1)[0],
+            role=role,
+            path=path,
+            duration_seconds=duration,
+            source_provider="auphonic",
+            source_id="prod-123",
+        )
+
+    workspace = Path(runtime_paths.workspaces_dir) / session_uid
+    workspace.mkdir(parents=True)
+    project = workspace / "repair.cpr"
+    project.write_bytes(b"cubase-project")
+    export = workspace / "manual-master.wav"
+    export.write_bytes(b"manual-export")
+    calls = []
+
+    def fake_align(source, destination, *, offset_seconds, target_duration_seconds):
+        calls.append((source.name, offset_seconds, target_duration_seconds))
+        destination.write_bytes(b"aligned:" + source.read_bytes())
+
+    monkeypatch.setattr("podline.artifacts._materialize_aligned_stem", fake_align)
+    metadata = {
+        "host1": {"track_id": "Jonathan", "offset_seconds": 0.0},
+        "host2": {"track_id": "Pasha", "offset_seconds": 1.8},
+    }
+
+    created = create_workspace(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session_uid=session_uid,
+        include_stems=True,
+        stem_metadata=metadata,
+    )
+    create_workspace(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session_uid=session_uid,
+        include_stems=True,
+        stem_metadata=metadata,
+    )
+    assert len(calls) == 2
+
+    metadata["host1"]["offset_seconds"] = 1.0
+    create_workspace(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session_uid=session_uid,
+        include_stems=True,
+        stem_metadata=metadata,
+    )
+
+    assert created == workspace
+    assert project.read_bytes() == b"cubase-project"
+    assert export.read_bytes() == b"manual-export"
+    assert (workspace / "stems" / "Jonathan.flac").exists()
+    assert (workspace / "stems" / "Pasha.flac").exists()
+    assert calls[0] == ("Jonathan.flac", 0.0, pytest.approx(10.0))
+    assert calls[1] == ("Pasha.flac", 1.8, pytest.approx(10.0))
+    assert calls[2] == ("Jonathan.flac", 1.0, pytest.approx(11.0))
+    assert calls[3] == ("Pasha.flac", 1.8, pytest.approx(11.0))
+
+    repair_manifest = json.loads(
+        (workspace / "repair-manifest.json").read_text(encoding="utf-8")
+    )
+    assert repair_manifest["auphonic_production_id"] == "prod-123"
+    assert repair_manifest["loudness_normalized"] is False
+    assert repair_manifest["final_loudness_check_required"] is True
+    assert repair_manifest["offsets_rendered_by_auphonic"] is False
+    assert repair_manifest["target_duration_seconds"] == pytest.approx(11.0)
+    assert [stem["role"] for stem in repair_manifest["stems"]] == ["host1", "host2"]
+    assert repair_manifest["stems"][1]["podline_offset_applied_seconds"] == 1.8
+    assert repair_manifest["stems"][1]["sha256"] == sha256_of_file(
+        workspace / "stems" / "Pasha.flac"
+    )
+
+
+def test_create_stem_workspace_does_not_double_apply_offsets_already_rendered(
+    app_config_factory,
+    runtime_factory,
+    artifact_registrar,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    for kind, role, filename, duration in (
+        ("pre_edit_master", "", "pre.mp3", None),
+        ("transcript", "", "episode.vtt", None),
+        ("pre_edit_stem", "host1", "Jonathan.flac", 10.0),
+        ("pre_edit_stem", "host2", "Pasha.flac", 10.0),
+    ):
+        path = tmp_path / filename
+        path.write_bytes(filename.encode())
+        artifact_registrar(
+            runtime_paths.db_file,
+            runtime_paths,
+            session_uid="s-baked",
+            kind=kind,
+            role=role,
+            path=path,
+            duration_seconds=duration,
+            source_provider="auphonic",
+            source_id="prod-123",
+        )
+    monkeypatch.setattr(
+        "podline.artifacts._materialize_aligned_stem",
+        lambda *_args, **_kwargs: pytest.fail("must not double-apply offsets"),
+    )
+
+    workspace = create_workspace(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session_uid="s-baked",
+        include_stems=True,
+        stem_metadata={
+            "host1": {"track_id": "Jonathan", "offset_seconds": 0.0},
+            "host2": {"track_id": "Pasha", "offset_seconds": 1.8},
+        },
+    )
+
+    manifest = json.loads(
+        (workspace / "repair-manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["offsets_rendered_by_auphonic"] is True
+    assert all(stem["podline_offset_applied_seconds"] == 0 for stem in manifest["stems"])
+
+
+@pytest.mark.parametrize(
+    ("durations", "offsets"),
+    [
+        ((10.0, 10.0), (0.0, 0.0)),
+        ((10.0, 9.98), (0.0, 0.03)),
+    ],
+)
+def test_stem_manifest_does_not_claim_auphonic_rendered_ambiguous_offsets(
+    app_config_factory,
+    runtime_factory,
+    artifact_registrar,
+    tmp_path: Path,
+    monkeypatch,
+    durations,
+    offsets,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    for kind, role, filename, duration in (
+        ("pre_edit_master", "", "pre.mp3", None),
+        ("transcript", "", "episode.vtt", None),
+        ("pre_edit_stem", "host1", "Jonathan.flac", durations[0]),
+        ("pre_edit_stem", "host2", "Pasha.flac", durations[1]),
+    ):
+        path = tmp_path / filename
+        path.write_bytes(filename.encode())
+        artifact_registrar(
+            runtime_paths.db_file,
+            runtime_paths,
+            session_uid="s-ambiguous",
+            kind=kind,
+            role=role,
+            path=path,
+            duration_seconds=duration,
+            source_provider="auphonic",
+            source_id="prod-123",
+        )
+    monkeypatch.setattr(
+        "podline.artifacts._materialize_aligned_stem",
+        lambda *_args, **_kwargs: pytest.fail("ambiguous offsets must not be applied"),
+    )
+
+    workspace = create_workspace(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session_uid="s-ambiguous",
+        include_stems=True,
+        stem_metadata={
+            "host1": {"track_id": "Jonathan", "offset_seconds": offsets[0]},
+            "host2": {"track_id": "Pasha", "offset_seconds": offsets[1]},
+        },
+    )
+
+    manifest = json.loads(
+        (workspace / "repair-manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["offsets_rendered_by_auphonic"] is False
+
+
+def test_store_artifact_files_keeps_previous_set_when_an_upload_fails(
+    app_config_factory,
+    runtime_factory,
+    artifact_registrar,
+    tmp_path: Path,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    for role, filename in (("host1", "old-one.flac"), ("host2", "old-two.flac")):
+        path = tmp_path / "old" / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(role.encode())
+        artifact_registrar(
+            runtime_paths.db_file,
+            runtime_paths,
+            session_uid="s-atomic",
+            kind="pre_edit_stem",
+            role=role,
+            path=path,
+        )
+    before = list_media_artifacts(
+        runtime_paths.db_file, "s-atomic", kind="pre_edit_stem"
+    )
+
+    class FailingStorage:
+        def __init__(self):
+            self.uploads = 0
+
+        def key_for(self, **kwargs):
+            return "/".join(
+                [kwargs["session_uid"], kwargs["kind"], kwargs["filename"]]
+            )
+
+        def upload_file(self, *, local_path, key, content_type, sha256):
+            self.uploads += 1
+            if self.uploads == 2:
+                raise StorageError("second upload failed")
+            return f"s3://test-podline-media/{key}"
+
+    replacements = []
+    for role, filename in (("host1", "new-one.flac"), ("host2", "new-two.flac")):
+        path = tmp_path / "new" / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes((role + "-new").encode())
+        replacements.append({"role": role, "source_path": path})
+
+    with pytest.raises(ArtifactError, match="second upload failed"):
+        store_artifact_files(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session_uid="s-atomic",
+            kind="pre_edit_stem",
+            files=replacements,
+            expected_roles=["host1", "host2"],
+            storage=FailingStorage(),
+        )
+
+    assert list_media_artifacts(
+        runtime_paths.db_file, "s-atomic", kind="pre_edit_stem"
+    ) == before
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="ffmpeg and ffprobe are required for the real alignment check",
+)
+def test_materialize_aligned_stem_pads_to_the_shared_timeline(tmp_path: Path) -> None:
+    source = tmp_path / "source.flac"
+    output = tmp_path / "aligned.flac"
+    subprocess.run(
+        [
+            shutil.which("ffmpeg"),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=48000:cl=mono",
+            "-t",
+            "0.2",
+            "-c:a",
+            "flac",
+            str(source),
+        ],
+        check=True,
+    )
+
+    _materialize_aligned_stem(
+        source,
+        output,
+        offset_seconds=0.1,
+        target_duration_seconds=0.3,
+    )
+
+    probe = subprocess.run(
+        [
+            shutil.which("ffprobe"),
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(output),
+        ],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    assert float(probe.stdout.strip()) == pytest.approx(0.3, abs=0.01)
