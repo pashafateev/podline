@@ -380,6 +380,13 @@ def test_auphonic_preview_accepts_selector_index_without_opening_browser(
                 "2024",
             ),
         )
+        connection.execute(
+            """
+            UPDATE sessions
+            SET auphonic_offsets_verified_production_id = auphonic_production_id
+            WHERE session_uid = 'session-1'
+            """
+        )
         connection.commit()
 
     browser_calls = []
@@ -447,7 +454,7 @@ def test_auphonic_offset_command_prints_dry_run_plan(
                 "session-1",
                 "/tmp/source1",
                 "fingerprint-1",
-                "queued",
+                "auphonic_prepared",
                 "prod-111",
                 "2024",
                 "2024",
@@ -459,7 +466,7 @@ def test_auphonic_offset_command_prints_dry_run_plan(
                 "session-2",
                 "/tmp/source2",
                 "fingerprint-2",
-                "queued",
+                "auphonic_prepared",
                 "prod-222",
                 "2025",
                 "2025",

@@ -84,6 +84,25 @@ Notes on ingest:
 - Cozytrack downloads land in a disposable staging folder that is removed after registration; re-running `pod ct-ingest <id>` is a no-op, and re-importing an identical folder is detected by content fingerprint.
 - WebM/Opus stems are passed through to Auphonic as-is via the S3 service reference.
 
+Next-action output
+
+Every successful workflow transition ends with the same state-derived guidance
+that appears at the bottom of `pod status <session>`. The section is one of:
+
+- `Next` — a safe command that can run now.
+- `Waiting on you` — a human verification or Cubase-editing gate, followed by
+  the command to run when it is complete.
+- `Recovery` — an interrupted or failed operation that must be reconciled or
+  repaired before advancing.
+- `Complete` — the Podbean draft exists; verify its audio, transcript, metadata,
+  and release settings before publishing.
+
+Generated commands always contain the exact session UID, even when the input was
+an index such as `@1`, so a later queue reorder cannot retarget a copied command.
+The guidance is derived from SQLite checkpoints and current artifacts rather than
+the previous terminal output, so `pod status <session_uid>` restores the safe
+direction for every persisted transition after a restart.
+
 2. Prepare the Auphonic production without starting it
 ```bash
 pod auphonic-prepare @1 --debug   # creates the production and attaches S3 tracks
@@ -94,6 +113,14 @@ pod auphonic-inspect --session @1
 ```
 
 Run `pod auphonic-offset` before preview/start. Durations come from audio packet timing recorded at ingest. Cozytrack starts each track's recorder sequentially and stops them all together, so a track's start offset equals its duration shortfall against the reference (the longest track). Every shorter track is offset — remote tracks and additional host-local channels alike; for sessions with more than 2 tracks, stable participant identity validates that all registered tracks belong to a topology containing both host-local and remote channels. The longest validated track is the reference even when a remote recorder started first. For those sessions, duration-derived offsets must also agree with Cozytrack recorder creation times within 0.5 seconds, preventing a delayed stop from being mistaken for an early start. Two-track sessions remain duration-derived even when Cozytrack topology is available. Tracks already equal to the reference are reported as aligned and skipped. The command updates the prepared production and does not start processing.
+
+The dry run ends with `Waiting on you` and the exact `--apply` command. After
+`--apply`, Podline reinspects every Auphonic track and records the production ID
+only if all applied and zero-offset values match the plan. Preview refuses to
+advance unless that checkpoint matches the current production. Resetting with
+`pod auphonic-reset` clears it along with the abandoned production. The old
+combined `pod auphonic` shortcut is intentionally rejected because it cannot
+preserve the offset-verification and preview gates.
 
 3. Start Auphonic after previewing the edit page
 ```bash
@@ -156,7 +183,10 @@ pod transcript-refresh @1
 Notes:
 - This creates a single-track Auphonic production reading the final master from S3, downloads the new WebVTT file, and stores it as the session's current transcript artifact (the previous object stays in the bucket as history).
 - If polling or downloading is interrupted after Auphonic starts, re-running the command resumes the stored refresh production instead of creating a duplicate.
-- A successful refresh invalidates previously generated episode metadata, so run `pod episode-meta @1` again before creating the Podbean draft.
+- A successful refresh records the final-master SHA-256 used to create the new
+  transcript and invalidates previously generated episode metadata. Guidance
+  advances to `pod episode-meta` only while that checksum still matches the
+  current final-master artifact.
 
 6. Generate episode metadata with the OpenAI API
 ```bash

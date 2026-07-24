@@ -123,7 +123,9 @@ def session_factory():
         status: str = "queued",
         source_basename: str = "010124_013143",
         auphonic_production_id=None,
+        auphonic_offsets_verified_production_id=None,
         transcript_refresh_production_id=None,
+        transcript_refreshed_from_sha256=None,
         cozytrack_session_id=None,
     ):
         with connect(db_file) as connection:
@@ -132,9 +134,11 @@ def session_factory():
                 INSERT INTO sessions (
                     session_uid, source_basename, source_path, fingerprint,
                     status, auphonic_production_id,
-                    transcript_refresh_production_id, cozytrack_session_id,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    auphonic_offsets_verified_production_id,
+                    transcript_refresh_production_id,
+                    transcript_refreshed_from_sha256,
+                    cozytrack_session_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_uid,
@@ -143,7 +147,9 @@ def session_factory():
                     f"fingerprint-{session_uid}",
                     status,
                     auphonic_production_id,
+                    auphonic_offsets_verified_production_id,
                     transcript_refresh_production_id,
+                    transcript_refreshed_from_sha256,
                     cozytrack_session_id,
                     "now",
                     "now",

@@ -44,6 +44,7 @@ from podline.repository import (
     get_media_artifact,
     get_session,
     list_media_artifacts,
+    record_auphonic_offsets_verified,
     record_transcript_refresh_production,
     reset_session_to_queued,
     update_media_artifact_duration,
@@ -424,21 +425,9 @@ def process_session_with_auphonic(
     client: Optional[AuphonicClientProtocol] = None,
     logger: Optional[logging.Logger] = None,
 ) -> SessionRecord:
-    prepared = prepare_session_with_auphonic(
-        config=config,
-        db_file=db_file,
-        session=session,
-        client=client,
-        logger=logger,
-    )
-    return start_prepared_session_with_auphonic(
-        config=config,
-        runtime_paths=runtime_paths,
-        db_file=db_file,
-        session=prepared,
-        client=client,
-        logger=logger,
-        allow_unpreviewed=True,
+    raise AuphonicError(
+        "Combined Auphonic processing cannot bypass offset verification and preview; "
+        f"run pod auphonic-prepare {session.session_uid} instead"
     )
 
 
@@ -565,6 +554,15 @@ def preview_prepared_session_with_auphonic(
         raise AuphonicError(
             f"Session {session.session_uid} has no stored Auphonic production id"
         )
+    if (
+        session.auphonic_offsets_verified_production_id
+        != session.auphonic_production_id
+    ):
+        raise AuphonicError(
+            f"Session {session.session_uid} offsets have not been verified for "
+            f"production {session.auphonic_production_id}; run pod auphonic-offset "
+            f"{session.session_uid} --apply first"
+        )
 
     production_id = session.auphonic_production_id
     details = inspect_production(config, production_id, client=client)
@@ -625,6 +623,15 @@ def start_prepared_session_with_auphonic(
     if not session.auphonic_production_id:
         raise AuphonicError(
             f"Session {session.session_uid} has no stored Auphonic production id"
+        )
+    if (
+        session.auphonic_offsets_verified_production_id
+        != session.auphonic_production_id
+    ):
+        raise AuphonicError(
+            f"Session {session.session_uid} offsets have not been verified for "
+            f"production {session.auphonic_production_id}; run pod auphonic-offset "
+            f"{session.session_uid} --apply first"
         )
 
     client = client or AuphonicClient(config)
@@ -726,6 +733,15 @@ def refresh_transcript_with_auphonic(
     validate_auphonic_config(config)
     client = client or AuphonicClient(config)
     production_id = session.transcript_refresh_production_id
+    final_master = get_media_artifact(
+        db_file,
+        session.session_uid,
+        kind=ArtifactKind.FINAL_MASTER.value,
+    )
+    if final_master is None:
+        raise AuphonicError(
+            f"Session {session.session_uid} has no final master artifact; run pod finalize first"
+        )
 
     if production_id:
         _log(
@@ -758,16 +774,6 @@ def refresh_transcript_with_auphonic(
                 client.start_production(production_id)
             production = client.wait_for_production(production_id)
     else:
-        final_master = get_media_artifact(
-            db_file,
-            session.session_uid,
-            kind=ArtifactKind.FINAL_MASTER.value,
-        )
-        if final_master is None:
-            raise AuphonicError(
-                f"Session {session.session_uid} has no final master artifact; run pod finalize first"
-            )
-
         resolved_preset_id = resolve_transcript_refresh_preset_id(config, preset_id)
         service_id = resolve_auphonic_service_id(config)
         _log(
@@ -812,6 +818,7 @@ def refresh_transcript_with_auphonic(
         session_uid=session.session_uid,
         status=session.status,
         production_id=production_id,
+        final_master_sha256=final_master.sha256,
         timestamp=datetime.now(timezone.utc).isoformat(),
     )
     _log(
@@ -1676,6 +1683,14 @@ def plan_session_auphonic_offset(
     cozytrack_client: Optional[CozytrackClientProtocol] = None,
     duration_probe: DurationProbe = probe_audio_duration_from_packets,
 ) -> AuphonicOffsetPlan:
+    if session.status not in {
+        SessionStatus.AUPHONIC_PREPARED.value,
+        SessionStatus.AUPHONIC_PREVIEWED.value,
+    }:
+        raise AuphonicError(
+            f"Session {session.session_uid} must be auphonic_prepared or "
+            "auphonic_previewed before offset verification"
+        )
     tracks = sorted(
         _spoken_raw_tracks(config, db_file, session.session_uid),
         key=lambda artifact: _recorder_order_key(artifact.role),
@@ -1798,16 +1813,58 @@ def offset_session_auphonic_production(
             plan.production_id, target.track_id, target.offset_seconds
         )
     details = inspect_production(config, plan.production_id, client=client)
+    inspected_tracks = details.get("multi_input_files") or []
+    expected_offsets = {
+        target.track_id: Decimal(str(target.offset_seconds)) for target in plan.targets
+    }
+    for asset in [plan.reference_asset, *plan.aligned_assets]:
+        track = _find_multi_input_track_for_asset(inspected_tracks, asset)
+        track_id = str(track.get("id") or "")
+        if not track_id:
+            raise AuphonicError(
+                f"Matched Auphonic track for {asset.filename} has no id during "
+                "offset re-inspection"
+            )
+        expected_offsets[track_id] = Decimal("0")
+
     track_states = []
-    for target in plan.targets:
+    target_ids = {target.track_id for target in plan.targets}
+    for track_id, expected_offset in expected_offsets.items():
         track_state = _find_multi_input_track_by_id(
-            details.get("multi_input_files") or [], target.track_id
+            inspected_tracks, track_id
         )
         if track_state is None:
             raise AuphonicError(
-                f"Auphonic offset was applied but updated track {target.track_id} was not present on re-inspection"
+                f"Auphonic offset was applied but track {track_id} was not present "
+                "on re-inspection"
             )
-        track_states.append(track_state)
+        try:
+            raw_offset = track_state.get("offset")
+            actual_offset = (
+                Decimal("0")
+                if raw_offset in (None, "")
+                else Decimal(str(raw_offset))
+            )
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise AuphonicError(
+                f"Auphonic offset for track {track_id} could not be "
+                "verified on re-inspection"
+            ) from exc
+        if abs(actual_offset - expected_offset) > Decimal("0.0005"):
+            raise AuphonicError(
+                f"Auphonic offset for track {track_id} could not be "
+                "verified on re-inspection: expected "
+                f"{expected_offset:.3f}s, found {track_state.get('offset')!r}"
+            )
+        if track_id in target_ids:
+            track_states.append(track_state)
+    record_auphonic_offsets_verified(
+        db_file,
+        session_uid=session.session_uid,
+        status=session.status,
+        production_id=plan.production_id,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+    )
     return AuphonicOffsetResult(plan=plan, applied=True, track_states=track_states)
 
 

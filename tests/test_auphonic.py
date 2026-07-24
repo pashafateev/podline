@@ -331,6 +331,9 @@ def _queued_session_with_tracks(
         session_uid="session-auphonic-1",
         status=status,
         auphonic_production_id=stored_production_id,
+        auphonic_offsets_verified_production_id=(
+            stored_production_id if status == "auphonic_previewed" else None
+        ),
     )
     tr1 = tmp_path / "Tr1.webm"
     tr1.write_bytes(b"track-one-bytes")
@@ -2094,6 +2097,32 @@ def test_session_offset_apply_does_not_checkpoint_unverified_remote_value(
     assert updated.auphonic_offsets_verified_production_id is None
 
 
+def test_session_offset_apply_verifies_reference_track_remains_at_zero(
+    app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _offset_session(
+        tmp_path, runtime_paths, session_factory, artifact_registrar
+    )
+    client = FakeOffsetAuphonicClient()
+    client.tracks[0]["offset"] = 2.0
+
+    with pytest.raises(AuphonicError, match="expected 0.000s"):
+        offset_session_auphonic_production(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=session,
+            apply=True,
+            client=client,
+        )
+
+    updated = get_session(runtime_paths.db_file, session.session_uid)
+    assert updated is not None
+    assert updated.auphonic_offsets_verified_production_id is None
+
+
 def test_session_offset_fails_when_production_is_not_change_allowed(
     app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
 ) -> None:
@@ -2153,6 +2182,7 @@ def test_auphonic_reset_requeues_prepared_session(
         session_uid="session-reset-1",
         status="auphonic_previewed",
         auphonic_production_id="prod-old",
+        auphonic_offsets_verified_production_id="prod-old",
     )
 
     refreshed = reset_session_auphonic_production(
@@ -2162,6 +2192,7 @@ def test_auphonic_reset_requeues_prepared_session(
 
     assert refreshed.status == "queued"
     assert refreshed.auphonic_production_id is None
+    assert refreshed.auphonic_offsets_verified_production_id is None
 
     from podline.db import connect
 
@@ -2602,6 +2633,7 @@ def test_start_failure_after_persist_recovers_via_reconcile_without_restart(
         runtime_paths.db_file,
         status="auphonic_previewed",
         auphonic_production_id="prod-123",
+        auphonic_offsets_verified_production_id="prod-123",
     )
     client = FakeAuphonicClient()
 

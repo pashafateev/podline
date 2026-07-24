@@ -101,6 +101,13 @@ EPISODE_METADATA = EpisodeRecord(
             f"pod auphonic-sync --session {SESSION_UID}",
         ),
         (
+            _session(status="auphonic_started"),
+            None,
+            None,
+            GuidanceKind.RECOVERY,
+            None,
+        ),
+        (
             _session(
                 status="waiting_for_finalize",
                 auphonic_production_id=PRODUCTION_ID,
@@ -109,7 +116,7 @@ EPISODE_METADATA = EpisodeRecord(
             None,
             None,
             GuidanceKind.WAITING,
-            f"pod finalize {SESSION_UID} --master <export>",
+            f"pod finalize {SESSION_UID}",
         ),
         (
             _session(status="ready_for_draft"),

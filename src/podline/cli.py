@@ -46,12 +46,18 @@ from podline.finalize import (
     finalize_session,
     get_episode_metadata,
 )
+from podline.guidance import resolve_next_action
 from podline.health import read_health_snapshot, write_health_snapshot
 from podline.ingest import IngestError, import_local_folder
 from podline.logging_setup import configure_logging
 from podline.paths import build_runtime_paths, ensure_runtime_dirs
 from podline.podbean import PodbeanError, create_podbean_draft
-from podline.repository import get_session, list_media_artifacts, list_sessions
+from podline.repository import (
+    get_media_artifact,
+    get_session,
+    list_media_artifacts,
+    list_sessions,
+)
 
 app = typer.Typer(help="podline automation CLI.")
 
@@ -102,6 +108,38 @@ def _print_section(title: str, items) -> None:
     typer.echo()
     typer.secho(title, fg=typer.colors.MAGENTA, bold=True)
     _print_key_values(items)
+
+
+def _print_session_guidance(
+    runtime_paths,
+    session,
+    *,
+    episode=None,
+    offset_plan_reviewed: bool = False,
+) -> None:
+    if episode is None:
+        episode = get_episode_metadata(runtime_paths.db_file, session.session_uid)
+    final_master = get_media_artifact(
+        runtime_paths.db_file,
+        session.session_uid,
+        kind="final_master",
+    )
+    action = resolve_next_action(
+        session,
+        episode=episode,
+        final_master_sha256=final_master.sha256 if final_master else None,
+        offset_plan_reviewed=offset_plan_reviewed,
+    )
+    items = []
+    if action.command:
+        items.append(
+            (
+                "command",
+                _styled(action.command, fg=typer.colors.WHITE, bold=True),
+            )
+        )
+    items.append(("why" if action.command else "check", action.instruction))
+    _print_section(action.kind.value, items)
 
 
 def _truncate(value: str, width: int) -> str:
@@ -599,8 +637,16 @@ def status(
         [
             ("auphonic_production_id", session.auphonic_production_id or "none"),
             (
+                "offsets_verified_for",
+                session.auphonic_offsets_verified_production_id or "none",
+            ),
+            (
                 "transcript_refresh_production_id",
                 session.transcript_refresh_production_id or "none",
+            ),
+            (
+                "transcript_refreshed_from",
+                session.transcript_refreshed_from_sha256 or "none",
             ),
         ],
     )
@@ -665,15 +711,9 @@ def status(
                     "status",
                     _styled("AI metadata pending", fg=typer.colors.YELLOW, bold=True),
                 ),
-                (
-                    "next_step",
-                    _styled(
-                        "Run pod episode-meta @n before Podbean draft",
-                        fg=typer.colors.WHITE,
-                    ),
-                ),
             ],
         )
+    _print_session_guidance(runtime_paths, session, episode=episode)
 
 
 @app.command()
@@ -728,6 +768,7 @@ def import_command(
             ("created", "yes" if created else "no (same content already registered)"),
         ]
     )
+    _print_session_guidance(runtime_paths, record)
 
 
 @app.command()
@@ -800,6 +841,7 @@ def workspace(
             fg=typer.colors.YELLOW,
             bold=True,
         )
+    _print_session_guidance(runtime_paths, session)
 
 
 @app.command("finalize")
@@ -868,15 +910,9 @@ def finalize_command(
                     "status",
                     _styled("AI metadata pending", fg=typer.colors.YELLOW, bold=True),
                 ),
-                (
-                    "next_step",
-                    _styled(
-                        "Run pod episode-meta @n before Podbean draft",
-                        fg=typer.colors.WHITE,
-                    ),
-                ),
             ],
         )
+    _print_session_guidance(runtime_paths, updated, episode=episode)
 
 
 @app.command("episode-meta")
@@ -920,6 +956,7 @@ def episode_meta_command(
             ("description", episode.description or "none"),
         ],
     )
+    _print_session_guidance(runtime_paths, session, episode=episode)
 
 
 @app.command("transcript-refresh")
@@ -969,6 +1006,7 @@ def transcript_refresh_command(
             ("final_master", _artifact_uri(runtime_paths, updated.session_uid, "final_master")),
         ],
     )
+    _print_session_guidance(runtime_paths, updated)
 
 
 @app.command("podbean-draft")
@@ -1015,6 +1053,8 @@ def podbean_draft_command(
             ("draft_url", episode.draft_url or "none"),
         ],
     )
+    if updated is not None:
+        _print_session_guidance(runtime_paths, updated, episode=episode)
 
 
 @app.command("auphonic")
@@ -1098,9 +1138,9 @@ def auphonic_prepare_command(
             ("status", _format_status(updated.status)),
             ("auphonic_production_id", updated.auphonic_production_id or "none"),
             ("auphonic_started", "no"),
-            ("next", f"pod auphonic-preview {session_uid}"),
         ]
     )
+    _print_session_guidance(runtime_paths, updated)
     # Show which file landed on which named preset track so a wrong pairing
     # is visible before anything starts. The session is already prepared at
     # this point, so a failure here is informational, never an exit code.
@@ -1176,10 +1216,10 @@ def auphonic_preview_command(
             ("edit_page", edit_page or "none"),
             ("status_page", details["status_page"] or "none"),
             ("browser_opened", "yes" if browser_opened else "no"),
-            ("next", f"pod auphonic-start {session_uid}"),
         ]
     )
     _print_auphonic_tracks(details["multi_input_files"])
+    _print_session_guidance(runtime_paths, preview.session)
 
 
 @app.command("auphonic-reset")
@@ -1223,9 +1263,9 @@ def auphonic_reset_command(
             ("session_uid", refreshed.session_uid),
             ("status", _format_status(refreshed.status)),
             ("abandoned_production", abandoned_production_id),
-            ("next", f"pod auphonic-prepare {refreshed.session_uid}"),
         ]
     )
+    _print_session_guidance(runtime_paths, refreshed)
 
 
 @app.command("auphonic-start")
@@ -1270,6 +1310,7 @@ def auphonic_start_command(
             ("workspace", str(workspace_path_for(runtime_paths, updated.session_uid))),
         ]
     )
+    _print_session_guidance(runtime_paths, updated)
 
 
 @app.command("auphonic-inspect")
@@ -1463,6 +1504,12 @@ def auphonic_offset_command(
                 for track_state in result.track_states
             ],
         )
+    refreshed = get_session(runtime_paths.db_file, session.session_uid)
+    _print_session_guidance(
+        runtime_paths,
+        refreshed or session,
+        offset_plan_reviewed=not result.applied,
+    )
 
 
 @app.command("ct-list")
@@ -1558,6 +1605,7 @@ def ct_ingest_command(
             ("status", _format_status(record.status)),
         ]
     )
+    _print_session_guidance(runtime_paths, record)
 
 
 @app.command("auphonic-sync")
@@ -1629,3 +1677,4 @@ def auphonic_sync_command(
             ),
         ]
     )
+    _print_session_guidance(runtime_paths, updated)
