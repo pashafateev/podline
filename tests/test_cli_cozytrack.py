@@ -137,10 +137,18 @@ def test_ct_ingest_passes_runtime_paths_and_reports_artifacts(
     seen = {}
 
     def fake_ingest(
-        *, config, runtime_paths, db_file, cozytrack_session_id, name_override, logger
+        *,
+        config,
+        runtime_paths,
+        db_file,
+        cozytrack_session_id,
+        name_override,
+        excluded_track_selectors,
+        logger,
     ):
         seen["runtime_paths"] = runtime_paths
         seen["cozytrack_session_id"] = cozytrack_session_id
+        seen["excluded_track_selectors"] = excluded_track_selectors
         with connect(db_file) as connection:
             connection.execute(
                 "INSERT INTO sessions (session_uid, source_path, fingerprint, status, cozytrack_session_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -169,7 +177,122 @@ def test_ct_ingest_passes_runtime_paths_and_reports_artifacts(
     assert "session-ct-1" in result.stdout
     assert "artifacts" in result.stdout
     assert seen["cozytrack_session_id"] == "sess-1"
+    assert seen["excluded_track_selectors"] == []
     assert seen["runtime_paths"] is not None
     db_file = runtime_home / "state" / "state.db"
     record = get_session_by_cozytrack_id(str(db_file), "sess-1")
     assert record is not None
+
+
+def test_ct_ingest_passes_repeated_friendly_exclusions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runtime_home = tmp_path / "runtime"
+    raw_root = tmp_path / "raw"
+    config_file = tmp_path / "config.yaml"
+    _write_config(config_file, runtime_home, raw_root)
+    seen = {}
+
+    def fake_ingest(**kwargs):
+        seen.update(kwargs)
+        db_file = kwargs["db_file"]
+        with connect(db_file) as connection:
+            connection.execute(
+                "INSERT INTO sessions (session_uid, source_path, fingerprint, status, cozytrack_session_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "session-ct-excluded",
+                    "/ingested/session-ct-excluded",
+                    "fingerprint-ct-excluded",
+                    "queued",
+                    kwargs["cozytrack_session_id"],
+                    "now",
+                    "now",
+                ),
+            )
+            connection.commit()
+        record = get_session_by_cozytrack_id(
+            db_file, kwargs["cozytrack_session_id"]
+        )
+        assert record is not None
+        return record
+
+    monkeypatch.setattr(cli_module, "cozytrack_ingest_session", fake_ingest)
+
+    result = runner.invoke(
+        app,
+        [
+            "ct-ingest",
+            "sess-1",
+            "--exclude",
+            "guest4",
+            "--exclude",
+            "guest5",
+            "--config",
+            str(config_file),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert seen["excluded_track_selectors"] == ["guest4", "guest5"]
+
+
+def test_ct_ingest_list_tracks_prints_choices_without_downloading(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runtime_home = tmp_path / "runtime"
+    raw_root = tmp_path / "raw"
+    config_file = tmp_path / "config.yaml"
+    _write_config(config_file, runtime_home, raw_root)
+    session = CozytrackSession(
+        id="sess-list",
+        name="Reconnects",
+        status="ready",
+        finalized_at="2026-07-25T13:00:00Z",
+        tracks=[
+            CozytrackTrack(
+                id="ct-host",
+                participant_name="Pasha",
+                participant_id="host-local-ch-1",
+                status="complete",
+                duration_ms=6055127,
+                created_at="2026-07-25T11:20:00Z",
+            ),
+            CozytrackTrack(
+                id="ct-rejoin",
+                participant_name="MATT D",
+                participant_id="guest_rejoin",
+                status="complete",
+                duration_ms=60220,
+                created_at="2026-07-25T13:00:10Z",
+            ),
+        ],
+    )
+
+    class FakeListingClient:
+        def __init__(self, config) -> None:
+            self.config = config
+
+        def get_session(self, session_id: str) -> CozytrackSession:
+            assert session_id == session.id
+            return session
+
+    monkeypatch.setattr(cli_module, "CozytrackClient", FakeListingClient)
+
+    result = runner.invoke(
+        app,
+        [
+            "ct-ingest",
+            session.id,
+            "--list-tracks",
+            "--config",
+            str(config_file),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert "Cozytrack Tracks" in result.stdout
+    assert "host1" in result.stdout
+    assert "guest1" in result.stdout
+    assert "MATT D" in result.stdout
+    assert "1:00.220" in result.stdout
+    assert "ct-rejoin" in result.stdout
