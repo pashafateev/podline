@@ -61,6 +61,7 @@ def ingest_session(
     db_file: str,
     cozytrack_session_id: str,
     name_override: Optional[str] = None,
+    excluded_track_selectors: Optional[List[str]] = None,
     client: Optional[CozytrackClientProtocol] = None,
     storage: Optional[MediaStorage] = None,
     duration_probe: Optional[DurationProbe] = None,
@@ -72,8 +73,18 @@ def ingest_session(
     upload; on success the staging folder is removed (the cache keeps
     hardlinked copies). Re-running an already-ingested session is a no-op.
     """
+    excluded_track_selectors = [
+        selector.strip()
+        for selector in (excluded_track_selectors or [])
+        if selector.strip()
+    ]
     existing = get_session_by_cozytrack_id(db_file, cozytrack_session_id)
     if existing is not None:
+        if excluded_track_selectors:
+            raise CozytrackIngestError(
+                f"Cozytrack session {cozytrack_session_id} is already ingested as "
+                f"{existing.session_uid}; --exclude only applies to the first ingest"
+            )
         _log(
             logger,
             "Cozytrack session %s already ingested as %s",
@@ -126,6 +137,23 @@ def ingest_session(
         raise CozytrackIngestError(
             f"Cozytrack session {cozytrack_session_id} has no tracks"
         )
+    selected_tracks = _select_tracks(
+        session=session,
+        excluded_track_selectors=excluded_track_selectors,
+    )
+    if excluded_track_selectors:
+        selected_track_ids = {track.id for track in selected_tracks}
+        excluded_track_ids = [
+            track.id for track in session.tracks if track.id not in selected_track_ids
+        ]
+        _log(
+            logger,
+            "Cozytrack ingest session=%s exclusions=%s excluded_track_ids=%s",
+            cozytrack_session_id,
+            excluded_track_selectors,
+            excluded_track_ids,
+        )
+    session = replace(session, tracks=selected_tracks)
     roles_by_track_id = _derive_participant_roles(session.tracks)
 
     folder = _build_staging_folder(
@@ -177,9 +205,19 @@ def ingest_session(
 
         parsed = _parse_session_dir(folder, logger=logger)
         if isinstance(parsed, UnsupportedSession):
-            raise CozytrackIngestError(
+            message = (
                 f"Cozytrack ingest produced an unsupported session: {parsed.reason}"
             )
+            if parsed.spoken_track_count > 4:
+                message = "\n\n".join(
+                    [
+                        message,
+                        "Available Cozytrack tracks:\n"
+                        + format_session_track_table(session),
+                        _track_exclusion_guidance(cozytrack_session_id),
+                    ]
+                )
+            raise CozytrackIngestError(message)
         if not isinstance(parsed, ScanCandidate):
             raise CozytrackIngestError(
                 f"Cozytrack ingest could not classify the downloaded session at {folder}"
@@ -311,9 +349,6 @@ def _reconcile_existing_session_roles(
     session is left untouched with a warning. Filenames and content are
     never modified.
     """
-    roles_by_track_id = _derive_participant_roles(cozytrack_session.tracks)
-    if roles_by_track_id is None:
-        return
     artifacts = [
         artifact
         for artifact in list_media_artifacts(
@@ -324,10 +359,49 @@ def _reconcile_existing_session_roles(
     if not artifacts:
         return
 
+    source_ids = []
+    for artifact in artifacts:
+        source_id = (artifact.source_id or "").strip()
+        if not source_id:
+            _log(
+                logger,
+                "Cannot verify roles for %s: artifact %s (role=%s) has no "
+                "Cozytrack source id; leaving roles unchanged",
+                existing.session_uid,
+                artifact.filename,
+                artifact.role,
+            )
+            return
+        source_ids.append(source_id)
+
+    source_id_set = set(source_ids)
+    selected_tracks = [
+        track for track in cozytrack_session.tracks if track.id in source_id_set
+    ]
+    selected_track_ids = {track.id for track in selected_tracks}
+    unmatched_source_ids = sorted(source_id_set - selected_track_ids)
+    if unmatched_source_ids:
+        _log(
+            logger,
+            "Cannot verify roles for %s: registered Cozytrack source ids do "
+            "not exist in the source session: %s; leaving roles unchanged",
+            existing.session_uid,
+            unmatched_source_ids,
+        )
+        return
+
+    # Excluded reconnect tracks are intentionally absent from the registered
+    # artifacts. Derive roles only from the persisted selection so a no-op
+    # re-ingest neither renumbers guests nor reintroduces invalid metadata
+    # from a source track the operator omitted.
+    roles_by_track_id = _derive_participant_roles(selected_tracks)
+    if roles_by_track_id is None:
+        return
+
     role_updates: Dict[str, str] = {}
     for artifact in artifacts:
         source_id = (artifact.source_id or "").strip()
-        derived_role = roles_by_track_id.get(source_id) if source_id else None
+        derived_role = roles_by_track_id.get(source_id)
         if derived_role is None:
             _log(
                 logger,
@@ -423,6 +497,172 @@ def _derive_participant_roles(
     return roles
 
 
+def _select_tracks(
+    *,
+    session: CozytrackSession,
+    excluded_track_selectors: List[str],
+) -> List[CozytrackTrack]:
+    if not excluded_track_selectors:
+        return list(session.tracks)
+
+    tracks_by_id = {track.id: track for track in session.tracks}
+    excluded_track_ids = set()
+    unresolved_selectors = []
+    for selector in excluded_track_selectors:
+        selected_track = tracks_by_id.get(selector)
+        if selected_track is not None:
+            excluded_track_ids.add(selected_track.id)
+        else:
+            unresolved_selectors.append(selector)
+
+    if unresolved_selectors:
+        roles_by_track_id = _display_roles_by_track_id(session.tracks)
+        track_ids_by_role = {
+            role.lower(): track_id for track_id, role in roles_by_track_id.items()
+        }
+        for selector in unresolved_selectors:
+            track_id = track_ids_by_role.get(selector.lower())
+            selected_track = tracks_by_id.get(track_id) if track_id else None
+            if selected_track is None:
+                raise CozytrackIngestError(
+                    "\n\n".join(
+                        [
+                            f"Unknown Cozytrack track selector {selector!r}. "
+                            "Use a role or exact track id from the table.",
+                            "Available Cozytrack tracks:\n"
+                            + format_session_track_table(session),
+                            _track_exclusion_guidance(session.id),
+                        ]
+                    )
+                )
+            excluded_track_ids.add(selected_track.id)
+
+    selected_tracks = [
+        track for track in session.tracks if track.id not in excluded_track_ids
+    ]
+    if len(selected_tracks) < 2:
+        raise CozytrackIngestError(
+            "\n\n".join(
+                [
+                    "Cozytrack ingest requires at least two tracks after exclusions; "
+                    f"{len(selected_tracks)} would remain.",
+                    "Available Cozytrack tracks:\n"
+                    + format_session_track_table(session),
+                ]
+            )
+        )
+    return selected_tracks
+
+
+def _display_roles_by_track_id(tracks: List[CozytrackTrack]) -> Dict[str, str]:
+    try:
+        roles = _derive_participant_roles(tracks)
+    except CozytrackIngestError:
+        sorted_tracks = sorted(
+            tracks,
+            key=lambda track: (track.created_at or "", track.id),
+        )
+        return {
+            track.id: f"track{index}"
+            for index, track in enumerate(sorted_tracks, start=1)
+        }
+    if roles is not None:
+        return roles
+    sorted_tracks = sorted(
+        tracks,
+        key=lambda track: (track.created_at or "", track.id),
+    )
+    return {
+        track.id: _legacy_track_role(index)
+        for index, track in enumerate(sorted_tracks, start=1)
+    }
+
+
+def _legacy_track_role(index: int) -> str:
+    if index <= 2:
+        return f"host{index}"
+    return f"guest{index - 2}"
+
+
+def format_session_track_table(session: CozytrackSession) -> str:
+    """Render stable, copyable track choices for an ingest operator."""
+    if not session.tracks:
+        return "(no tracks)"
+    roles_by_track_id = _display_roles_by_track_id(session.tracks)
+    sorted_tracks = sorted(
+        session.tracks,
+        key=lambda track: _display_role_order(roles_by_track_id[track.id]),
+    )
+    headers = ("role", "participant", "duration", "started", "status", "track id")
+    rows = [
+        (
+            roles_by_track_id[track.id],
+            _table_cell(track.participant_name or "unknown", 24),
+            _format_duration_ms(track.duration_ms),
+            _table_cell(track.created_at or "unknown", 24),
+            _table_cell(track.status or "unknown", 10),
+            track.id,
+        )
+        for track in sorted_tracks
+    ]
+    widths = [
+        max(len(headers[index]), *(len(row[index]) for row in rows))
+        for index in range(len(headers))
+    ]
+    lines = [
+        "  ".join(
+            header.ljust(widths[index]) for index, header in enumerate(headers)
+        ),
+        "  ".join("-" * width for width in widths),
+    ]
+    lines.extend(
+        "  ".join(cell.ljust(widths[index]) for index, cell in enumerate(row))
+        for row in rows
+    )
+    return "\n".join(lines)
+
+
+def _display_role_order(role: str) -> Tuple[int, int]:
+    if role.startswith("host"):
+        return (0, int(role[len("host") :]))
+    if role.startswith("guest"):
+        return (1, int(role[len("guest") :]))
+    if role.startswith("track"):
+        return (2, int(role[len("track") :]))
+    return (3, 0)
+
+
+def _format_duration_ms(duration_ms: Optional[int]) -> str:
+    if duration_ms is None or duration_ms < 0:
+        return "unknown"
+    total_seconds, milliseconds = divmod(duration_ms, 1000)
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
+    return f"{minutes}:{seconds:02d}.{milliseconds:03d}"
+
+
+def _table_cell(value: str, width: int) -> str:
+    if len(value) <= width:
+        return value
+    return value[: width - 1] + "…"
+
+
+def _track_exclusion_guidance(session_id: str) -> str:
+    return "\n".join(
+        [
+            "Inspect this metadata without downloading audio:",
+            f"  pod ct-ingest {session_id} --list-tracks",
+            "After deciding which tracks are irrelevant, retry with one or more "
+            "role labels or exact ids:",
+            f"  pod ct-ingest {session_id} --exclude <role-or-track-id> "
+            "[--exclude <role-or-track-id> ...]",
+            "Short duration alone is not proof that a track is safe to exclude.",
+        ]
+    )
+
+
 def _derived_role_order(role: str) -> Tuple[int, int]:
     """Recorder order for participant-derived roles: host channels, then guests."""
     if role.startswith("host"):
@@ -487,6 +727,7 @@ def _log(logger: Optional[logging.Logger], message: str, *args) -> None:
 
 __all__ = [
     "CozytrackIngestError",
+    "format_session_track_table",
     "ingest_session",
     "list_ready_sessions_for_ingest",
     "slugify",

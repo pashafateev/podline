@@ -15,6 +15,7 @@ from podline.cozytrack.client import (
 )
 from podline.cozytrack.ingest import (
     CozytrackIngestError,
+    format_session_track_table,
     ingest_session,
     list_ready_sessions_for_ingest,
     slugify,
@@ -157,6 +158,7 @@ def test_client_list_ready_sessions_uses_api_key_header(
                             "participantName": "Pasha",
                             "participantId": "host-local-ch-1",
                             "status": "complete",
+                            "durationMs": 6055127,
                             "createdAt": "2026-04-24T12:00:01Z",
                         }
                     ],
@@ -180,6 +182,7 @@ def test_client_list_ready_sessions_uses_api_key_header(
     assert sessions[0].finalized_at == "2026-04-24T12:00:00Z"
     assert sessions[0].tracks[0].participant_name == "Pasha"
     assert sessions[0].tracks[0].participant_id == "host-local-ch-1"
+    assert sessions[0].tracks[0].duration_ms == 6055127
 
 
 def test_client_get_track_download_url_returns_presigned_url(
@@ -370,6 +373,317 @@ def test_ingest_session_derives_roles_from_participant_ids(
         ("host1", "Tr1.webm", "ct-ch-1"),
         ("host2", "Tr2.webm", "ct-ch-2"),
     ]
+
+
+def test_ingest_session_excludes_reconnect_tracks_by_display_role(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+    session = _make_identified_session(
+        session_id="sess-reconnects",
+        tracks=[
+            ("ct-host", "host-local-ch-1", "Pasha"),
+            ("ct-j", "guest_j", "J"),
+            ("ct-carriss", "guest_carriss", "Carriss"),
+            ("ct-matt", "guest_matt", "MATT D"),
+            ("ct-matt-rejoin", "guest_matt_rejoin", "MATT D"),
+            ("ct-carriss-rejoin", "guest_carriss_rejoin", "Carriss"),
+        ],
+    )
+    fake = FakeCozytrackClient(sessions=[session])
+
+    record = ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id=session.id,
+        excluded_track_selectors=["guest4", "guest5"],
+        client=fake,
+        duration_probe=_probe,
+    )
+
+    assert fake.requested_track_ids == [
+        "ct-host",
+        "ct-j",
+        "ct-carriss",
+        "ct-matt",
+    ]
+    artifacts = list_media_artifacts(runtime_paths.db_file, record.session_uid)
+    assert [(a.role, a.source_id) for a in artifacts] == [
+        ("guest1", "ct-j"),
+        ("guest2", "ct-carriss"),
+        ("guest3", "ct-matt"),
+        ("host1", "ct-host"),
+    ]
+
+
+def test_ingest_session_accepts_exact_track_id_exclusion(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+    session = _make_identified_session(
+        session_id="sess-track-id",
+        tracks=[
+            ("ct-host", "host-local-ch-1", "Pasha"),
+            ("ct-j", "guest_j", "J"),
+            ("ct-rejoin", "guest_rejoin", "J"),
+        ],
+    )
+    fake = FakeCozytrackClient(sessions=[session])
+
+    ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id=session.id,
+        excluded_track_selectors=["ct-rejoin"],
+        client=fake,
+        duration_probe=_probe,
+    )
+
+    assert fake.requested_track_ids == ["ct-host", "ct-j"]
+
+
+@pytest.mark.parametrize(
+    "tracks",
+    [
+        [
+            ("ct-host", "host", "Pasha"),
+            ("ct-duplicate-host", "host-local-ch-1", "Duplicate host"),
+            ("ct-guest", "guest_j", "J"),
+        ],
+        [
+            ("ct-host", "host-local-ch-1", "Pasha"),
+            ("ct-missing-id", None, "Abandoned reconnect"),
+            ("ct-guest", "guest_j", "J"),
+        ],
+    ],
+)
+def test_ingest_session_exact_id_can_exclude_invalid_metadata_track(
+    tracks, moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+    session = _make_identified_session(
+        session_id="sess-invalid-excluded",
+        tracks=tracks,
+    )
+    excluded_track_id = tracks[1][0]
+    fake = FakeCozytrackClient(sessions=[session])
+
+    ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id=session.id,
+        excluded_track_selectors=[excluded_track_id],
+        client=fake,
+        duration_probe=_probe,
+    )
+
+    assert fake.requested_track_ids == ["ct-host", "ct-guest"]
+
+
+@pytest.mark.parametrize(
+    ("tracks", "excluded_selector"),
+    [
+        (
+            [
+                ("ct-host", "host-local-ch-1", "Pasha"),
+                ("ct-abandoned", "guest_abandoned", "Abandoned reconnect"),
+                ("ct-j", "guest_j", "J"),
+                ("ct-carriss", "guest_carriss", "Carriss"),
+            ],
+            "guest1",
+        ),
+        (
+            [
+                ("ct-host", "host-local-ch-1", "Pasha"),
+                ("ct-invalid", None, "Abandoned reconnect"),
+                ("ct-j", "guest_j", "J"),
+            ],
+            "ct-invalid",
+        ),
+    ],
+)
+def test_reingest_reconciles_only_originally_selected_source_tracks(
+    tracks,
+    excluded_selector,
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    tmp_path: Path,
+) -> None:
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+    session = _make_identified_session(
+        session_id="sess-selected-rerun",
+        tracks=tracks,
+    )
+    fake = FakeCozytrackClient(sessions=[session])
+
+    first = ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id=session.id,
+        excluded_track_selectors=[excluded_selector],
+        client=fake,
+        duration_probe=_probe,
+    )
+    roles_before = [
+        (artifact.role, artifact.source_id)
+        for artifact in list_media_artifacts(runtime_paths.db_file, first.session_uid)
+    ]
+
+    second = ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id=session.id,
+        client=fake,
+        duration_probe=_probe,
+    )
+
+    assert second.session_uid == first.session_uid
+    assert [
+        (artifact.role, artifact.source_id)
+        for artifact in list_media_artifacts(runtime_paths.db_file, first.session_uid)
+    ] == roles_before
+
+
+def test_ingest_session_rejects_unknown_exclusion_before_download(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+    session = _make_identified_session(
+        session_id="sess-unknown-exclusion",
+        tracks=[
+            ("ct-host", "host-local-ch-1", "Pasha"),
+            ("ct-j", "guest_j", "J"),
+        ],
+    )
+    fake = FakeCozytrackClient(sessions=[session])
+
+    with pytest.raises(CozytrackIngestError) as excinfo:
+        ingest_session(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            cozytrack_session_id=session.id,
+            excluded_track_selectors=["guest9"],
+            client=fake,
+            duration_probe=_probe,
+        )
+
+    message = str(excinfo.value)
+    assert "Unknown Cozytrack track selector 'guest9'" in message
+    assert "guest1" in message
+    assert "ct-j" in message
+    assert fake.requested_track_ids == []
+    assert get_session_by_cozytrack_id(runtime_paths.db_file, session.id) is None
+
+
+def test_ingest_session_more_than_four_tracks_explains_how_to_choose_exclusions(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+    session = _make_identified_session(
+        session_id="sess-too-many",
+        tracks=[
+            ("ct-host", "host-local-ch-1", "Pasha"),
+            ("ct-a", "guest_a", "A"),
+            ("ct-b", "guest_b", "B"),
+            ("ct-c", "guest_c", "C"),
+            ("ct-d", "guest_d", "D"),
+        ],
+    )
+    fake = FakeCozytrackClient(sessions=[session])
+
+    with pytest.raises(CozytrackIngestError) as excinfo:
+        ingest_session(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            cozytrack_session_id=session.id,
+            client=fake,
+            duration_probe=_probe,
+        )
+
+    message = str(excinfo.value)
+    assert "Available Cozytrack tracks" in message
+    assert "guest4" in message
+    assert "ct-d" in message
+    assert f"pod ct-ingest {session.id} --list-tracks" in message
+    assert (
+        f"pod ct-ingest {session.id} --exclude <role-or-track-id>" in message
+    )
+    assert get_session_by_cozytrack_id(runtime_paths.db_file, session.id) is None
+
+
+def test_format_session_track_table_shows_human_choices_and_ids() -> None:
+    session = CozytrackSession(
+        id="sess-table",
+        name="Reconnects",
+        status="ready",
+        finalized_at="2026-07-25T13:00:00Z",
+        tracks=[
+            CozytrackTrack(
+                id="ct-host",
+                participant_name="Pasha",
+                participant_id="host-local-ch-1",
+                status="complete",
+                duration_ms=6055127,
+                created_at="2026-07-25T11:20:00Z",
+            ),
+            CozytrackTrack(
+                id="ct-rejoin",
+                participant_name="MATT D",
+                participant_id="guest_rejoin",
+                status="complete",
+                duration_ms=60220,
+                created_at="2026-07-25T13:00:10Z",
+            ),
+        ],
+    )
+
+    table = format_session_track_table(session)
+
+    assert "role" in table
+    assert "participant" in table
+    assert "duration" in table
+    assert "started" in table
+    assert "track id" in table
+    assert "host1" in table
+    assert "1:40:55.127" in table
+    assert "guest1" in table
+    assert "MATT D" in table
+    assert "1:00.220" in table
+    assert "ct-rejoin" in table
+
+
+def test_format_session_track_table_falls_back_when_roles_cannot_be_derived() -> None:
+    session = _make_identified_session(
+        session_id="sess-unresolved-table",
+        tracks=[
+            ("ct-host", "host-local-ch-1", "Pasha"),
+            ("ct-missing-id", None, "Reconnect"),
+            ("ct-guest", "guest_j", "J"),
+        ],
+    )
+
+    table = format_session_track_table(session)
+
+    assert "track1" in table
+    assert "track2" in table
+    assert "track3" in table
+    assert "ct-host" in table
+    assert "ct-missing-id" in table
+    assert "ct-guest" in table
 
 
 def test_ingest_session_rejects_partially_identified_tracks(

@@ -66,6 +66,7 @@ Current workflow
 For Cozytrack (remote stems):
 ```bash
 pod ct-list                    # show ready Cozytrack sessions, excludes already-ingested
+pod ct-ingest <id> --list-tracks  # inspect role, participant, duration, start, and source id
 pod ct-ingest <cozytrack-id>   # download, classify, upload tracks to S3, register
 pod list
 ```
@@ -79,6 +80,7 @@ pod list
 Notes on ingest:
 - Tracks are hashed and uploaded to `s3://<bucket>/sessions/<uid>/raw_track/...`; packet-derived durations are stored for the offset step. Nothing is written to the external drive.
 - Cozytrack roles come from stable participant ids (`host-local-ch-N` → hostN, guests numbered by recorder start order), and files are named in recorder order — not row-creation order, which can interleave a guest between host channels. Sessions without participant ids keep the legacy creation-order naming.
+- If reconnects leave more than four active source tracks, inspect them with `pod ct-ingest <id> --list-tracks`, then explicitly omit known-irrelevant clips with repeated selectors such as `--exclude guest4 --exclude guest5`. A selector may be the displayed role or exact Cozytrack track id. Podline never discards a track automatically based on its duration, and exclusions do not delete the Cozytrack source files.
 - Re-running `pod ct-ingest` on an already-ingested session reconciles its stored roles against Cozytrack participant ids (the migration path for sessions ingested before identity-based roles). If roles change on a session that already has a prepared production, run `pod auphonic-reset` and re-run `pod auphonic-prepare`/`auphonic-offset` so the preset wiring picks up the corrected roles.
 - When `pod ct-ingest` dedups onto a session that was first registered via `pod import`, the surviving session gains the Cozytrack source ids (tracks paired by content hash) before roles are reconciled — without them, multitrack offset topology cannot resolve. The ids are persisted in the same transaction as the association, and a session left half-migrated by an interrupted or pre-migration run is detected on the next `pod ct-ingest`, which re-downloads and heals it in place by content hash — recovery never depends on fingerprints or file naming, and content that matches nothing is reported rather than guessed at.
 - Cozytrack downloads land in a disposable staging folder that is removed after registration; re-running `pod ct-ingest <id>` is a no-op, and re-importing an identical folder is detected by content fingerprint.
