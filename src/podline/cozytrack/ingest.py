@@ -469,30 +469,37 @@ def _select_tracks(
     if not excluded_track_selectors:
         return list(session.tracks)
 
-    roles_by_track_id = _display_roles_by_track_id(session.tracks)
     tracks_by_id = {track.id: track for track in session.tracks}
-    track_ids_by_role = {
-        role.lower(): track_id for track_id, role in roles_by_track_id.items()
-    }
     excluded_track_ids = set()
+    unresolved_selectors = []
     for selector in excluded_track_selectors:
         selected_track = tracks_by_id.get(selector)
-        if selected_track is None:
+        if selected_track is not None:
+            excluded_track_ids.add(selected_track.id)
+        else:
+            unresolved_selectors.append(selector)
+
+    if unresolved_selectors:
+        roles_by_track_id = _display_roles_by_track_id(session.tracks)
+        track_ids_by_role = {
+            role.lower(): track_id for track_id, role in roles_by_track_id.items()
+        }
+        for selector in unresolved_selectors:
             track_id = track_ids_by_role.get(selector.lower())
             selected_track = tracks_by_id.get(track_id) if track_id else None
-        if selected_track is None:
-            raise CozytrackIngestError(
-                "\n\n".join(
-                    [
-                        f"Unknown Cozytrack track selector {selector!r}. "
-                        "Use a role or exact track id from the table.",
-                        "Available Cozytrack tracks:\n"
-                        + format_session_track_table(session),
-                        _track_exclusion_guidance(session.id),
-                    ]
+            if selected_track is None:
+                raise CozytrackIngestError(
+                    "\n\n".join(
+                        [
+                            f"Unknown Cozytrack track selector {selector!r}. "
+                            "Use a role or exact track id from the table.",
+                            "Available Cozytrack tracks:\n"
+                            + format_session_track_table(session),
+                            _track_exclusion_guidance(session.id),
+                        ]
+                    )
                 )
-            )
-        excluded_track_ids.add(selected_track.id)
+            excluded_track_ids.add(selected_track.id)
 
     selected_tracks = [
         track for track in session.tracks if track.id not in excluded_track_ids
@@ -512,7 +519,17 @@ def _select_tracks(
 
 
 def _display_roles_by_track_id(tracks: List[CozytrackTrack]) -> Dict[str, str]:
-    roles = _derive_participant_roles(tracks)
+    try:
+        roles = _derive_participant_roles(tracks)
+    except CozytrackIngestError:
+        sorted_tracks = sorted(
+            tracks,
+            key=lambda track: (track.created_at or "", track.id),
+        )
+        return {
+            track.id: f"track{index}"
+            for index, track in enumerate(sorted_tracks, start=1)
+        }
     if roles is not None:
         return roles
     sorted_tracks = sorted(
@@ -538,7 +555,7 @@ def format_session_track_table(session: CozytrackSession) -> str:
     roles_by_track_id = _display_roles_by_track_id(session.tracks)
     sorted_tracks = sorted(
         session.tracks,
-        key=lambda track: _derived_role_order(roles_by_track_id[track.id]),
+        key=lambda track: _display_role_order(roles_by_track_id[track.id]),
     )
     headers = ("role", "participant", "duration", "started", "status", "track id")
     rows = [
@@ -567,6 +584,16 @@ def format_session_track_table(session: CozytrackSession) -> str:
         for row in rows
     )
     return "\n".join(lines)
+
+
+def _display_role_order(role: str) -> Tuple[int, int]:
+    if role.startswith("host"):
+        return (0, int(role[len("host") :]))
+    if role.startswith("guest"):
+        return (1, int(role[len("guest") :]))
+    if role.startswith("track"):
+        return (2, int(role[len("track") :]))
+    return (3, 0)
 
 
 def _format_duration_ms(duration_ms: Optional[int]) -> str:

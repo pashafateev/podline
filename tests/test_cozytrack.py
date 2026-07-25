@@ -446,6 +446,46 @@ def test_ingest_session_accepts_exact_track_id_exclusion(
     assert fake.requested_track_ids == ["ct-host", "ct-j"]
 
 
+@pytest.mark.parametrize(
+    "tracks",
+    [
+        [
+            ("ct-host", "host", "Pasha"),
+            ("ct-duplicate-host", "host-local-ch-1", "Duplicate host"),
+            ("ct-guest", "guest_j", "J"),
+        ],
+        [
+            ("ct-host", "host-local-ch-1", "Pasha"),
+            ("ct-missing-id", None, "Abandoned reconnect"),
+            ("ct-guest", "guest_j", "J"),
+        ],
+    ],
+)
+def test_ingest_session_exact_id_can_exclude_invalid_metadata_track(
+    tracks, moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+    session = _make_identified_session(
+        session_id="sess-invalid-excluded",
+        tracks=tracks,
+    )
+    excluded_track_id = tracks[1][0]
+    fake = FakeCozytrackClient(sessions=[session])
+
+    ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id=session.id,
+        excluded_track_selectors=[excluded_track_id],
+        client=fake,
+        duration_probe=_probe,
+    )
+
+    assert fake.requested_track_ids == ["ct-host", "ct-guest"]
+
+
 def test_ingest_session_rejects_unknown_exclusion_before_download(
     moto_s3, app_config_factory, runtime_factory, tmp_path: Path
 ) -> None:
@@ -556,6 +596,26 @@ def test_format_session_track_table_shows_human_choices_and_ids() -> None:
     assert "MATT D" in table
     assert "1:00.220" in table
     assert "ct-rejoin" in table
+
+
+def test_format_session_track_table_falls_back_when_roles_cannot_be_derived() -> None:
+    session = _make_identified_session(
+        session_id="sess-unresolved-table",
+        tracks=[
+            ("ct-host", "host-local-ch-1", "Pasha"),
+            ("ct-missing-id", None, "Reconnect"),
+            ("ct-guest", "guest_j", "J"),
+        ],
+    )
+
+    table = format_session_track_table(session)
+
+    assert "track1" in table
+    assert "track2" in table
+    assert "track3" in table
+    assert "ct-host" in table
+    assert "ct-missing-id" in table
+    assert "ct-guest" in table
 
 
 def test_ingest_session_rejects_partially_identified_tracks(
