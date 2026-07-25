@@ -486,6 +486,74 @@ def test_ingest_session_exact_id_can_exclude_invalid_metadata_track(
     assert fake.requested_track_ids == ["ct-host", "ct-guest"]
 
 
+@pytest.mark.parametrize(
+    ("tracks", "excluded_selector"),
+    [
+        (
+            [
+                ("ct-host", "host-local-ch-1", "Pasha"),
+                ("ct-abandoned", "guest_abandoned", "Abandoned reconnect"),
+                ("ct-j", "guest_j", "J"),
+                ("ct-carriss", "guest_carriss", "Carriss"),
+            ],
+            "guest1",
+        ),
+        (
+            [
+                ("ct-host", "host-local-ch-1", "Pasha"),
+                ("ct-invalid", None, "Abandoned reconnect"),
+                ("ct-j", "guest_j", "J"),
+            ],
+            "ct-invalid",
+        ),
+    ],
+)
+def test_reingest_reconciles_only_originally_selected_source_tracks(
+    tracks,
+    excluded_selector,
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    tmp_path: Path,
+) -> None:
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+    session = _make_identified_session(
+        session_id="sess-selected-rerun",
+        tracks=tracks,
+    )
+    fake = FakeCozytrackClient(sessions=[session])
+
+    first = ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id=session.id,
+        excluded_track_selectors=[excluded_selector],
+        client=fake,
+        duration_probe=_probe,
+    )
+    roles_before = [
+        (artifact.role, artifact.source_id)
+        for artifact in list_media_artifacts(runtime_paths.db_file, first.session_uid)
+    ]
+
+    second = ingest_session(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        cozytrack_session_id=session.id,
+        client=fake,
+        duration_probe=_probe,
+    )
+
+    assert second.session_uid == first.session_uid
+    assert [
+        (artifact.role, artifact.source_id)
+        for artifact in list_media_artifacts(runtime_paths.db_file, first.session_uid)
+    ] == roles_before
+
+
 def test_ingest_session_rejects_unknown_exclusion_before_download(
     moto_s3, app_config_factory, runtime_factory, tmp_path: Path
 ) -> None:

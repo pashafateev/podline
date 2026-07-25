@@ -349,9 +349,6 @@ def _reconcile_existing_session_roles(
     session is left untouched with a warning. Filenames and content are
     never modified.
     """
-    roles_by_track_id = _derive_participant_roles(cozytrack_session.tracks)
-    if roles_by_track_id is None:
-        return
     artifacts = [
         artifact
         for artifact in list_media_artifacts(
@@ -362,10 +359,49 @@ def _reconcile_existing_session_roles(
     if not artifacts:
         return
 
+    source_ids = []
+    for artifact in artifacts:
+        source_id = (artifact.source_id or "").strip()
+        if not source_id:
+            _log(
+                logger,
+                "Cannot verify roles for %s: artifact %s (role=%s) has no "
+                "Cozytrack source id; leaving roles unchanged",
+                existing.session_uid,
+                artifact.filename,
+                artifact.role,
+            )
+            return
+        source_ids.append(source_id)
+
+    source_id_set = set(source_ids)
+    selected_tracks = [
+        track for track in cozytrack_session.tracks if track.id in source_id_set
+    ]
+    selected_track_ids = {track.id for track in selected_tracks}
+    unmatched_source_ids = sorted(source_id_set - selected_track_ids)
+    if unmatched_source_ids:
+        _log(
+            logger,
+            "Cannot verify roles for %s: registered Cozytrack source ids do "
+            "not exist in the source session: %s; leaving roles unchanged",
+            existing.session_uid,
+            unmatched_source_ids,
+        )
+        return
+
+    # Excluded reconnect tracks are intentionally absent from the registered
+    # artifacts. Derive roles only from the persisted selection so a no-op
+    # re-ingest neither renumbers guests nor reintroduces invalid metadata
+    # from a source track the operator omitted.
+    roles_by_track_id = _derive_participant_roles(selected_tracks)
+    if roles_by_track_id is None:
+        return
+
     role_updates: Dict[str, str] = {}
     for artifact in artifacts:
         source_id = (artifact.source_id or "").strip()
-        derived_role = roles_by_track_id.get(source_id) if source_id else None
+        derived_role = roles_by_track_id.get(source_id)
         if derived_role is None:
             _log(
                 logger,
