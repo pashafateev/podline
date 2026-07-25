@@ -1,6 +1,6 @@
 from pathlib import Path
 import re
-from typing import Optional
+from typing import List, Optional
 import webbrowser
 
 import typer
@@ -30,9 +30,10 @@ from podline.auphonic import (
 )
 from podline.config import load_config
 from podline.storage import redact_url, sha256_of_file, storage_health
-from podline.cozytrack.client import CozytrackError
+from podline.cozytrack.client import CozytrackClient, CozytrackError
 from podline.cozytrack.ingest import (
     CozytrackIngestError,
+    format_session_track_table,
     ingest_session as cozytrack_ingest_session,
     list_ready_sessions_for_ingest,
 )
@@ -1525,6 +1526,16 @@ def ct_ingest_command(
     name: Optional[str] = typer.Option(
         None, "--name", help="Override the session name when building the folder slug."
     ),
+    exclude: Optional[List[str]] = typer.Option(
+        None,
+        "--exclude",
+        help="Exclude a track by displayed role or exact Cozytrack track id. Repeat as needed.",
+    ),
+    list_tracks: bool = typer.Option(
+        False,
+        "--list-tracks",
+        help="Show track roles, participants, durations, start times, and ids without downloading.",
+    ),
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
         None, "--config", help="Path to config.yaml."
@@ -1534,6 +1545,22 @@ def ct_ingest_command(
     config_path = _resolve_config_path(config)
     loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
 
+    if list_tracks:
+        try:
+            session = CozytrackClient(loaded_config).get_session(cozytrack_id)
+        except CozytrackError as exc:
+            logger.error("Cozytrack track list failed for %s: %s", cozytrack_id, exc)
+            typer.echo(f"Cozytrack error: {exc}")
+            raise typer.Exit(code=1)
+        _print_header("Cozytrack Tracks")
+        typer.echo(format_session_track_table(session))
+        typer.echo()
+        typer.echo(
+            "Exclude an irrelevant track with "
+            "'--exclude <role-or-track-id>'; repeat the option as needed."
+        )
+        return
+
     try:
         record = cozytrack_ingest_session(
             config=loaded_config,
@@ -1541,6 +1568,7 @@ def ct_ingest_command(
             db_file=runtime_paths.db_file,
             cozytrack_session_id=cozytrack_id,
             name_override=name,
+            excluded_track_selectors=exclude or [],
             logger=logger,
         )
     except (CozytrackError, CozytrackIngestError) as exc:

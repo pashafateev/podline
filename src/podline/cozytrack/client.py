@@ -47,6 +47,7 @@ class CozytrackTrack:
     status: Optional[str]
     created_at: Optional[str]
     participant_id: Optional[str] = None
+    duration_ms: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -168,6 +169,7 @@ def _parse_track(payload: Dict[str, Any]) -> CozytrackTrack:
         status=_optional_str(payload.get("status")),
         created_at=_optional_str(payload.get("createdAt")),
         participant_id=_optional_str(payload.get("participantId")),
+        duration_ms=_optional_int(payload.get("durationMs")),
     )
 
 
@@ -175,3 +177,12 @@ def _optional_str(value: Any) -> Optional[str]:
     if value is None:
         return None
     return str(value)
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise CozytrackError(f"Expected integer value, received {value!r}") from exc

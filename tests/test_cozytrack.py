@@ -479,6 +479,44 @@ def test_ingest_session_rejects_unknown_exclusion_before_download(
     assert get_session_by_cozytrack_id(runtime_paths.db_file, session.id) is None
 
 
+def test_ingest_session_more_than_four_tracks_explains_how_to_choose_exclusions(
+    moto_s3, app_config_factory, runtime_factory, tmp_path: Path
+) -> None:
+    config = app_config_factory(tmp_path, cozytrack_api_key="test-key")
+    runtime_paths = runtime_factory(config)
+    session = _make_identified_session(
+        session_id="sess-too-many",
+        tracks=[
+            ("ct-host", "host-local-ch-1", "Pasha"),
+            ("ct-a", "guest_a", "A"),
+            ("ct-b", "guest_b", "B"),
+            ("ct-c", "guest_c", "C"),
+            ("ct-d", "guest_d", "D"),
+        ],
+    )
+    fake = FakeCozytrackClient(sessions=[session])
+
+    with pytest.raises(CozytrackIngestError) as excinfo:
+        ingest_session(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            cozytrack_session_id=session.id,
+            client=fake,
+            duration_probe=_probe,
+        )
+
+    message = str(excinfo.value)
+    assert "Available Cozytrack tracks" in message
+    assert "guest4" in message
+    assert "ct-d" in message
+    assert f"pod ct-ingest {session.id} --list-tracks" in message
+    assert (
+        f"pod ct-ingest {session.id} --exclude <role-or-track-id>" in message
+    )
+    assert get_session_by_cozytrack_id(runtime_paths.db_file, session.id) is None
+
+
 def test_format_session_track_table_shows_human_choices_and_ids() -> None:
     session = CozytrackSession(
         id="sess-table",
