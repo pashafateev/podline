@@ -72,6 +72,7 @@ def app_config_factory():
                 max_poll_attempts=2,
                 preset_ids={
                     "transcript_refresh": "transcript-preset",
+                    "speakers_1": "preset-1",
                     "speakers_2": "preset-2",
                     "speakers_3": "preset-3",
                     "speakers_4": "preset-4",

@@ -662,6 +662,66 @@ def test_prepare_preview_then_start_splits_the_auphonic_flow(
     assert (workspace / "manifest.json").exists()
 
 
+def test_single_track_prepare_offset_apply_then_preview(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = session_factory(
+        runtime_paths.db_file,
+        session_uid="session-auphonic-single",
+        status="queued",
+    )
+    track = tmp_path / "Tr1.webm"
+    track.write_bytes(b"single-track-bytes")
+    artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid=session.session_uid,
+        kind="raw_track",
+        role="host1",
+        path=track,
+        duration_seconds=60.0,
+    )
+    client = FakeAuphonicClient()
+
+    prepared = prepare_session_with_auphonic(
+        config=config,
+        db_file=runtime_paths.db_file,
+        session=session,
+        client=client,
+    )
+    offset = offset_session_auphonic_production(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=prepared,
+        apply=True,
+        client=client,
+    )
+    verified = get_session(runtime_paths.db_file, session.session_uid)
+    assert verified is not None
+    preview = preview_prepared_session_with_auphonic(
+        config=config,
+        db_file=runtime_paths.db_file,
+        session=verified,
+        client=client,
+    )
+
+    assert client.created == [("010124_013143", 1, "preset-1")]
+    assert offset.plan.reference_asset.role == "host1"
+    assert offset.plan.targets == []
+    assert offset.track_states == []
+    assert client.offset_updates == []
+    assert verified.auphonic_offsets_verified_production_id == "prod-123"
+    assert preview.session.status == "auphonic_previewed"
+
+
 def test_preview_requires_offsets_verified_for_current_production(
     app_config_factory, runtime_factory, session_factory, tmp_path
 ) -> None:
