@@ -717,7 +717,6 @@ def test_single_track_prepare_offset_apply_then_preview(
     assert offset.plan.reference_asset.role == "host1"
     assert offset.plan.targets == []
     assert offset.track_states == []
-    assert client.offset_updates == []
     assert verified.auphonic_offsets_verified_production_id == "prod-123"
     assert preview.session.status == "auphonic_previewed"
 

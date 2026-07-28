@@ -1848,10 +1848,6 @@ def plan_session_auphonic_offset(
         _spoken_raw_tracks(config, db_file, session.session_uid),
         key=lambda artifact: _recorder_order_key(artifact.role),
     )
-    if len(tracks) < 2:
-        raise AuphonicError(
-            f"Session {session.session_uid} must have at least 2 audio assets to compute an Auphonic offset; found {len(tracks)}"
-        )
     if not session.auphonic_production_id:
         raise AuphonicError(
             f"Session {session.session_uid} has no stored Auphonic production id"
