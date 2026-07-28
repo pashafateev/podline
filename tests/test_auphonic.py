@@ -1804,6 +1804,46 @@ def test_session_offset_skips_aligned_remote_and_updates_shorter_remote(
     ]
 
 
+def test_session_offset_apply_recovers_nonzero_aligned_track(
+    app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session, cozytrack_client = _cozytrack_offset_session(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        tracks=[
+            ("host1", "Tr1.webm", 100.0, "host"),
+            ("host2", "Tr2.webm", 100.0, "guest-aligned"),
+            ("guest1", "Tr3.webm", 97.25, "guest-late"),
+        ],
+    )
+    client = FakeOffsetAuphonicClient(tracks=_three_auphonic_tracks())
+    client.tracks[1]["offset"] = 4.0
+
+    result = offset_session_auphonic_production(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        apply=True,
+        client=client,
+        cozytrack_client=cozytrack_client,
+    )
+
+    assert result.applied is True
+    assert [target.asset.filename for target in result.plan.targets] == [
+        "Tr2.webm",
+        "Tr3.webm",
+    ]
+    assert client.offset_updates == [
+        ("prod-123", "Remote 1", 0.0),
+        ("prod-123", "Remote 2", pytest.approx(2.75)),
+    ]
+
+
 def test_session_offset_skips_aligned_local_channel(
     app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
 ) -> None:
@@ -2376,7 +2416,7 @@ def test_start_rejects_offsets_changed_after_verification(
     assert client.started == []
 
 
-def test_session_offset_apply_verifies_reference_track_remains_at_zero(
+def test_session_offset_apply_recovers_nonzero_reference_track(
     app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
 ) -> None:
     config = app_config_factory(tmp_path)
@@ -2387,19 +2427,27 @@ def test_session_offset_apply_verifies_reference_track_remains_at_zero(
     client = FakeOffsetAuphonicClient()
     client.tracks[0]["offset"] = 2.0
 
-    with pytest.raises(AuphonicError, match="expected 0.000s"):
-        offset_session_auphonic_production(
-            config=config,
-            runtime_paths=runtime_paths,
-            db_file=runtime_paths.db_file,
-            session=session,
-            apply=True,
-            client=client,
-        )
+    result = offset_session_auphonic_production(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        apply=True,
+        client=client,
+    )
 
     updated = get_session(runtime_paths.db_file, session.session_uid)
+    assert result.applied is True
+    assert [target.asset.filename for target in result.plan.targets] == [
+        "Tr1.webm",
+        "Tr2.webm",
+    ]
+    assert client.offset_updates == [
+        ("prod-123", "Jonathan", 0.0),
+        ("prod-123", "Pasha", pytest.approx(1.801)),
+    ]
     assert updated is not None
-    assert updated.auphonic_offsets_verified_production_id is None
+    assert updated.auphonic_offsets_verified_production_id == "prod-123"
 
 
 def test_session_offset_fails_when_production_is_not_change_allowed(
