@@ -1896,16 +1896,15 @@ def plan_session_auphonic_offset(
     # Cozytrack starts each track's recorder sequentially and stops them all
     # together, so every shorter track — additional host-local channels
     # included — started late by exactly its duration shortfall against the
-    # reference. Only the reference stays at zero.
-    for item in asset_durations:
-        if item is reference:
-            continue
+    # reference. Reference/equal-duration tracks stay at zero, but are included
+    # as repair targets when the remote production has drifted away from zero.
+    planned_items = [
+        item for item in asset_durations if item is not reference
+    ] + [reference]
+    for item in planned_items:
         offset_decimal = Decimal(str(reference.duration_seconds)) - Decimal(
             str(item.duration_seconds)
         )
-        if offset_decimal == 0:
-            aligned_assets.append(item.asset)
-            continue
         target_track = _find_multi_input_track_for_asset(
             inspected_tracks, item.asset
         )
@@ -1914,6 +1913,12 @@ def plan_session_auphonic_offset(
             raise AuphonicError(
                 f"Matched Auphonic track for {item.asset.filename} has no id; inspected tracks: {_format_track_choices(inspected_tracks)}"
             )
+        if offset_decimal == 0 and _track_offset_matches(
+            target_track, Decimal("0")
+        ):
+            if item is not reference:
+                aligned_assets.append(item.asset)
+            continue
         targets.append(
             AuphonicOffsetTarget(
                 asset=item.asset,
@@ -1930,6 +1935,21 @@ def plan_session_auphonic_offset(
         reference_asset=reference.asset,
         targets=targets,
         aligned_assets=aligned_assets,
+    )
+
+
+def _track_offset_matches(track: Dict, expected_offset: Decimal) -> bool:
+    raw_offset = track.get("offset")
+    try:
+        actual_offset = (
+            Decimal("0")
+            if raw_offset in (None, "")
+            else Decimal(str(raw_offset))
+        )
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    return actual_offset.is_finite() and (
+        abs(actual_offset - expected_offset) <= Decimal("0.0005")
     )
 
 

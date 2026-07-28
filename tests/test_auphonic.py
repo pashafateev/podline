@@ -2439,12 +2439,12 @@ def test_session_offset_apply_recovers_nonzero_reference_track(
     updated = get_session(runtime_paths.db_file, session.session_uid)
     assert result.applied is True
     assert [target.asset.filename for target in result.plan.targets] == [
-        "Tr1.webm",
         "Tr2.webm",
+        "Tr1.webm",
     ]
     assert client.offset_updates == [
-        ("prod-123", "Jonathan", 0.0),
         ("prod-123", "Pasha", pytest.approx(1.801)),
+        ("prod-123", "Jonathan", 0.0),
     ]
     assert updated is not None
     assert updated.auphonic_offsets_verified_production_id == "prod-123"
