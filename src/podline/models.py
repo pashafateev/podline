@@ -69,6 +69,7 @@ class SessionRecord:
     auphonic_production_id: Optional[str]
     auphonic_offsets_verified_production_id: Optional[str]
     transcript_refresh_production_id: Optional[str]
+    transcript_refresh_source_sha256: Optional[str]
     transcript_refreshed_from_sha256: Optional[str]
     pre_edit_master_path: Optional[str]
     transcript_path: Optional[str]

@@ -24,6 +24,7 @@ def list_sessions(db_file: str) -> List[SessionRecord]:
            failure_reason, failed_at_stage, auphonic_production_id,
            auphonic_offsets_verified_production_id,
            transcript_refresh_production_id,
+           transcript_refresh_source_sha256,
            transcript_refreshed_from_sha256,
            pre_edit_master_path, transcript_path, final_master_path,
            cozytrack_session_id, created_at, updated_at
@@ -42,6 +43,7 @@ def get_session(db_file: str, session_uid: str) -> Optional[SessionRecord]:
            failure_reason, failed_at_stage, auphonic_production_id,
            auphonic_offsets_verified_production_id,
            transcript_refresh_production_id,
+           transcript_refresh_source_sha256,
            transcript_refreshed_from_sha256,
            pre_edit_master_path, transcript_path, final_master_path,
            cozytrack_session_id, created_at, updated_at
@@ -77,6 +79,7 @@ def get_session_by_fingerprint(
            failure_reason, failed_at_stage, auphonic_production_id,
            auphonic_offsets_verified_production_id,
            transcript_refresh_production_id,
+           transcript_refresh_source_sha256,
            transcript_refreshed_from_sha256,
            pre_edit_master_path, transcript_path, final_master_path,
            cozytrack_session_id, created_at, updated_at
@@ -363,6 +366,8 @@ def reset_session_to_queued(
             SET status = ?,
                 auphonic_production_id = NULL,
                 auphonic_offsets_verified_production_id = NULL,
+                failure_reason = NULL,
+                failed_at_stage = NULL,
                 updated_at = ?
             WHERE session_uid = ? AND status = ?
             """,
@@ -429,16 +434,19 @@ def record_transcript_refresh_production(
     session_uid: str,
     status: str,
     production_id: str,
+    final_master_sha256: str,
     timestamp: str,
 ) -> None:
     with connect(db_file) as connection:
         cursor = connection.execute(
             """
             UPDATE sessions
-            SET transcript_refresh_production_id = ?, updated_at = ?
+            SET transcript_refresh_production_id = ?,
+                transcript_refresh_source_sha256 = ?,
+                updated_at = ?
             WHERE session_uid = ? AND transcript_refresh_production_id IS NULL
             """,
-            (production_id, timestamp, session_uid),
+            (production_id, final_master_sha256, timestamp, session_uid),
         )
         if cursor.rowcount != 1:
             raise RuntimeError(
@@ -473,7 +481,9 @@ def discard_transcript_refresh_production(
         cursor = connection.execute(
             """
             UPDATE sessions
-            SET transcript_refresh_production_id = NULL, updated_at = ?
+            SET transcript_refresh_production_id = NULL,
+                transcript_refresh_source_sha256 = NULL,
+                updated_at = ?
             WHERE session_uid = ? AND transcript_refresh_production_id = ?
             """,
             (timestamp, session_uid, production_id),
@@ -522,13 +532,22 @@ def complete_transcript_refresh(
             """
             UPDATE sessions
             SET transcript_refresh_production_id = NULL,
+                transcript_refresh_source_sha256 = NULL,
                 transcript_refreshed_from_sha256 = ?,
                 updated_at = ?,
                 failure_reason = NULL,
                 failed_at_stage = NULL
-            WHERE session_uid = ? AND transcript_refresh_production_id = ?
+            WHERE session_uid = ?
+              AND transcript_refresh_production_id = ?
+              AND transcript_refresh_source_sha256 = ?
             """,
-            (final_master_sha256, timestamp, session_uid, production_id),
+            (
+                final_master_sha256,
+                timestamp,
+                session_uid,
+                production_id,
+                final_master_sha256,
+            ),
         )
         if cursor.rowcount != 1:
             raise RuntimeError(
@@ -572,6 +591,9 @@ def _row_to_session(row) -> SessionRecord:
         ],
         transcript_refresh_production_id=row[
             "transcript_refresh_production_id"
+        ],
+        transcript_refresh_source_sha256=row[
+            "transcript_refresh_source_sha256"
         ],
         transcript_refreshed_from_sha256=row[
             "transcript_refreshed_from_sha256"
@@ -661,6 +683,7 @@ def get_session_by_cozytrack_id(
            failure_reason, failed_at_stage, auphonic_production_id,
            auphonic_offsets_verified_production_id,
            transcript_refresh_production_id,
+           transcript_refresh_source_sha256,
            transcript_refreshed_from_sha256,
            pre_edit_master_path, transcript_path, final_master_path,
            cozytrack_session_id, created_at, updated_at

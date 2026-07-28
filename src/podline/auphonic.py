@@ -525,7 +525,7 @@ def prepare_session_with_auphonic(
             detail=f"Auphonic processing failed: {exc}",
             auphonic_production_id=production_id,
             failure_reason=str(exc),
-            failed_at_stage="auphonic",
+            failed_at_stage="auphonic_prepare",
         )
         raise
 
@@ -706,7 +706,7 @@ def start_prepared_session_with_auphonic(
             detail=f"Auphonic processing failed: {exc}",
             auphonic_production_id=production_id,
             failure_reason=str(exc),
-            failed_at_stage="auphonic",
+            failed_at_stage="auphonic_start",
         )
         raise
 
@@ -744,6 +744,23 @@ def refresh_transcript_with_auphonic(
         )
 
     if production_id:
+        if session.transcript_refresh_source_sha256 != final_master.sha256:
+            discard_transcript_refresh_production(
+                db_file,
+                session_uid=session.session_uid,
+                status=session.status,
+                production_id=production_id,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                detail=(
+                    "discarded stale Auphonic transcript refresh production "
+                    f"{production_id} after the final master changed"
+                ),
+            )
+            raise AuphonicError(
+                f"Session {session.session_uid} final master changed after Auphonic "
+                f"transcript refresh production {production_id} was created; the "
+                "stale production was discarded, so run transcript-refresh again"
+            )
         _log(
             logger,
             "Resuming Auphonic transcript refresh production %s for %s",
@@ -799,6 +816,7 @@ def refresh_transcript_with_auphonic(
             session_uid=session.session_uid,
             status=session.status,
             production_id=production_id,
+            final_master_sha256=final_master.sha256,
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
         client.start_production(production_id)
@@ -859,6 +877,33 @@ def _spoken_raw_tracks(
             f"No raw track artifacts registered for session {session_uid}"
         )
     return tracks
+
+
+def _validate_attached_source_tracks(
+    config: AppConfig,
+    db_file: str,
+    session_uid: str,
+    multi_input_files: List[Dict],
+) -> None:
+    expected_tracks = _spoken_raw_tracks(config, db_file, session_uid)
+    attached_tracks = [
+        track for track in multi_input_files if track.get("input_file")
+    ]
+    if len(attached_tracks) != len(expected_tracks):
+        raise AuphonicError(
+            f"Auphonic production does not have all attached source tracks for "
+            f"session {session_uid}: expected {len(expected_tracks)}, found "
+            f"{len(attached_tracks)}; inspected tracks: "
+            f"{_format_track_choices(multi_input_files)}"
+        )
+    try:
+        for artifact in expected_tracks:
+            _find_multi_input_track_for_asset(attached_tracks, artifact)
+    except AuphonicError as exc:
+        raise AuphonicError(
+            f"Auphonic production does not have the expected attached source tracks "
+            f"for session {session_uid}: {exc}"
+        ) from exc
 
 
 def _artifact_key(config: AppConfig, artifact: MediaArtifactRecord) -> str:
@@ -1886,14 +1931,20 @@ def reset_session_auphonic_production(
     created before a role fix keeps the old wiring; offsets applied before a
     duration fix keep the old alignment. Resetting returns the session to
     queued for a fresh prepare/offset/preview cycle. The abandoned
-    production is left untouched on Auphonic; only editing states before
-    start are resettable — once outputs are persisted a reset would orphan
-    downstream artifacts.
+    production is left untouched on Auphonic; editing states before start
+    and failed prepares with an incomplete production are resettable. Once
+    outputs are persisted a reset would orphan downstream artifacts.
     """
-    if session.status not in _AUPHONIC_RESETTABLE_STATUSES:
+    failed_prepare = (
+        session.status == SessionStatus.FAILED.value
+        and session.failed_at_stage == "auphonic_prepare"
+        and bool(session.auphonic_production_id)
+    )
+    if session.status not in _AUPHONIC_RESETTABLE_STATUSES and not failed_prepare:
         raise AuphonicError(
             f"Session {session.session_uid} must be auphonic_prepared or "
-            f"auphonic_previewed to reset; status is {session.status}"
+            "auphonic_previewed, or a failed auphonic_prepare with a stored "
+            f"production to reset; status is {session.status}"
         )
     production_id = session.auphonic_production_id or "none"
     reset_session_to_queued(
@@ -1975,6 +2026,29 @@ def reconcile_production_to_session(
             failed_at_stage=None,
         )
     elif details.get("start_allowed"):
+        try:
+            _validate_attached_source_tracks(
+                config,
+                db_file,
+                session.session_uid,
+                details.get("multi_input_files") or [],
+            )
+        except AuphonicError as exc:
+            if current_state == SessionStatus.FAILED.value:
+                update_session_status(
+                    db_file,
+                    session_uid=session.session_uid,
+                    from_state=current_state,
+                    to_state=current_state,
+                    timestamp=timestamp,
+                    detail=(
+                        "reconciled incomplete Auphonic prepare; reset is required"
+                    ),
+                    auphonic_production_id=production_id,
+                    failure_reason=str(exc),
+                    failed_at_stage="auphonic_prepare",
+                )
+            raise
         # Auphonic has no notion of "previewed"; both prepared and previewed
         # productions report start_allowed=True. Preserve the local previewed
         # marker so sync doesn't silently force a re-preview before start.

@@ -125,6 +125,7 @@ def session_factory():
         auphonic_production_id=None,
         auphonic_offsets_verified_production_id=None,
         transcript_refresh_production_id=None,
+        transcript_refresh_source_sha256=None,
         transcript_refreshed_from_sha256=None,
         cozytrack_session_id=None,
     ):
@@ -136,9 +137,10 @@ def session_factory():
                     status, auphonic_production_id,
                     auphonic_offsets_verified_production_id,
                     transcript_refresh_production_id,
+                    transcript_refresh_source_sha256,
                     transcript_refreshed_from_sha256,
                     cozytrack_session_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_uid,
@@ -149,6 +151,7 @@ def session_factory():
                     auphonic_production_id,
                     auphonic_offsets_verified_production_id,
                     transcript_refresh_production_id,
+                    transcript_refresh_source_sha256,
                     transcript_refreshed_from_sha256,
                     cozytrack_session_id,
                     "now",

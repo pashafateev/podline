@@ -36,12 +36,27 @@ def resolve_next_action(
     transcript_refresh_id = getattr(
         session, "transcript_refresh_production_id", None
     )
+    transcript_refresh_source = getattr(
+        session, "transcript_refresh_source_sha256", None
+    )
     transcript_refreshed_from = getattr(
         session, "transcript_refreshed_from_sha256", None
     )
 
     if status == SessionStatus.FAILED.value:
-        if production_id and getattr(session, "failed_at_stage", None) == "auphonic":
+        if (
+            production_id
+            and getattr(session, "failed_at_stage", None) == "auphonic_prepare"
+        ):
+            return NextAction(
+                GuidanceKind.RECOVERY,
+                "Abandon the incomplete Auphonic production and rebuild it.",
+                f"pod auphonic-reset {session_uid}",
+            )
+        if production_id and getattr(session, "failed_at_stage", None) in {
+            "auphonic",
+            "auphonic_start",
+        }:
             return NextAction(
                 GuidanceKind.RECOVERY,
                 "Reconcile the stored Auphonic production before retrying anything.",
@@ -128,6 +143,13 @@ def resolve_next_action(
                 "The finalized session has no current final-master artifact.",
             )
         if transcript_refresh_id:
+            if transcript_refresh_source != final_master_sha256:
+                return NextAction(
+                    GuidanceKind.RECOVERY,
+                    "The final master changed after this transcript refresh started; "
+                    "discard the stale production and retry.",
+                    f"pod transcript-refresh {session_uid}",
+                )
             return NextAction(
                 GuidanceKind.RECOVERY,
                 "Resume the saved Auphonic transcript-refresh production.",

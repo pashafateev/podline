@@ -645,6 +645,10 @@ def status(
                 session.transcript_refresh_production_id or "none",
             ),
             (
+                "transcript_refresh_source_sha256",
+                session.transcript_refresh_source_sha256 or "none",
+            ),
+            (
                 "transcript_refreshed_from",
                 session.transcript_refreshed_from_sha256 or "none",
             ),

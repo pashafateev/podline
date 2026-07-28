@@ -26,6 +26,7 @@ def _session(**changes) -> SessionRecord:
         auphonic_production_id=None,
         auphonic_offsets_verified_production_id=None,
         transcript_refresh_production_id=None,
+        transcript_refresh_source_sha256=None,
         transcript_refreshed_from_sha256=None,
         pre_edit_master_path=None,
         transcript_path=None,
@@ -224,9 +225,26 @@ def test_interrupted_transcript_refresh_guides_safe_resume() -> None:
         _session(
             status="ready_for_draft",
             transcript_refresh_production_id="prod-transcript-refresh",
+            transcript_refresh_source_sha256=FINAL_MASTER_SHA256,
         ),
         final_master_sha256=FINAL_MASTER_SHA256,
     )
 
     assert action.kind is GuidanceKind.RECOVERY
     assert action.command == f"pod transcript-refresh {SESSION_UID}"
+    assert "Resume" in action.instruction
+
+
+def test_stale_transcript_refresh_guides_discard_before_retry() -> None:
+    action = resolve_next_action(
+        _session(
+            status="ready_for_draft",
+            transcript_refresh_production_id="prod-transcript-refresh",
+            transcript_refresh_source_sha256="older-master-sha256",
+        ),
+        final_master_sha256=FINAL_MASTER_SHA256,
+    )
+
+    assert action.kind is GuidanceKind.RECOVERY
+    assert action.command == f"pod transcript-refresh {SESSION_UID}"
+    assert "changed" in action.instruction

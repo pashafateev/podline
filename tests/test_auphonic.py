@@ -2384,6 +2384,7 @@ def test_reconcile_rejects_startable_production_with_missing_source_track(
     unchanged = get_session(runtime_paths.db_file, session.session_uid)
     assert unchanged is not None
     assert unchanged.status == "failed"
+    assert unchanged.failed_at_stage == "auphonic_prepare"
 
 
 def test_reconcile_preserves_previewed_status(
