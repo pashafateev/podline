@@ -428,6 +428,61 @@ def record_auphonic_offsets_verified(
         connection.commit()
 
 
+def begin_auphonic_offset_apply(
+    db_file: str,
+    *,
+    session_uid: str,
+    status: str,
+    production_id: str,
+    timestamp: str,
+) -> str:
+    """Invalidate prior verification before the first remote offset mutation."""
+    apply_status = (
+        SessionStatus.AUPHONIC_PREPARED.value
+        if status == SessionStatus.AUPHONIC_PREVIEWED.value
+        else status
+    )
+    with connect(db_file) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE sessions
+            SET status = ?,
+                auphonic_offsets_verified_production_id = NULL,
+                updated_at = ?
+            WHERE session_uid = ?
+              AND status = ?
+              AND auphonic_production_id = ?
+            """,
+            (
+                apply_status,
+                timestamp,
+                session_uid,
+                status,
+                production_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                f"Could not begin Auphonic offset apply for {session_uid}; "
+                "the production or session status changed"
+            )
+        connection.execute(
+            """
+            INSERT INTO events (session_uid, from_state, to_state, timestamp, detail)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                session_uid,
+                status,
+                apply_status,
+                timestamp,
+                f"invalidated offset verification before applying production {production_id}",
+            ),
+        )
+        connection.commit()
+    return apply_status
+
+
 def clear_auphonic_offsets_verified(
     db_file: str,
     *,

@@ -38,6 +38,7 @@ from podline.models import (
     SessionStatus,
 )
 from podline.repository import (
+    begin_auphonic_offset_apply,
     clear_auphonic_offsets_verified,
     complete_transcript_refresh,
     delete_media_artifacts,
@@ -1936,6 +1937,13 @@ def offset_session_auphonic_production(
     if not apply:
         return AuphonicOffsetResult(plan=plan, applied=False, track_states=[])
 
+    verification_status = begin_auphonic_offset_apply(
+        db_file,
+        session_uid=session.session_uid,
+        status=session.status,
+        production_id=plan.production_id,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+    )
     for target in plan.targets:
         client.update_multi_input_file_offset(
             plan.production_id, target.track_id, target.offset_seconds
@@ -1989,7 +1997,7 @@ def offset_session_auphonic_production(
     record_auphonic_offsets_verified(
         db_file,
         session_uid=session.session_uid,
-        status=session.status,
+        status=verification_status,
         production_id=plan.production_id,
         timestamp=datetime.now(timezone.utc).isoformat(),
     )

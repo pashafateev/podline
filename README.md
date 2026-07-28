@@ -115,16 +115,18 @@ pod auphonic-inspect --session @1
 Run `pod auphonic-offset` before preview/start. Durations come from audio packet timing recorded at ingest. Cozytrack starts each track's recorder sequentially and stops them all together, so a track's start offset equals its duration shortfall against the reference (the longest track). Every shorter track is offset — remote tracks and additional host-local channels alike; for sessions with more than 2 tracks, stable participant identity validates that all registered tracks belong to a topology containing both host-local and remote channels. The longest validated track is the reference even when a remote recorder started first. For those sessions, duration-derived offsets must also agree with Cozytrack recorder creation times within 0.5 seconds, preventing a delayed stop from being mistaken for an early start. Two-track sessions remain duration-derived even when Cozytrack topology is available. Tracks already equal to the reference are reported as aligned and skipped. The command updates the prepared production and does not start processing.
 
 The dry run ends with `Waiting on you` and the exact `--apply` command. After
-`--apply`, Podline reinspects every Auphonic track and records the production ID
-only if all applied and zero-offset values match the plan. Preview refuses to
-advance unless that checkpoint matches the current production. Immediately
-before start, Podline reinspects every remote offset against the stored source
-durations. If anything changed after verification, it clears the checkpoint and
-returns the session to `auphonic_prepared`, requiring offset verification and
-preview again. Resetting with `pod auphonic-reset` clears the checkpoint along
-with the abandoned production. The old combined `pod auphonic` shortcut is
-intentionally rejected because it cannot preserve the offset-verification and
-preview gates.
+`--apply`, Podline clears any prior verification checkpoint before changing the
+remote production and returns a previously previewed session to
+`auphonic_prepared`. It then reinspects every Auphonic track and records the
+production ID only if all applied and zero-offset values match the plan. Preview
+refuses to advance unless that checkpoint matches the current production.
+Immediately before start, Podline reinspects every remote offset against the
+stored source durations. If anything changed after verification, it clears the
+checkpoint and returns the session to `auphonic_prepared`, requiring offset
+verification and preview again. Resetting with `pod auphonic-reset` clears the
+checkpoint along with the abandoned production. The old combined `pod auphonic`
+shortcut is intentionally rejected because it cannot preserve the
+offset-verification and preview gates.
 
 3. Start Auphonic after previewing the edit page
 ```bash
