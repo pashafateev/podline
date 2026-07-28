@@ -141,6 +141,17 @@ class FakeAuphonicClient:
         }
 
 
+class FakePartialAttachAuphonicClient(FakeAuphonicClient):
+    def attach_service_input(
+        self, production_id: str, track_id: str, service_id: str, input_key: str
+    ):
+        if self.attached:
+            raise AuphonicError("second track attachment failed")
+        return super().attach_service_input(
+            production_id, track_id, service_id, input_key
+        )
+
+
 class FakeDoneAuphonicClient(FakeAuphonicClient):
     def get_production(self, production_id: str):
         payload = super().get_production(production_id)
@@ -474,6 +485,45 @@ def test_prepare_attaches_s3_tracks_through_service(
     assert all(key.startswith("sessions/") for key in attached_keys)
     assert client.started == []
     assert client.downloads == []
+
+
+def test_partial_prepare_failure_routes_to_safe_reset(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _queued_session_with_tracks(
+        tmp_path, runtime_paths, session_factory, artifact_registrar
+    )
+
+    with pytest.raises(AuphonicError, match="second track attachment failed"):
+        prepare_session_with_auphonic(
+            config=config,
+            db_file=runtime_paths.db_file,
+            session=session,
+            client=FakePartialAttachAuphonicClient(),
+        )
+
+    failed = get_session(runtime_paths.db_file, session.session_uid)
+    assert failed is not None
+    assert failed.status == "failed"
+    assert failed.failed_at_stage == "auphonic_prepare"
+    assert failed.auphonic_production_id == "prod-123"
+
+    reset = reset_session_auphonic_production(
+        db_file=runtime_paths.db_file,
+        session=failed,
+    )
+
+    assert reset.status == "queued"
+    assert reset.auphonic_production_id is None
+    assert reset.failure_reason is None
+    assert reset.failed_at_stage is None
 
 
 def test_prepare_fails_when_artifact_lives_in_wrong_bucket(
@@ -2292,6 +2342,50 @@ def test_reconcile_done_production_persists_outputs(
     assert workspace_path_for(runtime_paths, session.session_uid).exists()
 
 
+def test_reconcile_rejects_startable_production_with_missing_source_track(
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _queued_session_with_tracks(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
+        status="failed",
+        auphonic_production_id="prod-123",
+    )
+    raw_tracks = list_media_artifacts(
+        runtime_paths.db_file, session.session_uid, kind="raw_track"
+    )
+    client = FakeAuphonicClient()
+    client.tracks = [
+        {
+            "id": "Jonathan",
+            "type": "multitrack",
+            "input_file": raw_tracks[0].s3_uri.split("/", 3)[-1],
+        }
+    ]
+
+    with pytest.raises(AuphonicError, match="attached source tracks"):
+        reconcile_production_to_session(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=session,
+            production_id="prod-123",
+            client=client,
+        )
+
+    unchanged = get_session(runtime_paths.db_file, session.session_uid)
+    assert unchanged is not None
+    assert unchanged.status == "failed"
+
+
 def test_reconcile_preserves_previewed_status(
     moto_s3,
     app_config_factory,
@@ -2487,6 +2581,11 @@ def test_refresh_transcript_resumes_started_production_after_local_failure(
     interrupted = get_session(runtime_paths.db_file, session.session_uid)
     assert interrupted is not None
     assert interrupted.transcript_refresh_production_id == "prod-refresh"
+    final_master = get_media_artifact(
+        runtime_paths.db_file, session.session_uid, kind="final_master"
+    )
+    assert final_master is not None
+    assert interrupted.transcript_refresh_source_sha256 == final_master.sha256
 
     updated = refresh_transcript_with_auphonic(
         config=config,
@@ -2499,6 +2598,61 @@ def test_refresh_transcript_resumes_started_production_after_local_failure(
     assert len(client.single_created) == 1
     assert client.started == ["prod-refresh"]
     assert updated.transcript_refresh_production_id is None
+    assert updated.transcript_refresh_source_sha256 is None
+
+
+def test_refresh_transcript_discards_resume_when_final_master_changed(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _ready_for_draft_session(
+        tmp_path, runtime_paths, session_factory, artifact_registrar
+    )
+    client = FakeResumableTranscriptRefreshClient()
+
+    with pytest.raises(AuphonicError, match="poll interrupted"):
+        refresh_transcript_with_auphonic(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=session,
+            client=client,
+        )
+
+    interrupted = get_session(runtime_paths.db_file, session.session_uid)
+    assert interrupted is not None
+    replacement_master = tmp_path / "replacement-final-master.mp3"
+    replacement_master.write_bytes(b"replacement-final-master")
+    replacement = artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid=session.session_uid,
+        kind="final_master",
+        path=replacement_master,
+    )
+
+    with pytest.raises(AuphonicError, match="final master changed"):
+        refresh_transcript_with_auphonic(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=interrupted,
+            client=client,
+        )
+
+    discarded = get_session(runtime_paths.db_file, session.session_uid)
+    assert discarded is not None
+    assert discarded.transcript_refresh_production_id is None
+    assert discarded.transcript_refresh_source_sha256 is None
+    assert discarded.transcript_refreshed_from_sha256 != replacement.sha256
+    assert len(client.single_created) == 1
+    assert client.downloads == []
 
 
 def test_pair_tracks_orders_fallback_by_recorder_position() -> None:

@@ -155,6 +155,18 @@ EPISODE_METADATA = EpisodeRecord(
         (
             _session(
                 status="failed",
+                failed_at_stage="auphonic_prepare",
+                failure_reason="second track attachment failed",
+                auphonic_production_id=PRODUCTION_ID,
+            ),
+            None,
+            None,
+            GuidanceKind.RECOVERY,
+            f"pod auphonic-reset {SESSION_UID}",
+        ),
+        (
+            _session(
+                status="failed",
                 failed_at_stage="auphonic",
                 failure_reason="poll interrupted",
                 auphonic_production_id=PRODUCTION_ID,
