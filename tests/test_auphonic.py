@@ -2165,6 +2165,67 @@ def test_session_offset_apply_does_not_checkpoint_unverified_remote_value(
     assert updated.auphonic_offsets_verified_production_id is None
 
 
+def test_session_offset_reapply_clears_checkpoint_before_partial_failure(
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _offset_session(
+        tmp_path, runtime_paths, session_factory, artifact_registrar
+    )
+    client = FakeOffsetAuphonicClient()
+    offset_session_auphonic_production(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        apply=True,
+        client=client,
+    )
+    verified = get_session(runtime_paths.db_file, session.session_uid)
+    assert verified is not None
+    preview = preview_prepared_session_with_auphonic(
+        config=config,
+        db_file=runtime_paths.db_file,
+        session=verified,
+        client=client,
+    )
+
+    def mutate_then_fail(production_id: str, track_id: str, offset: float):
+        for track in client.tracks:
+            if track.get("id") == track_id:
+                track["offset"] = 9.0
+        raise AuphonicError("partial offset update failure")
+
+    client.update_multi_input_file_offset = mutate_then_fail
+
+    with pytest.raises(AuphonicError, match="partial offset update failure"):
+        offset_session_auphonic_production(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=preview.session,
+            apply=True,
+            client=client,
+        )
+
+    invalidated = get_session(runtime_paths.db_file, session.session_uid)
+    assert invalidated is not None
+    assert invalidated.status == "auphonic_prepared"
+    assert invalidated.auphonic_offsets_verified_production_id is None
+    with pytest.raises(AuphonicError, match="offsets have not been verified"):
+        preview_prepared_session_with_auphonic(
+            config=config,
+            db_file=runtime_paths.db_file,
+            session=invalidated,
+            client=client,
+        )
+
+
 def test_start_rejects_offsets_changed_after_verification(
     app_config_factory,
     runtime_factory,
