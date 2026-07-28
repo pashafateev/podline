@@ -112,6 +112,10 @@ pod auphonic-preview @1
 pod auphonic-inspect --session @1
 ```
 
+If Auphonic creation fails before returning a production ID, the session remains
+queued and `pod status` safely recommends retrying prepare. Failures after a
+production exists are persisted for recovery with `pod auphonic-reset`.
+
 Run `pod auphonic-offset` before preview/start. Durations come from audio packet timing recorded at ingest. A single-track production is verified at offset zero without a remote update; configure its Auphonic preset under `auphonic.preset_ids.speakers_1`. Cozytrack starts each track's recorder sequentially and stops them all together, so a track's start offset equals its duration shortfall against the reference (the longest track). Every shorter track is offset — remote tracks and additional host-local channels alike; for sessions with more than 2 tracks, stable participant identity validates that all registered tracks belong to a topology containing both host-local and remote channels. The longest validated track is the reference even when a remote recorder started first. For those sessions, duration-derived offsets must also agree with Cozytrack recorder creation times within 0.5 seconds, preventing a delayed stop from being mistaken for an early start. Two-track sessions remain duration-derived even when Cozytrack topology is available. Tracks already equal to the reference are reported as aligned and skipped. The command updates the prepared production and does not start processing.
 
 The dry run ends with `Waiting on you` and the exact `--apply` command. After

@@ -519,17 +519,18 @@ def prepare_session_with_auphonic(
         )
     except Exception as exc:
         _log(logger, "Auphonic prepare failed for %s: %s", session.session_uid, exc)
-        update_session_status(
-            db_file,
-            session_uid=session.session_uid,
-            from_state=session.status,
-            to_state=SessionStatus.FAILED.value,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            detail=f"Auphonic processing failed: {exc}",
-            auphonic_production_id=production_id,
-            failure_reason=str(exc),
-            failed_at_stage="auphonic_prepare",
-        )
+        if production_id is not None:
+            update_session_status(
+                db_file,
+                session_uid=session.session_uid,
+                from_state=session.status,
+                to_state=SessionStatus.FAILED.value,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                detail=f"Auphonic processing failed: {exc}",
+                auphonic_production_id=production_id,
+                failure_reason=str(exc),
+                failed_at_stage="auphonic_prepare",
+            )
         raise
 
     updated = get_session(db_file, session.session_uid)
