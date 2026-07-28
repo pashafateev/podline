@@ -160,6 +160,13 @@ class FakePartialAttachAuphonicClient(FakeAuphonicClient):
         )
 
 
+class FakeCreateFailureAuphonicClient(FakeAuphonicClient):
+    def create_production(
+        self, *, title: str, track_count: int, preset_id: str
+    ) -> AuphonicPreparedProduction:
+        raise AuphonicError("production creation unavailable")
+
+
 class FakeDoneAuphonicClient(FakeAuphonicClient):
     def get_production(self, production_id: str):
         payload = super().get_production(production_id)
@@ -502,6 +509,43 @@ def test_prepare_attaches_s3_tracks_through_service(
     assert all(key.startswith("sessions/") for key in attached_keys)
     assert client.started == []
     assert client.downloads == []
+
+
+def test_prepare_creation_failure_leaves_session_queued_for_retry(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _queued_session_with_tracks(
+        tmp_path, runtime_paths, session_factory, artifact_registrar
+    )
+
+    with pytest.raises(AuphonicError, match="production creation unavailable"):
+        prepare_session_with_auphonic(
+            config=config,
+            db_file=runtime_paths.db_file,
+            session=session,
+            client=FakeCreateFailureAuphonicClient(),
+        )
+
+    retryable = get_session(runtime_paths.db_file, session.session_uid)
+    assert retryable is not None
+    assert retryable.status == "queued"
+    assert retryable.auphonic_production_id is None
+    assert retryable.failed_at_stage is None
+
+    prepared = prepare_session_with_auphonic(
+        config=config,
+        db_file=runtime_paths.db_file,
+        session=retryable,
+        client=FakeAuphonicClient(),
+    )
+    assert prepared.status == "auphonic_prepared"
 
 
 def test_partial_prepare_failure_routes_to_safe_reset(
