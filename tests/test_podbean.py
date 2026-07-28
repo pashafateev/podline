@@ -155,6 +155,64 @@ def test_create_podbean_draft_requires_final_master_artifact(
         )
 
 
+@pytest.mark.parametrize("checkpoint", [None, "stale-final-master-sha256"])
+def test_create_podbean_draft_rejects_transcript_refresh_bypass(
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path: Path,
+    checkpoint,
+) -> None:
+    config = app_config_factory(tmp_path, podbean_enabled=True)
+    runtime_paths = runtime_factory(config)
+    session = session_factory(
+        runtime_paths.db_file,
+        session_uid="session-podbean-unrefreshed",
+        status="ready_for_draft",
+        transcript_refreshed_from_sha256=checkpoint,
+    )
+    final_master = tmp_path / "unrefreshed-final.mp3"
+    final_master.write_bytes(b"current-final-master")
+    transcript = tmp_path / "unrefreshed-transcript.vtt"
+    transcript.write_text(
+        "WEBVTT\n\n00:00.000 --> 00:01.000\nold cut\n",
+        encoding="utf-8",
+    )
+    artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid=session.session_uid,
+        kind="final_master",
+        path=final_master,
+    )
+    artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid=session.session_uid,
+        kind="transcript",
+        path=transcript,
+    )
+    upsert_episode_metadata(
+        runtime_paths.db_file,
+        session_uid=session.session_uid,
+        title="Stale metadata",
+        description="Generated from the old transcript",
+    )
+    client = FakePodbeanClient()
+
+    with pytest.raises(PodbeanError, match="transcript-refresh"):
+        create_podbean_draft(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=session,
+            client=client,
+        )
+
+    assert client.uploaded == []
+
+
 def test_podbean_client_wraps_http_status_errors(
     app_config_factory, tmp_path: Path
 ) -> None:

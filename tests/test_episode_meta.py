@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -167,6 +168,49 @@ def test_generate_episode_metadata_sends_current_transcript_and_persists_result_
     assert "background" not in request
     assert "conversation" not in request
     assert "previous_response_id" not in request
+
+
+@pytest.mark.parametrize("checkpoint", [None, "stale-final-master-sha256"])
+def test_generate_episode_metadata_rejects_transcript_refresh_bypass(
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path: Path,
+    checkpoint: Optional[str],
+) -> None:
+    config, runtime_paths, session = _ready_session_with_transcript(
+        app_config_factory=app_config_factory,
+        runtime_factory=runtime_factory,
+        session_factory=session_factory,
+        artifact_registrar=artifact_registrar,
+        tmp_path=tmp_path,
+        session_uid="session-meta-unrefreshed",
+    )
+    final_master = tmp_path / "session-meta-unrefreshed.mp3"
+    final_master.write_bytes(b"current-final-master")
+    artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid=session.session_uid,
+        kind="final_master",
+        path=final_master,
+    )
+    client = FakeOpenAIClient(response=_parsed_response())
+
+    with pytest.raises(EpisodeMetaError, match="transcript-refresh"):
+        generate_episode_metadata(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=replace(
+                session,
+                transcript_refreshed_from_sha256=checkpoint,
+            ),
+            client=client,
+        )
+
+    assert client.responses.calls == []
 
 
 @pytest.mark.parametrize("status", ["queued", "waiting_for_finalize"])

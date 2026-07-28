@@ -241,6 +241,7 @@ class FakeOffsetAuphonicClient:
             {"id": "Pasha", "type": "multitrack", "input_file": "sessions/s/raw_track/bbb/Tr2.webm"},
         ]
         self.offset_updates = []
+        self.started = []
 
     def get_production(self, production_id: str):
         return {
@@ -268,6 +269,9 @@ class FakeOffsetAuphonicClient:
             if track.get("id") == track_id:
                 track["offset"] = offset
         return {"status_code": 200, "data": {"id": track_id, "offset": offset}}
+
+    def start_production(self, production_id: str) -> None:
+        self.started.append(production_id)
 
 
 class FakeTranscriptRefreshClient(FakeAuphonicClient):
@@ -2145,6 +2149,53 @@ def test_session_offset_apply_does_not_checkpoint_unverified_remote_value(
     updated = get_session(runtime_paths.db_file, session.session_uid)
     assert updated is not None
     assert updated.auphonic_offsets_verified_production_id is None
+
+
+def test_start_rejects_offsets_changed_after_verification(
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _offset_session(
+        tmp_path, runtime_paths, session_factory, artifact_registrar
+    )
+    client = FakeOffsetAuphonicClient()
+    offset_session_auphonic_production(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        apply=True,
+        client=client,
+    )
+    verified = get_session(runtime_paths.db_file, session.session_uid)
+    assert verified is not None
+    preview = preview_prepared_session_with_auphonic(
+        config=config,
+        db_file=runtime_paths.db_file,
+        session=verified,
+        client=client,
+    )
+    client.tracks[1]["offset"] = 9.0
+
+    with pytest.raises(AuphonicError, match="changed after verification"):
+        start_prepared_session_with_auphonic(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=preview.session,
+            client=client,
+        )
+
+    unchanged = get_session(runtime_paths.db_file, session.session_uid)
+    assert unchanged is not None
+    assert unchanged.status == "auphonic_previewed"
+    assert unchanged.auphonic_offsets_verified_production_id is None
+    assert client.started == []
 
 
 def test_session_offset_apply_verifies_reference_track_remains_at_zero(
