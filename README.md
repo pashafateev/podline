@@ -117,10 +117,14 @@ Run `pod auphonic-offset` before preview/start. Durations come from audio packet
 The dry run ends with `Waiting on you` and the exact `--apply` command. After
 `--apply`, Podline reinspects every Auphonic track and records the production ID
 only if all applied and zero-offset values match the plan. Preview refuses to
-advance unless that checkpoint matches the current production. Resetting with
-`pod auphonic-reset` clears it along with the abandoned production. The old
-combined `pod auphonic` shortcut is intentionally rejected because it cannot
-preserve the offset-verification and preview gates.
+advance unless that checkpoint matches the current production. Immediately
+before start, Podline reinspects every remote offset against the stored source
+durations. If anything changed after verification, it clears the checkpoint and
+returns the session to `auphonic_prepared`, requiring offset verification and
+preview again. Resetting with `pod auphonic-reset` clears the checkpoint along
+with the abandoned production. The old combined `pod auphonic` shortcut is
+intentionally rejected because it cannot preserve the offset-verification and
+preview gates.
 
 3. Start Auphonic after previewing the edit page
 ```bash
@@ -197,6 +201,9 @@ pod status @1
 
 `pod episode-meta` remains a manual step. It sends the current registered VTT
 transcript to the Responses API and saves the structured title and description.
+The command refuses to call the API unless the transcript-refresh checksum
+matches the current final master; `pod podbean-draft` enforces the same gate
+before any Podbean request or upload.
 The model defaults to `gpt-5.6` with low reasoning effort and a 120-second
 timeout; override those values in the optional `episode_metadata` config section.
 The API key is read only from `OPENAI_API_KEY`, never from YAML.

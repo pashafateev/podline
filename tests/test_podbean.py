@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -83,7 +84,7 @@ def test_create_podbean_draft_materializes_artifacts_and_updates_session(
     transcript.write_text(
         "WEBVTT\n\n00:00.000 --> 00:01.000\nhello\n", encoding="utf-8"
     )
-    artifact_registrar(
+    final_master_artifact = artifact_registrar(
         runtime_paths.db_file,
         runtime_paths,
         session_uid=session.session_uid,
@@ -102,6 +103,10 @@ def test_create_podbean_draft_materializes_artifacts_and_updates_session(
         session_uid=session.session_uid,
         title="Is my sponsor God?",
         description="Draft description",
+    )
+    session = replace(
+        session,
+        transcript_refreshed_from_sha256=final_master_artifact.sha256,
     )
     client = FakePodbeanClient()
 

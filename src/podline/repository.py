@@ -428,6 +428,56 @@ def record_auphonic_offsets_verified(
         connection.commit()
 
 
+def clear_auphonic_offsets_verified(
+    db_file: str,
+    *,
+    session_uid: str,
+    status: str,
+    production_id: str,
+    timestamp: str,
+    detail: str,
+) -> None:
+    reset_status = (
+        SessionStatus.AUPHONIC_PREPARED.value
+        if status == SessionStatus.AUPHONIC_PREVIEWED.value
+        else status
+    )
+    with connect(db_file) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE sessions
+            SET status = ?,
+                auphonic_offsets_verified_production_id = NULL,
+                updated_at = ?
+            WHERE session_uid = ?
+              AND status = ?
+              AND auphonic_production_id = ?
+              AND auphonic_offsets_verified_production_id = ?
+            """,
+            (
+                reset_status,
+                timestamp,
+                session_uid,
+                status,
+                production_id,
+                production_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                f"Could not invalidate verified Auphonic offsets for {session_uid}; "
+                "the production or session status changed"
+            )
+        connection.execute(
+            """
+            INSERT INTO events (session_uid, from_state, to_state, timestamp, detail)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (session_uid, status, reset_status, timestamp, detail),
+        )
+        connection.commit()
+
+
 def record_transcript_refresh_production(
     db_file: str,
     *,

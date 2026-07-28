@@ -98,6 +98,19 @@ def _ready_session_with_transcript(
         kind="transcript",
         path=transcript,
     )
+    final_master = tmp_path / f"{session_uid}.mp3"
+    final_master.write_bytes(b"current-final-master")
+    final_master_artifact = artifact_registrar(
+        runtime_paths.db_file,
+        runtime_paths,
+        session_uid=session.session_uid,
+        kind="final_master",
+        path=final_master,
+    )
+    session = replace(
+        session,
+        transcript_refreshed_from_sha256=final_master_artifact.sha256,
+    )
     return config, runtime_paths, session
 
 

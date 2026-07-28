@@ -16,7 +16,11 @@ from podline.models import (
     SessionRecord,
     SessionStatus,
 )
-from podline.repository import get_episode, update_session_status
+from podline.repository import (
+    get_episode,
+    get_media_artifact,
+    update_session_status,
+)
 
 
 logger = logging.getLogger("podline")
@@ -195,6 +199,25 @@ def create_podbean_draft(
     if session.status != SessionStatus.READY_FOR_DRAFT.value:
         raise PodbeanError(
             f"Session {session.session_uid} must be ready_for_draft before creating a Podbean draft"
+        )
+
+    final_master_artifact = get_media_artifact(
+        db_file,
+        session.session_uid,
+        kind=ArtifactKind.FINAL_MASTER.value,
+    )
+    if final_master_artifact is None:
+        raise PodbeanError(
+            f"No final_master artifact registered for session {session.session_uid}"
+        )
+    if (
+        session.transcript_refreshed_from_sha256
+        != final_master_artifact.sha256
+    ):
+        raise PodbeanError(
+            f"Session {session.session_uid} transcript is not refreshed from the "
+            "current final master; run pod transcript-refresh "
+            f"{session.session_uid} first"
         )
 
     episode = get_episode(db_file, session.session_uid)

@@ -84,6 +84,14 @@ class FakeAuphonicClient:
     def start_production(self, production_id: str) -> None:
         self.started.append(production_id)
 
+    def update_multi_input_file_offset(
+        self, production_id: str, track_id: str, offset: float
+    ):
+        for track in self.tracks:
+            if track.get("id") == track_id:
+                track["offset"] = offset
+        return {"status_code": 200, "data": {"id": track_id, "offset": offset}}
+
     def wait_for_production(self, production_id: str) -> AuphonicProduction:
         assert production_id == "prod-123"
         return AuphonicProduction(
@@ -224,6 +232,11 @@ class FakeStemAuphonicClient(FakeDoneAuphonicClient):
                     archive.writestr(name, content)
             return
         super().download_file(url, destination)
+
+
+class FakeStartableStemAuphonicClient(FakeStemAuphonicClient):
+    def get_production(self, production_id: str):
+        return FakeAuphonicClient.get_production(self, production_id)
 
 
 class FakeOffsetAuphonicClient:
@@ -598,12 +611,13 @@ def test_prepare_preview_then_start_splits_the_auphonic_flow(
     )
     assert prepared.status == "auphonic_prepared"
     assert client.started == []
-    record_auphonic_offsets_verified(
-        runtime_paths.db_file,
-        session_uid=prepared.session_uid,
-        status=prepared.status,
-        production_id=prepared.auphonic_production_id,
-        timestamp="now",
+    offset_session_auphonic_production(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=prepared,
+        apply=True,
+        client=client,
     )
     prepared = get_session(runtime_paths.db_file, prepared.session_uid)
     assert prepared is not None
@@ -911,7 +925,7 @@ def test_start_continues_when_optional_stem_archive_is_unmappable(
         artifact_registrar,
         status="auphonic_previewed",
     )
-    client = FakeStemAuphonicClient(
+    client = FakeStartableStemAuphonicClient(
         archive_entries={"1.flac": b"one", "2.flac": b"two"}
     )
     caplog.set_level(logging.WARNING, logger="podline")
@@ -2193,7 +2207,7 @@ def test_start_rejects_offsets_changed_after_verification(
 
     unchanged = get_session(runtime_paths.db_file, session.session_uid)
     assert unchanged is not None
-    assert unchanged.status == "auphonic_previewed"
+    assert unchanged.status == "auphonic_prepared"
     assert unchanged.auphonic_offsets_verified_production_id is None
     assert client.started == []
 
@@ -2817,6 +2831,7 @@ def test_start_failure_after_persist_recovers_via_reconcile_without_restart(
     app_config_factory,
     runtime_factory,
     session_factory,
+    artifact_registrar,
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -2835,13 +2850,31 @@ def test_start_failure_after_persist_recovers_via_reconcile_without_restart(
 
     config = app_config_factory(tmp_path)
     runtime_paths = runtime_factory(config)
-    session = session_factory(
-        runtime_paths.db_file,
+    session = _queued_session_with_tracks(
+        tmp_path,
+        runtime_paths,
+        session_factory,
+        artifact_registrar,
         status="auphonic_previewed",
-        auphonic_production_id="prod-123",
-        auphonic_offsets_verified_production_id="prod-123",
     )
     client = FakeAuphonicClient()
+    raw_tracks = list_media_artifacts(
+        runtime_paths.db_file, session.session_uid, kind="raw_track"
+    )
+    client.tracks = [
+        {
+            "id": "Jonathan",
+            "type": "multitrack",
+            "input_file": raw_tracks[0].s3_uri.split("/", 3)[-1],
+            "offset": 0,
+        },
+        {
+            "id": "Pasha",
+            "type": "multitrack",
+            "input_file": raw_tracks[1].s3_uri.split("/", 3)[-1],
+            "offset": 1.801,
+        },
+    ]
 
     def _local_failure(**_kwargs):
         raise ArtifactError("simulated local failure after outputs persisted")

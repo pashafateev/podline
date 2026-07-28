@@ -14,7 +14,7 @@ from podline.models import (
     SessionRecord,
     SessionStatus,
 )
-from podline.repository import upsert_episode_metadata
+from podline.repository import get_media_artifact, upsert_episode_metadata
 
 EPISODE_METADATA_PROMPT = (
     resources.files("podline")
@@ -65,6 +65,23 @@ def generate_episode_metadata(
         )
     except ArtifactError as exc:
         raise EpisodeMetaError(str(exc)) from exc
+
+    final_master = get_media_artifact(
+        db_file,
+        session.session_uid,
+        kind=ArtifactKind.FINAL_MASTER.value,
+    )
+    if final_master is None:
+        raise EpisodeMetaError(
+            f"Session {session.session_uid} has no final master artifact; "
+            "run pod finalize first"
+        )
+    if session.transcript_refreshed_from_sha256 != final_master.sha256:
+        raise EpisodeMetaError(
+            f"Session {session.session_uid} transcript is not refreshed from the "
+            "current final master; run pod transcript-refresh "
+            f"{session.session_uid} first"
+        )
 
     transcript_text = transcript_path.read_text(encoding="utf-8-sig")
     openai_client = client or _build_openai_client(config)

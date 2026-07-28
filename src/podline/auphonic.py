@@ -38,6 +38,7 @@ from podline.models import (
     SessionStatus,
 )
 from podline.repository import (
+    clear_auphonic_offsets_verified,
     complete_transcript_refresh,
     delete_media_artifacts,
     discard_transcript_refresh_production,
@@ -636,6 +637,33 @@ def start_prepared_session_with_auphonic(
 
     client = client or AuphonicClient(config)
     production_id = session.auphonic_production_id
+    current_details = inspect_production(config, production_id, client=client)
+    if (
+        _is_done_status(current_details)
+        or _is_failed_status(current_details)
+        or current_details.get("start_allowed") is not True
+    ):
+        raise AuphonicError(
+            f"Auphonic production {production_id} changed state after preview; "
+            f"run pod auphonic-sync --session {session.session_uid}"
+        )
+    try:
+        _validate_verified_offsets_current(
+            config=config,
+            db_file=db_file,
+            session_uid=session.session_uid,
+            details=current_details,
+        )
+    except AuphonicError as exc:
+        clear_auphonic_offsets_verified(
+            db_file,
+            session_uid=session.session_uid,
+            status=session.status,
+            production_id=production_id,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            detail=f"invalidated Auphonic offset verification before start: {exc}",
+        )
+        raise
 
     try:
         _log(
@@ -904,6 +932,61 @@ def _validate_attached_source_tracks(
             f"Auphonic production does not have the expected attached source tracks "
             f"for session {session_uid}: {exc}"
         ) from exc
+
+
+def _validate_verified_offsets_current(
+    *,
+    config: AppConfig,
+    db_file: str,
+    session_uid: str,
+    details: Dict,
+) -> None:
+    artifacts = _spoken_raw_tracks(config, db_file, session_uid)
+    durations = {}
+    for artifact in artifacts:
+        if artifact.duration_seconds is None:
+            raise AuphonicError(
+                f"Auphonic offsets changed after verification or cannot be "
+                f"revalidated for {session_uid}; {artifact.filename} has no stored "
+                "duration. Rerun pod auphonic-offset --apply."
+            )
+        durations[artifact] = Decimal(
+            str(
+                _validated_duration(
+                    artifact.duration_seconds,
+                    source=artifact.filename,
+                )
+            )
+        )
+
+    reference_duration = max(durations.values())
+    inspected_tracks = details.get("multi_input_files") or []
+    for artifact, duration in durations.items():
+        track = _find_multi_input_track_for_asset(inspected_tracks, artifact)
+        expected_offset = reference_duration - duration
+        raw_offset = track.get("offset")
+        try:
+            actual_offset = (
+                Decimal("0")
+                if raw_offset in (None, "")
+                else Decimal(str(raw_offset))
+            )
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise AuphonicError(
+                f"Auphonic offsets changed after verification for {session_uid}; "
+                f"track {track.get('id') or artifact.filename} has invalid offset "
+                f"{raw_offset!r}. Rerun pod auphonic-offset --apply."
+            ) from exc
+        if (
+            not actual_offset.is_finite()
+            or abs(actual_offset - expected_offset) > Decimal("0.0005")
+        ):
+            raise AuphonicError(
+                f"Auphonic offsets changed after verification for {session_uid}; "
+                f"track {track.get('id') or artifact.filename} expected "
+                f"{expected_offset:.3f}s but found {raw_offset or 0!r}. "
+                "Rerun pod auphonic-offset --apply and preview again."
+            )
 
 
 def _artifact_key(config: AppConfig, artifact: MediaArtifactRecord) -> str:
