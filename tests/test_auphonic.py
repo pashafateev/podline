@@ -2656,6 +2656,61 @@ def test_refresh_transcript_replaces_transcript_artifact(
     assert updated.transcript_refreshed_from_sha256 == final_master.sha256
 
 
+def test_refresh_transcript_restores_current_artifact_when_master_changes_mid_run(
+    moto_s3,
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _ready_for_draft_session(
+        tmp_path, runtime_paths, session_factory, artifact_registrar
+    )
+    previous_transcript = get_media_artifact(
+        runtime_paths.db_file, session.session_uid, kind="transcript"
+    )
+    assert previous_transcript is not None
+    client = FakeTranscriptRefreshClient()
+    original_download = client.download_file
+
+    def download_then_replace_master(url: str, destination: Path) -> None:
+        original_download(url, destination)
+        replacement_master = tmp_path / "mid-run-final-master.mp3"
+        replacement_master.write_bytes(b"new-final-master-during-refresh")
+        artifact_registrar(
+            runtime_paths.db_file,
+            runtime_paths,
+            session_uid=session.session_uid,
+            kind="final_master",
+            path=replacement_master,
+        )
+
+    client.download_file = download_then_replace_master
+
+    with pytest.raises(RuntimeError, match="current final master changed"):
+        refresh_transcript_with_auphonic(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=runtime_paths.db_file,
+            session=session,
+            client=client,
+        )
+
+    current_transcript = get_media_artifact(
+        runtime_paths.db_file, session.session_uid, kind="transcript"
+    )
+    assert current_transcript is not None
+    assert current_transcript.sha256 == previous_transcript.sha256
+    assert current_transcript.s3_uri == previous_transcript.s3_uri
+    interrupted = get_session(runtime_paths.db_file, session.session_uid)
+    assert interrupted is not None
+    assert interrupted.transcript_refresh_production_id == "prod-refresh"
+    assert interrupted.transcript_refreshed_from_sha256 is None
+
+
 def test_refresh_transcript_requires_final_master_artifact(
     moto_s3,
     app_config_factory,
