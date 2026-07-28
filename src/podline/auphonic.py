@@ -49,6 +49,7 @@ from podline.repository import (
     record_auphonic_offsets_verified,
     record_transcript_refresh_production,
     reset_session_to_queued,
+    restore_media_artifact_after_failed_replacement,
     update_media_artifact_duration,
     update_session_status,
 )
@@ -851,6 +852,11 @@ def refresh_transcript_with_auphonic(
         client.start_production(production_id)
         production = client.wait_for_production(production_id)
 
+    previous_transcript = get_media_artifact(
+        db_file,
+        session.session_uid,
+        kind=ArtifactKind.TRANSCRIPT.value,
+    )
     transcript_artifact = _persist_transcript_output(
         client=client,
         config=config,
@@ -860,14 +866,32 @@ def refresh_transcript_with_auphonic(
         production=production,
     )
 
-    complete_transcript_refresh(
-        db_file,
-        session_uid=session.session_uid,
-        status=session.status,
-        production_id=production_id,
-        final_master_sha256=final_master.sha256,
-        timestamp=datetime.now(timezone.utc).isoformat(),
-    )
+    try:
+        complete_transcript_refresh(
+            db_file,
+            session_uid=session.session_uid,
+            status=session.status,
+            production_id=production_id,
+            final_master_sha256=final_master.sha256,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+    except Exception:
+        try:
+            restore_media_artifact_after_failed_replacement(
+                db_file,
+                session_uid=session.session_uid,
+                kind=ArtifactKind.TRANSCRIPT.value,
+                role="",
+                failed_sha256=transcript_artifact.sha256,
+                previous=previous_transcript,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            )
+        except Exception as rollback_error:
+            raise RuntimeError(
+                f"Transcript refresh completion failed for {session.session_uid}, "
+                "and the prior transcript could not be restored"
+            ) from rollback_error
+        raise
     _log(
         logger,
         "Stored refreshed transcript for %s transcript=%s",

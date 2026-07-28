@@ -899,6 +899,66 @@ def register_media_artifact(
     return record
 
 
+def restore_media_artifact_after_failed_replacement(
+    db_file: str,
+    *,
+    session_uid: str,
+    kind: str,
+    role: str,
+    failed_sha256: str,
+    previous: Optional[MediaArtifactRecord],
+    timestamp: str,
+) -> None:
+    """Restore the prior current artifact without deleting immutable history."""
+    if previous is not None and (
+        previous.session_uid != session_uid
+        or previous.kind != kind
+        or previous.role != role
+    ):
+        raise ValueError("Previous artifact does not match the replacement target")
+
+    with connect(db_file) as connection:
+        current = connection.execute(
+            """
+            SELECT sha256
+            FROM media_artifacts
+            WHERE session_uid = ? AND kind = ? AND role = ?
+            """,
+            (session_uid, kind, role),
+        ).fetchone()
+        if current is None or current["sha256"] != failed_sha256:
+            raise RuntimeError(
+                f"Could not restore {kind}/{role or 'default'} for {session_uid}; "
+                "the current artifact changed after the failed replacement"
+            )
+
+        if previous is None:
+            connection.execute(
+                """
+                DELETE FROM media_artifacts
+                WHERE session_uid = ? AND kind = ? AND role = ? AND sha256 = ?
+                """,
+                (session_uid, kind, role, failed_sha256),
+            )
+        else:
+            _insert_media_artifact(
+                connection,
+                session_uid=previous.session_uid,
+                kind=previous.kind,
+                role=previous.role,
+                filename=previous.filename,
+                content_type=previous.content_type,
+                byte_size=previous.byte_size,
+                sha256=previous.sha256,
+                duration_seconds=previous.duration_seconds,
+                s3_uri=previous.s3_uri,
+                source_provider=previous.source_provider,
+                source_id=previous.source_id,
+                timestamp=timestamp,
+            )
+        connection.commit()
+
+
 def replace_media_artifact_set(
     db_file: str,
     *,

@@ -189,6 +189,9 @@ pod transcript-refresh @1
 Notes:
 - This creates a single-track Auphonic production reading the final master from S3, downloads the new WebVTT file, and stores it as the session's current transcript artifact (the previous object stays in the bucket as history).
 - If polling or downloading is interrupted after Auphonic starts, re-running the command resumes the stored refresh production instead of creating a duplicate.
+- If the final master changes while refresh output is being persisted, completion
+  fails and the prior transcript remains registered as current; the rejected
+  output stays only as immutable S3 history.
 - A successful refresh records the final-master SHA-256 used to create the new
   transcript and invalidates previously generated episode metadata. Guidance
   advances to `pod episode-meta` only while that checksum still matches the
