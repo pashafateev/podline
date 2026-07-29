@@ -2160,6 +2160,13 @@ def test_audio_processing_status_is_not_treated_as_failed() -> None:
     assert _is_failed_status(data_node) is False
 
 
+def test_incoming_file_transfer_status_is_not_treated_as_failed() -> None:
+    data_node = {"status": 12, "status_string": "Incoming File Transfer"}
+
+    assert _is_done_status(data_node) is False
+    assert _is_failed_status(data_node) is False
+
+
 def test_error_status_is_treated_as_failed() -> None:
     data_node = {"status": 2, "status_string": "Error"}
 
