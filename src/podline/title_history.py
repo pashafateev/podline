@@ -82,7 +82,7 @@ def _read_cache(cache_path: Path, *, feed_url: str) -> list[str]:
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return []
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         LOGGER.warning("Could not read published-title cache %s: %s", cache_path, exc)
         return []
 

@@ -1,4 +1,5 @@
 from importlib import resources
+import json
 import os
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -177,14 +178,12 @@ def _build_user_content(
     if not published_titles:
         return transcript_text
 
-    title_lines = "\n".join(f"- {title}" for title in published_titles)
-    return (
-        "<published_title_style_references>\n"
-        f"{title_lines}\n"
-        "</published_title_style_references>\n\n"
-        "<current_episode_transcript>\n"
-        f"{transcript_text}"
-        "</current_episode_transcript>"
+    return json.dumps(
+        {
+            "published_title_style_references": list(published_titles),
+            "current_episode_transcript": transcript_text,
+        },
+        ensure_ascii=False,
     )
 
 
