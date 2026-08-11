@@ -177,6 +177,9 @@ and a first-run failure falls back to transcript-only generation.
 The model defaults to `gpt-5.6` with low reasoning effort and a 120-second
 timeout. The RSS request defaults to a five-second timeout and the 20 most recent
 titles; override those values in the optional `episode_metadata` config section.
+Feed reads have a one-megabyte response cap and total elapsed deadline, and titles
+longer than 200 characters are ignored so external data cannot grow the prompt
+without bound.
 The API key is read only from `OPENAI_API_KEY`, never from YAML.
 
 7. Create the Podbean draft
