@@ -51,6 +51,12 @@ podbean:
     assert config.episode_metadata.model == "gpt-5.6"
     assert config.episode_metadata.reasoning_effort == "low"
     assert config.episode_metadata.request_timeout_seconds == 120
+    assert (
+        config.episode_metadata.feed_url
+        == "https://feed.podbean.com/sexdrunks/feed.xml"
+    )
+    assert config.episode_metadata.feed_timeout_seconds == 5
+    assert config.episode_metadata.title_history_limit == 20
 
 
 def test_load_config_overlays_local_config(tmp_path: Path) -> None:
@@ -144,6 +150,9 @@ episode_metadata:
   model: gpt-5.6-terra
   reasoning_effort: medium
   request_timeout_seconds: 45
+  feed_url: https://podcast.example/feed.xml
+  feed_timeout_seconds: 8
+  title_history_limit: 12
 """.strip()
         + "\n",
         encoding="utf-8",
@@ -154,6 +163,9 @@ episode_metadata:
     assert config.episode_metadata.model == "gpt-5.6-terra"
     assert config.episode_metadata.reasoning_effort == "medium"
     assert config.episode_metadata.request_timeout_seconds == 45
+    assert config.episode_metadata.feed_url == "https://podcast.example/feed.xml"
+    assert config.episode_metadata.feed_timeout_seconds == 8
+    assert config.episode_metadata.title_history_limit == 12
 
 
 _BASE_CONFIG = """

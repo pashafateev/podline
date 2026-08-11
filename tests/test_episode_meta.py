@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -31,6 +32,27 @@ class FakeResponses:
 class FakeOpenAIClient:
     def __init__(self, response=None, error: Optional[Exception] = None) -> None:
         self.responses = FakeResponses(response=response, error=error)
+
+
+class FakeFeedResponse:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def raise_for_status(self) -> None:
+        return None
+
+
+class FakeFeedClient:
+    def __init__(self, *, response=None, error=None) -> None:
+        self.response = response
+        self.error = error
+        self.calls = []
+
+    def get(self, url: str, **kwargs):
+        self.calls.append((url, kwargs))
+        if self.error is not None:
+            raise self.error
+        return self.response
 
 
 def _parsed_response(
@@ -105,6 +127,9 @@ def test_episode_meta_prompt_preserves_editorial_contract() -> None:
     assert "recurring transcript themes, phrases, or images" in EPISODE_METADATA_PROMPT
     assert "Slightly edgy and memorable, but newcomer-safe" in EPISODE_METADATA_PROMPT
     assert "Humor is secondary to the episode's meaning" in EPISODE_METADATA_PROMPT
+    assert "style references only" in EPISODE_METADATA_PROMPT
+    assert "sole factual source" in EPISODE_METADATA_PROMPT
+    assert "isolated joke or memorable aside" in EPISODE_METADATA_PROMPT
     assert "2–4 conversational sentences" in EPISODE_METADATA_PROMPT
     assert "Use `J.`" in EPISODE_METADATA_PROMPT
     assert "Do not include the episode number" in EPISODE_METADATA_PROMPT
@@ -167,6 +192,100 @@ def test_generate_episode_metadata_sends_current_transcript_and_persists_result_
     assert "background" not in request
     assert "conversation" not in request
     assert "previous_response_id" not in request
+
+
+def test_generate_episode_metadata_sends_published_titles_as_style_only_context(
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path: Path,
+) -> None:
+    config, runtime_paths, session = _ready_session_with_transcript(
+        app_config_factory=app_config_factory,
+        runtime_factory=runtime_factory,
+        session_factory=session_factory,
+        artifact_registrar=artifact_registrar,
+        tmp_path=tmp_path,
+        session_uid="session-meta-title-history",
+    )
+    feed_url = "https://feed.podbean.com/sexdrunks/feed.xml"
+    config = replace(
+        config,
+        episode_metadata=replace(config.episode_metadata, feed_url=feed_url),
+    )
+    feed_client = FakeFeedClient(
+        response=FakeFeedResponse(
+            "<?xml version='1.0'?><rss><channel>"
+            "<title>Sex Drunks</title>"
+            "<item><title>28. I met God at the car dealership</title></item>"
+            "<item><title>27. I love lust</title></item>"
+            "</channel></rss>"
+        )
+    )
+    openai_client = FakeOpenAIClient(response=_parsed_response())
+
+    generate_episode_metadata(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        client=openai_client,
+        feed_client=feed_client,
+    )
+
+    assert feed_client.calls == [
+        (feed_url, {"timeout": 5, "follow_redirects": True})
+    ]
+    content = openai_client.responses.calls[0]["input"][1]["content"]
+    assert "<published_title_style_references>" in content
+    assert "I met God at the car dealership" in content
+    assert "I love lust" in content
+    assert "28. I met God" not in content
+    assert "Sex Drunks" not in content
+    assert "<current_episode_transcript>" in content
+    assert "hello from the current cut" in content
+
+
+def test_generate_episode_metadata_continues_without_feed_or_cache(
+    app_config_factory,
+    runtime_factory,
+    session_factory,
+    artifact_registrar,
+    tmp_path: Path,
+) -> None:
+    config, runtime_paths, session = _ready_session_with_transcript(
+        app_config_factory=app_config_factory,
+        runtime_factory=runtime_factory,
+        session_factory=session_factory,
+        artifact_registrar=artifact_registrar,
+        tmp_path=tmp_path,
+        session_uid="session-meta-title-history-offline",
+    )
+    feed_url = "https://feed.podbean.com/sexdrunks/feed.xml"
+    config = replace(
+        config,
+        episode_metadata=replace(config.episode_metadata, feed_url=feed_url),
+    )
+    feed_client = FakeFeedClient(
+        error=httpx.ConnectError(
+            "offline", request=httpx.Request("GET", feed_url)
+        )
+    )
+    openai_client = FakeOpenAIClient(response=_parsed_response())
+
+    generate_episode_metadata(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        client=openai_client,
+        feed_client=feed_client,
+    )
+
+    content = openai_client.responses.calls[0]["input"][1]["content"]
+    assert content.startswith("WEBVTT")
+    assert "published_title_style_references" not in content
 
 
 @pytest.mark.parametrize("status", ["queued", "waiting_for_finalize"])
