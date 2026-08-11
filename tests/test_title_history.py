@@ -135,6 +135,27 @@ def test_load_published_titles_returns_empty_without_feed_or_matching_cache(
     assert titles == []
 
 
+def test_load_published_titles_ignores_non_utf8_cache_when_feed_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "published-title-history.json").write_bytes(b"\xff\xfe")
+    failed_client = FakeFeedClient(
+        error=httpx.ConnectError(
+            "offline", request=httpx.Request("GET", FEED_URL)
+        )
+    )
+
+    titles = load_published_titles(
+        feed_url=FEED_URL,
+        timeout_seconds=4,
+        limit=20,
+        cache_dir=tmp_path,
+        client=failed_client,
+    )
+
+    assert titles == []
+
+
 def test_load_published_titles_skips_disabled_or_zero_limit_feed(
     tmp_path: Path,
 ) -> None:
