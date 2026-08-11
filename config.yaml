@@ -39,3 +39,6 @@ episode_metadata:
   model: gpt-5.6
   reasoning_effort: low
   request_timeout_seconds: 120
+  feed_url: https://feed.podbean.com/sexdrunks/feed.xml
+  feed_timeout_seconds: 5
+  title_history_limit: 20
