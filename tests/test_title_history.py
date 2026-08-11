@@ -3,16 +3,29 @@ from pathlib import Path
 
 import httpx
 
-from podline.title_history import load_published_titles
+from podline.title_history import (
+    MAX_FEED_BYTES,
+    MAX_TITLE_CHARACTERS,
+    load_published_titles,
+)
 
 
 FEED_URL = "https://feed.podbean.com/sexdrunks/feed.xml"
 
 
 class FakeFeedResponse:
-    def __init__(self, text: str, *, status_code: int = 200) -> None:
+    def __init__(
+        self, text: str = "", *, status_code: int = 200, chunks=None
+    ) -> None:
         self.text = text
         self.status_code = status_code
+        self.chunks = chunks
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        return None
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
@@ -22,6 +35,9 @@ class FakeFeedResponse:
                 "feed request failed", request=request, response=response
             )
 
+    def iter_bytes(self, chunk_size=None):
+        yield from self.chunks or [self.text.encode("utf-8")]
+
 
 class FakeFeedClient:
     def __init__(self, *, response=None, error=None) -> None:
@@ -29,8 +45,8 @@ class FakeFeedClient:
         self.error = error
         self.calls = []
 
-    def get(self, url: str, **kwargs):
-        self.calls.append((url, kwargs))
+    def stream(self, method: str, url: str, **kwargs):
+        self.calls.append((method, url, kwargs))
         if self.error is not None:
             raise self.error
         return self.response
@@ -68,7 +84,7 @@ def test_load_published_titles_normalizes_deduplicates_limits_and_caches(
         "Sober Dating, Future Tripping",
     ]
     assert client.calls == [
-        (FEED_URL, {"timeout": 4, "follow_redirects": True})
+        ("GET", FEED_URL, {"timeout": 4, "follow_redirects": True})
     ]
     cached = json.loads((tmp_path / "published-title-history.json").read_text())
     assert cached == {
@@ -76,7 +92,6 @@ def test_load_published_titles_normalizes_deduplicates_limits_and_caches(
         "titles": [
             "Raise Your Hand—or Don’t",
             "Sober Dating, Future Tripping",
-            "Welcome Is Not the Same as Safe",
         ],
     }
 
@@ -154,6 +169,81 @@ def test_load_published_titles_ignores_non_utf8_cache_when_feed_is_unavailable(
     )
 
     assert titles == []
+
+
+def test_load_published_titles_ignores_oversized_cache_when_feed_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "published-title-history.json").write_bytes(
+        b"x" * (MAX_FEED_BYTES + 1)
+    )
+    failed_client = FakeFeedClient(
+        error=httpx.ConnectError(
+            "offline", request=httpx.Request("GET", FEED_URL)
+        )
+    )
+
+    titles = load_published_titles(
+        feed_url=FEED_URL,
+        timeout_seconds=4,
+        limit=20,
+        cache_dir=tmp_path,
+        client=failed_client,
+    )
+
+    assert titles == []
+
+
+def test_load_published_titles_rejects_oversized_feed(tmp_path: Path) -> None:
+    client = FakeFeedClient(
+        response=FakeFeedResponse(chunks=[b"x" * (MAX_FEED_BYTES + 1)])
+    )
+
+    titles = load_published_titles(
+        feed_url=FEED_URL,
+        timeout_seconds=4,
+        limit=20,
+        cache_dir=tmp_path,
+        client=client,
+    )
+
+    assert titles == []
+
+
+def test_load_published_titles_enforces_total_elapsed_timeout(
+    monkeypatch, tmp_path: Path
+) -> None:
+    clock = iter([100.0, 105.0])
+    monkeypatch.setattr("podline.title_history.time.monotonic", lambda: next(clock))
+    client = FakeFeedClient(response=FakeFeedResponse(_rss("A title")))
+
+    titles = load_published_titles(
+        feed_url=FEED_URL,
+        timeout_seconds=4,
+        limit=20,
+        cache_dir=tmp_path,
+        client=client,
+    )
+
+    assert titles == []
+
+
+def test_load_published_titles_skips_oversized_titles(tmp_path: Path) -> None:
+    client = FakeFeedClient(
+        response=FakeFeedResponse(
+            _rss("x" * (MAX_TITLE_CHARACTERS + 1), "28. A usable title")
+        )
+    )
+
+    titles = load_published_titles(
+        feed_url=FEED_URL,
+        timeout_seconds=4,
+        limit=20,
+        cache_dir=tmp_path,
+        client=client,
+    )
+
+    assert titles == ["A usable title"]
 
 
 def test_load_published_titles_skips_disabled_or_zero_limit_feed(

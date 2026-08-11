@@ -39,8 +39,17 @@ class FakeFeedResponse:
     def __init__(self, text: str) -> None:
         self.text = text
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        return None
+
     def raise_for_status(self) -> None:
         return None
+
+    def iter_bytes(self, chunk_size=None):
+        yield self.text.encode("utf-8")
 
 
 class FakeFeedClient:
@@ -49,8 +58,8 @@ class FakeFeedClient:
         self.error = error
         self.calls = []
 
-    def get(self, url: str, **kwargs):
-        self.calls.append((url, kwargs))
+    def stream(self, method: str, url: str, **kwargs):
+        self.calls.append((method, url, kwargs))
         if self.error is not None:
             raise self.error
         return self.response
@@ -242,7 +251,7 @@ def test_generate_episode_metadata_sends_published_titles_as_style_only_context(
     )
 
     assert feed_client.calls == [
-        (feed_url, {"timeout": 5, "follow_redirects": True})
+        ("GET", feed_url, {"timeout": 5, "follow_redirects": True})
     ]
     content = json.loads(openai_client.responses.calls[0]["input"][1]["content"])
     assert content["published_title_style_references"] == [
