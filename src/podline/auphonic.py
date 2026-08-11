@@ -1321,7 +1321,7 @@ def _is_done_status(data_node: Dict) -> bool:
 def _is_failed_status(data_node: Dict) -> bool:
     status = str(data_node.get("status") or "").lower()
     status_string = str(data_node.get("status_string") or "").lower()
-    return status in {"2", "11", "12", "failed", "error"} or status_string in {
+    return status in {"2", "11", "failed", "error"} or status_string in {
         "failed",
         "error",
         "stopped",
