@@ -1,8 +1,8 @@
+import asyncio
 import json
 import logging
 from pathlib import Path
 import re
-import time
 from typing import Any, Optional
 import xml.etree.ElementTree as ET
 
@@ -38,13 +38,14 @@ def load_published_titles(
         feed_url=feed_url,
         limit=effective_limit,
     )
-    streamer = client.stream if client is not None else httpx.stream
 
     try:
-        feed_content = _download_feed(
-            streamer=streamer,
-            feed_url=feed_url,
-            timeout_seconds=timeout_seconds,
+        feed_content = asyncio.run(
+            _download_feed(
+                client=client,
+                feed_url=feed_url,
+                timeout_seconds=timeout_seconds,
+            )
         )
         titles = _parse_published_titles(feed_content, limit=effective_limit)
         if not titles:
@@ -68,22 +69,33 @@ def load_published_titles(
     return titles
 
 
-def _download_feed(*, streamer, feed_url: str, timeout_seconds: float) -> bytes:
-    started_at = time.monotonic()
+async def _download_feed(*, client, feed_url: str, timeout_seconds: float) -> bytes:
+    async def download() -> bytes:
+        if client is not None:
+            return await _read_feed(client, feed_url, timeout_seconds)
+        async with httpx.AsyncClient() as owned_client:
+            return await _read_feed(owned_client, feed_url, timeout_seconds)
+
+    try:
+        # One cancellable deadline includes connection, redirects and body reads.
+        return await asyncio.wait_for(download(), timeout=timeout_seconds)
+    except asyncio.TimeoutError as exc:
+        raise httpx.TimeoutException(
+            "published-title feed exceeded total timeout",
+            request=httpx.Request("GET", feed_url),
+        ) from exc
+
+
+async def _read_feed(client, feed_url: str, timeout_seconds: float) -> bytes:
     content = bytearray()
-    with streamer(
+    async with client.stream(
         "GET",
         feed_url,
         timeout=timeout_seconds,
         follow_redirects=True,
     ) as response:
         response.raise_for_status()
-        for chunk in response.iter_bytes(chunk_size=_STREAM_CHUNK_BYTES):
-            if time.monotonic() - started_at > timeout_seconds:
-                raise httpx.TimeoutException(
-                    "published-title feed exceeded total timeout",
-                    request=httpx.Request("GET", feed_url),
-                )
+        async for chunk in response.aiter_bytes(chunk_size=_STREAM_CHUNK_BYTES):
             if len(content) + len(chunk) > MAX_FEED_BYTES:
                 raise ValueError(
                     f"feed exceeded {MAX_FEED_BYTES} byte response limit"

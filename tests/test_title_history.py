@@ -1,3 +1,4 @@
+import asyncio
 import json
 import threading
 import time
@@ -24,10 +25,10 @@ class FakeFeedResponse:
         self.status_code = status_code
         self.chunks = chunks
 
-    def __enter__(self):
+    async def __aenter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
+    async def __aexit__(self, exc_type, exc_value, traceback) -> None:
         return None
 
     def raise_for_status(self) -> None:
@@ -38,8 +39,9 @@ class FakeFeedResponse:
                 "feed request failed", request=request, response=response
             )
 
-    def iter_bytes(self, chunk_size=None):
-        yield from self.chunks or [self.text.encode("utf-8")]
+    async def aiter_bytes(self, chunk_size=None):
+        for chunk in self.chunks or [self.text.encode("utf-8")]:
+            yield chunk
 
 
 class FakeFeedClient:
@@ -213,24 +215,6 @@ def test_load_published_titles_rejects_oversized_feed(tmp_path: Path) -> None:
     assert titles == []
 
 
-def test_load_published_titles_enforces_total_elapsed_timeout(
-    monkeypatch, tmp_path: Path
-) -> None:
-    clock = iter([100.0, 105.0])
-    monkeypatch.setattr("podline.title_history.time.monotonic", lambda: next(clock))
-    client = FakeFeedClient(response=FakeFeedResponse(_rss("A title")))
-
-    titles = load_published_titles(
-        feed_url=FEED_URL,
-        timeout_seconds=4,
-        limit=20,
-        cache_dir=tmp_path,
-        client=client,
-    )
-
-    assert titles == []
-
-
 def test_load_published_titles_skips_oversized_titles(tmp_path: Path) -> None:
     client = FakeFeedClient(
         response=FakeFeedResponse(
@@ -310,3 +294,28 @@ def test_feed_deadline_interrupts_trickling_body_and_uses_cache(tmp_path: Path) 
         server.shutdown()
         server.server_close()
         worker.join()
+
+
+def test_feed_deadline_interrupts_wait_for_headers_without_cache(tmp_path: Path) -> None:
+    cancelled = []
+
+    class WaitingForHeaders(FakeFeedResponse):
+        async def __aenter__(self):
+            try:
+                await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+            return self
+
+    started = time.monotonic()
+    titles = load_published_titles(
+        feed_url=FEED_URL,
+        timeout_seconds=0.05,
+        limit=20,
+        cache_dir=tmp_path,
+        client=FakeFeedClient(response=WaitingForHeaders(_rss("A title"))),
+    )
+    assert titles == []
+    assert cancelled == [True]
+    assert time.monotonic() - started < 1.0

@@ -39,16 +39,16 @@ class FakeFeedResponse:
     def __init__(self, text: str) -> None:
         self.text = text
 
-    def __enter__(self):
+    async def __aenter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
+    async def __aexit__(self, exc_type, exc_value, traceback) -> None:
         return None
 
     def raise_for_status(self) -> None:
         return None
 
-    def iter_bytes(self, chunk_size=None):
+    async def aiter_bytes(self, chunk_size=None):
         yield self.text.encode("utf-8")
 
 
