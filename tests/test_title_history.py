@@ -1,4 +1,7 @@
 import json
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
@@ -266,3 +269,44 @@ def test_load_published_titles_skips_disabled_or_zero_limit_feed(
         client=client,
     ) == []
     assert client.calls == []
+
+
+def test_feed_deadline_interrupts_trickling_body_and_uses_cache(tmp_path: Path) -> None:
+    disconnected = threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            try:
+                # Each write is faster than the read timeout; the full body is not.
+                for _ in range(100):
+                    self.wfile.write(b" ")
+                    self.wfile.flush()
+                    time.sleep(0.02)
+            except (BrokenPipeError, ConnectionResetError):
+                disconnected.set()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    feed_url = f"http://127.0.0.1:{server.server_port}/feed"
+    (tmp_path / "published-title-history.json").write_text(
+        json.dumps({"feed_url": feed_url, "titles": ["Cached title"]})
+    )
+    try:
+        started = time.monotonic()
+        titles = load_published_titles(
+            feed_url=feed_url, timeout_seconds=0.2, limit=20, cache_dir=tmp_path
+        )
+        elapsed = time.monotonic() - started
+        assert titles == ["Cached title"]
+        assert elapsed < 1.0, f"deadline failed to interrupt download: {elapsed:.3f}s"
+        assert disconnected.wait(1), "timed-out response was not closed"
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join()
