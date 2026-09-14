@@ -66,6 +66,9 @@ class EpisodeMetadataConfig:
     model: str = "gpt-5.6"
     reasoning_effort: str = "low"
     request_timeout_seconds: int = 120
+    feed_url: str = "https://feed.podbean.com/sexdrunks/feed.xml"
+    feed_timeout_seconds: float = 5
+    title_history_limit: int = 20
 
 
 @dataclass(frozen=True)
@@ -144,6 +147,13 @@ def _load_episode_metadata_config(data: Dict[str, Any]) -> EpisodeMetadataConfig
         model=str(section.get("model", "gpt-5.6")),
         reasoning_effort=str(section.get("reasoning_effort", "low")),
         request_timeout_seconds=int(section.get("request_timeout_seconds", 120)),
+        feed_url=str(
+            section.get(
+                "feed_url", "https://feed.podbean.com/sexdrunks/feed.xml"
+            )
+        ),
+        feed_timeout_seconds=float(section.get("feed_timeout_seconds", 5)),
+        title_history_limit=int(section.get("title_history_limit", 20)),
     )
 
 

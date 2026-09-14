@@ -169,8 +169,20 @@ pod status @1
 
 `pod episode-meta` remains a manual step. It sends the current registered VTT
 transcript to the Responses API and saves the structured title and description.
+Before generation, it reads recent published titles from the configured RSS feed
+and supplies them as style-only references; the transcript remains the only factual
+source for the current episode. Each run refreshes
+`cache/published-title-history.json` under the runtime directory after a successful
+feed read. A failed read preserves and uses the last published-title snapshot;
+without a saved snapshot, generation uses only the transcript.
 The model defaults to `gpt-5.6` with low reasoning effort and a 120-second
-timeout; override those values in the optional `episode_metadata` config section.
+timeout. The RSS request defaults to a five-second timeout and the 20 most recent
+titles; override those values in the optional `episode_metadata` config section.
+Feed requests ask for uncompressed responses and reject compressed replies.
+Reads have a one-megabyte response cap and a total deadline that includes DNS
+resolution, redirects, and body reads. A timed-out download is terminated. Titles
+longer than 200 characters are ignored so external data cannot grow the prompt
+without bound.
 The API key is read only from `OPENAI_API_KEY`, never from YAML.
 
 7. Create the Podbean draft

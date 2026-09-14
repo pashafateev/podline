@@ -1,6 +1,8 @@
 from importlib import resources
+import json
 import os
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Optional, Sequence
 
 from openai import APITimeoutError, OpenAI, OpenAIError
 from pydantic import BaseModel, Field, ValidationError, field_validator
@@ -15,6 +17,7 @@ from podline.models import (
     SessionStatus,
 )
 from podline.repository import upsert_episode_metadata
+from podline.title_history import load_published_titles
 
 EPISODE_METADATA_PROMPT = (
     resources.files("podline")
@@ -68,10 +71,17 @@ def generate_episode_metadata(
 
     transcript_text = transcript_path.read_text(encoding="utf-8-sig")
     openai_client = client or _build_openai_client(config)
+    published_titles = load_published_titles(
+        feed_url=config.episode_metadata.feed_url,
+        timeout_seconds=config.episode_metadata.feed_timeout_seconds,
+        limit=config.episode_metadata.title_history_limit,
+        cache_dir=Path(runtime_paths.cache_dir),
+    )
     draft = _request_episode_metadata(
         client=openai_client,
         config=config,
         transcript_text=transcript_text,
+        published_titles=published_titles,
     )
     return upsert_episode_metadata(
         db_file,
@@ -98,7 +108,12 @@ def _request_episode_metadata(
     client: Any,
     config: AppConfig,
     transcript_text: str,
+    published_titles: Sequence[str],
 ) -> EpisodeMetadataDraft:
+    user_content = _build_user_content(
+        transcript_text=transcript_text,
+        published_titles=published_titles,
+    )
     try:
         response = client.responses.parse(
             model=config.episode_metadata.model,
@@ -109,7 +124,7 @@ def _request_episode_metadata(
                 },
                 {
                     "role": "user",
-                    "content": transcript_text,
+                    "content": user_content,
                 },
             ],
             text_format=EpisodeMetadataDraft,
@@ -152,6 +167,21 @@ def _request_episode_metadata(
 
     raise EpisodeMetaError(
         "OpenAI episode metadata response was missing parsed structured output"
+    )
+
+
+def _build_user_content(
+    *, transcript_text: str, published_titles: Sequence[str]
+) -> str:
+    if not published_titles:
+        return transcript_text
+
+    return json.dumps(
+        {
+            "published_title_style_references": list(published_titles),
+            "current_episode_transcript": transcript_text,
+        },
+        ensure_ascii=False,
     )
 
 

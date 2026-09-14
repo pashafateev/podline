@@ -12,6 +12,7 @@ from podline.config import (
     AppConfig,
     AuphonicConfig,
     CozytrackConfig,
+    EpisodeMetadataConfig,
     NotificationsConfig,
     PathsConfig,
     PodbeanConfig,
@@ -98,6 +99,7 @@ def app_config_factory():
                 key_prefix="",
             ),
             config_file=runtime_home / "config.yaml",
+            episode_metadata=EpisodeMetadataConfig(feed_url=""),
         )
 
     return _build
