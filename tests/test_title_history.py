@@ -1,11 +1,14 @@
 import asyncio
 import json
+import os
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
+import pytest
 
 from podline.title_history import (
     MAX_FEED_BYTES,
@@ -319,3 +322,69 @@ def test_feed_deadline_interrupts_wait_for_headers_without_cache(tmp_path: Path)
     assert titles == []
     assert cancelled == [True]
     assert time.monotonic() - started < 1.0
+
+
+@pytest.mark.parametrize("has_cache", [True, False])
+def test_feed_deadline_interrupts_slow_dns(monkeypatch, tmp_path: Path, has_cache) -> None:
+    feed_url = "https://slow-dns.example.invalid/feed.xml"
+    marker = tmp_path / "resolver-pid"
+    # Apply the same resolver stall in this process and any Python download worker.
+    customization = tmp_path / "sitecustomize.py"
+    customization.write_text(
+        "import os, socket, time\n"
+        "from pathlib import Path\n"
+        "def slow_resolution(*args, **kwargs):\n"
+        f"    Path({str(marker)!r}).write_text(str(os.getpid()))\n"
+        "    time.sleep(2)\n"
+        "    raise socket.gaierror('simulated stalled resolver')\n"
+        "socket.getaddrinfo = slow_resolution\n"
+    )
+
+    def slow_resolution(*args, **kwargs):
+        marker.write_text(str(os.getpid()))
+        time.sleep(2)
+        raise socket.gaierror("simulated stalled resolver")
+
+    monkeypatch.setattr(socket, "getaddrinfo", slow_resolution)
+    monkeypatch.setenv("NO_PROXY", "*")
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    cache_path = tmp_path / "published-title-history.json"
+    snapshot = json.dumps({"feed_url": feed_url, "titles": ["Cached title"]})
+    if has_cache:
+        cache_path.write_text(snapshot)
+
+    started = time.monotonic()
+    titles = load_published_titles(
+        feed_url=feed_url, timeout_seconds=0.5, limit=20, cache_dir=tmp_path
+    )
+    elapsed = time.monotonic() - started
+    assert marker.exists(), "test never reached DNS resolution"
+    assert titles == (["Cached title"] if has_cache else [])
+    assert elapsed < 1.5, f"deadline waited for DNS cleanup: {elapsed:.3f}s"
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(marker.read_text()), 0)
+    if has_cache:
+        assert cache_path.read_text() == snapshot
+    else:
+        assert not cache_path.exists()
+
+
+@pytest.mark.parametrize("has_cache", [True, False])
+def test_unsupported_xml_encoding_falls_back(tmp_path: Path, has_cache) -> None:
+    cache_path = tmp_path / "published-title-history.json"
+    snapshot = json.dumps({"feed_url": FEED_URL, "titles": ["Cached title"]})
+    if has_cache:
+        cache_path.write_text(snapshot)
+    client = FakeFeedClient(response=FakeFeedResponse(
+        '<?xml version="1.0" encoding="unknown-encoding"?><rss><channel /></rss>'
+    ))
+
+    titles = load_published_titles(
+        feed_url=FEED_URL, timeout_seconds=1, limit=20, cache_dir=tmp_path, client=client
+    )
+
+    assert titles == (["Cached title"] if has_cache else [])
+    if has_cache:
+        assert cache_path.read_text() == snapshot
+    else:
+        assert not cache_path.exists()
