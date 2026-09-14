@@ -1,9 +1,11 @@
-import asyncio
 import json
 import logging
+import math
 from pathlib import Path
 import re
-from typing import Any, Optional
+import subprocess
+import sys
+import time
 import xml.etree.ElementTree as ET
 
 import httpx
@@ -14,7 +16,6 @@ CACHE_FILENAME = "published-title-history.json"
 MAX_FEED_BYTES = 1_000_000
 MAX_TITLE_CHARACTERS = 200
 MAX_TITLE_HISTORY_LIMIT = 100
-_STREAM_CHUNK_BYTES = 64 * 1024
 _EPISODE_NUMBER_PREFIX = re.compile(r"^\s*\d+\s*[.)-]\s*")
 
 
@@ -24,7 +25,6 @@ def load_published_titles(
     timeout_seconds: float,
     limit: int,
     cache_dir: Path,
-    client: Optional[Any] = None,
 ) -> list[str]:
     """Return recent published titles, falling back to the matching disk cache."""
     feed_url = feed_url.strip()
@@ -40,17 +40,14 @@ def load_published_titles(
     )
 
     try:
-        feed_content = asyncio.run(
-            _download_feed(
-                client=client,
-                feed_url=feed_url,
-                timeout_seconds=timeout_seconds,
-            )
+        feed_content = _download_feed(
+            feed_url=feed_url,
+            timeout_seconds=timeout_seconds,
         )
         titles = _parse_published_titles(feed_content, limit=effective_limit)
         if not titles:
             raise ValueError("feed contained no episode titles")
-    except (httpx.HTTPError, ET.ParseError, ValueError) as exc:
+    except (httpx.HTTPError, ET.ParseError, LookupError, OSError, ValueError) as exc:
         if cached_titles:
             LOGGER.warning(
                 "Published-title feed unavailable; using %d cached titles: %s",
@@ -69,39 +66,45 @@ def load_published_titles(
     return titles
 
 
-async def _download_feed(*, client, feed_url: str, timeout_seconds: float) -> bytes:
-    async def download() -> bytes:
-        if client is not None:
-            return await _read_feed(client, feed_url, timeout_seconds)
-        async with httpx.AsyncClient() as owned_client:
-            return await _read_feed(owned_client, feed_url, timeout_seconds)
+def _download_feed(*, feed_url: str, timeout_seconds: float) -> bytes:
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("feed timeout must be a positive finite number")
 
-    try:
-        # One cancellable deadline includes connection, redirects and body reads.
-        return await asyncio.wait_for(download(), timeout=timeout_seconds)
-    except asyncio.TimeoutError as exc:
-        raise httpx.TimeoutException(
-            "published-title feed exceeded total timeout",
-            request=httpx.Request("GET", feed_url),
-        ) from exc
+    request = json.dumps({
+        "feed_url": feed_url,
+        "timeout_seconds": timeout_seconds,
+        "max_bytes": MAX_FEED_BYTES,
+    }).encode("utf-8")
+    # Use this checkout's worker even when another checkout is installed editable.
+    worker_path = Path(__file__).resolve().with_name("_title_feed_worker.py")
+    deadline = time.monotonic() + timeout_seconds
+    with subprocess.Popen(
+        [sys.executable, str(worker_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ) as worker:
+        try:
+            content, error = worker.communicate(
+                input=request, timeout=max(0, deadline - time.monotonic())
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise httpx.TimeoutException(
+                "published-title feed exceeded total timeout",
+                request=httpx.Request("GET", feed_url),
+            ) from exc
+        finally:
+            # This also runs on interruption; never leave a resolver or request alive.
+            if worker.poll() is None:
+                worker.kill()
+            worker.wait()
 
-
-async def _read_feed(client, feed_url: str, timeout_seconds: float) -> bytes:
-    content = bytearray()
-    async with client.stream(
-        "GET",
-        feed_url,
-        timeout=timeout_seconds,
-        follow_redirects=True,
-    ) as response:
-        response.raise_for_status()
-        async for chunk in response.aiter_bytes(chunk_size=_STREAM_CHUNK_BYTES):
-            if len(content) + len(chunk) > MAX_FEED_BYTES:
-                raise ValueError(
-                    f"feed exceeded {MAX_FEED_BYTES} byte response limit"
-                )
-            content.extend(chunk)
-    return bytes(content)
+    if worker.returncode:
+        detail = error.decode("utf-8", errors="replace").strip()[:1024]
+        raise ValueError(f"feed download failed (exit {worker.returncode}): {detail}")
+    if len(content) > MAX_FEED_BYTES:
+        raise ValueError(f"feed exceeded {MAX_FEED_BYTES} byte response limit")
+    return content
 
 
 def _parse_published_titles(feed_content: bytes, *, limit: int) -> list[str]:

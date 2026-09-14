@@ -49,7 +49,6 @@ def generate_episode_metadata(
     db_file: str,
     session: SessionRecord,
     client: Optional[Any] = None,
-    feed_client: Optional[Any] = None,
 ) -> EpisodeRecord:
     if session.status not in {
         SessionStatus.READY_FOR_DRAFT.value,
@@ -77,7 +76,6 @@ def generate_episode_metadata(
         timeout_seconds=config.episode_metadata.feed_timeout_seconds,
         limit=config.episode_metadata.title_history_limit,
         cache_dir=Path(runtime_paths.cache_dir),
-        client=feed_client,
     )
     draft = _request_episode_metadata(
         client=openai_client,
