@@ -1,3 +1,4 @@
+import gzip
 import json
 import os
 import socket
@@ -44,6 +45,7 @@ def feed_download(monkeypatch):
 def feed_server(monkeypatch):
     state = SimpleNamespace(
         content=_rss("A title"), status=200, mode="normal", requests=[],
+        content_encoding=None, request_headers=[],
         disconnected=threading.Event(), stop=threading.Event(),
     )
 
@@ -53,6 +55,7 @@ def feed_server(monkeypatch):
 
         def do_GET(self):
             state.requests.append(self.path)
+            state.request_headers.append(self.headers)
             try:
                 if state.mode == "headers":
                     state.stop.wait(3)
@@ -64,6 +67,8 @@ def feed_server(monkeypatch):
                     self.end_headers()
                     return
                 self.send_response(state.status)
+                if state.content_encoding:
+                    self.send_header("Content-Encoding", state.content_encoding)
                 if state.mode != "trickle":
                     self.send_header("Content-Length", str(len(state.content)))
                 self.end_headers()
@@ -194,6 +199,23 @@ def test_worker_refreshes_saved_titles_on_each_successful_fetch(
     assert len(worker_processes) == 2
     assert all(process.returncode == 0 for process in worker_processes)
     assert len(feed_server.requests) == 2
+
+
+def test_worker_rejects_compressed_response_before_decoding(
+    tmp_path: Path, feed_server, worker_processes,
+) -> None:
+    feed_server.content_encoding = "gzip"
+    feed_server.content = gzip.compress(_rss("Compressed title"))
+    cache_path = tmp_path / "published-title-history.json"
+    snapshot = json.dumps({"feed_url": feed_server.url, "titles": ["Cached title"]})
+    cache_path.write_text(snapshot)
+
+    assert load_published_titles(
+        feed_url=feed_server.url, timeout_seconds=3, limit=20, cache_dir=tmp_path,
+    ) == ["Cached title"]
+    assert feed_server.request_headers[0]["Accept-Encoding"] == "identity"
+    assert cache_path.read_text() == snapshot
+    assert worker_processes[0].returncode != 0
 
 
 @pytest.mark.parametrize("failure", ["oversize", "http_error"])
