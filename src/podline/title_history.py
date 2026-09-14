@@ -156,7 +156,9 @@ def _read_cache(cache_path: Path, *, feed_url: str, limit: int) -> list[str]:
     for raw_title in raw_titles:
         if not isinstance(raw_title, str):
             continue
-        title = _normalize_title(raw_title)
+        # Snapshots already contain normalized titles; stripping again loses text
+        # such as the "12-" in "12-Step Romance".
+        title = raw_title.strip()
         if len(title) > MAX_TITLE_CHARACTERS:
             continue
         key = title.casefold()
