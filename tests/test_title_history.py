@@ -137,16 +137,17 @@ def test_load_published_titles_normalizes_deduplicates_limits_and_caches(
     }
 
 
+@pytest.mark.parametrize("title", ["I met God at the car dealership", "12-Step Romance"])
 def test_load_published_titles_uses_matching_cache_when_feed_is_unavailable(
-    tmp_path: Path, feed_download,
+    tmp_path: Path, feed_download, title,
 ) -> None:
-    feed_download.content = _rss("28. I met God at the car dealership")
+    feed_download.content = _rss("28. " + title)
     load_published_titles(feed_url=FEED_URL, timeout_seconds=4, limit=20, cache_dir=tmp_path)
     snapshot = (tmp_path / "published-title-history.json").read_bytes()
     feed_download.error = httpx.ConnectError("offline")
     assert load_published_titles(
         feed_url=FEED_URL, timeout_seconds=4, limit=20, cache_dir=tmp_path,
-    ) == ["I met God at the car dealership"]
+    ) == [title]
     assert (tmp_path / "published-title-history.json").read_bytes() == snapshot
 
 
