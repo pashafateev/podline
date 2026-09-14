@@ -9,10 +9,16 @@ import httpx
 def download_feed(*, feed_url: str, timeout_seconds: float, max_bytes: int) -> bytes:
     content = bytearray()
     with httpx.stream(
-        "GET", feed_url, timeout=timeout_seconds, follow_redirects=True
+        "GET", feed_url, timeout=timeout_seconds, follow_redirects=True,
+        headers={"Accept-Encoding": "identity"},
     ) as response:
         response.raise_for_status()
-        for chunk in response.iter_bytes(chunk_size=64 * 1024):
+        if response.headers.get("Content-Encoding", "identity").strip().lower() not in {
+            "", "identity",
+        }:
+            raise ValueError("compressed title feeds are unsupported")
+        # Never invoke HTTPX's decompressor before applying the byte cap.
+        for chunk in response.iter_raw(chunk_size=64 * 1024):
             if len(content) + len(chunk) > max_bytes:
                 raise ValueError(f"feed exceeded {max_bytes} byte response limit")
             content.extend(chunk)
