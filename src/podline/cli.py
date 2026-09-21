@@ -92,6 +92,9 @@ def _print_header(title: str) -> None:
 
 
 def _print_key_values(items) -> None:
+    if not items:
+        typer.echo("  none")
+        return
     width = max(len(label) for label, _value in items)
     for label, value in items:
         typer.echo(

@@ -3,6 +3,7 @@ from dataclasses import replace
 import logging
 from types import SimpleNamespace
 
+import pytest
 from typer.testing import CliRunner
 
 from podline import cli as cli_module
@@ -471,6 +472,78 @@ def test_auphonic_offset_command_prints_dry_run_plan(
     assert "Already Aligned" in result.stdout
     assert "Tr3.webm" in result.stdout
     assert "applied" in result.stdout
+
+
+def test_print_section_handles_empty_items(capsys) -> None:
+    cli_module._print_section("Targets", [])
+
+    assert capsys.readouterr().out == "\nTargets\n  none\n"
+
+
+@pytest.mark.parametrize("apply", [False, True])
+def test_auphonic_offset_command_prints_equal_duration_plan(
+    tmp_path: Path, monkeypatch, apply: bool
+) -> None:
+    runtime_home = tmp_path / "runtime"
+    config_file = tmp_path / "config.yaml"
+    _write_config(config_file, runtime_home, tmp_path / "raw")
+
+    db_file = runtime_home / "state" / "state.db"
+    initialize_database(str(db_file))
+    with connect(str(db_file)) as connection:
+        connection.execute(
+            "INSERT INTO sessions (session_uid, source_path, fingerprint, status, auphonic_production_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "session-1",
+                "/tmp/source",
+                "fingerprint-1",
+                "auphonic_prepared",
+                "prod-111",
+                "2025",
+                "2025",
+            ),
+        )
+        connection.commit()
+
+    tr1 = AssetRecord("host1", "091826_125329_Tr1.WAV", 9, "/tmp/source/Tr1.WAV")
+    tr2 = AssetRecord("host2", "091826_125329_Tr2.WAV", 9, "/tmp/source/Tr2.WAV")
+    calls = []
+
+    def fake_offset(*, config, runtime_paths, db_file, session, apply):
+        calls.append((session.session_uid, apply))
+        return AuphonicOffsetResult(
+            plan=AuphonicOffsetPlan(
+                production_id="prod-111",
+                asset_durations=[
+                    AuphonicAssetDuration(tr1, 3598.0),
+                    AuphonicAssetDuration(tr2, 3598.0),
+                ],
+                local_assets=[],
+                reference_asset=tr1,
+                targets=[],
+                aligned_assets=[tr2],
+            ),
+            applied=apply,
+            track_states=[],
+        )
+
+    monkeypatch.setattr(cli_module, "offset_session_auphonic_production", fake_offset)
+    args = ["auphonic-offset", "session-1", "--config", str(config_file)]
+    if apply:
+        args.append("--apply")
+
+    result = runner.invoke(app, args)
+
+    assert result.exit_code == 0, result.output
+    assert calls == [("session-1", apply)]
+    heading = "Auphonic Offset Applied" if apply else "Auphonic Offset Plan"
+    assert heading in result.stdout
+    assert "3598.000s" in result.stdout
+    assert "Targets\n  none\n" in result.stdout
+    assert (
+        "Already Aligned\n091826_125329_Tr2.WAV  offset_seconds=0  update=skipped"
+        in result.stdout
+    )
 
 
 def test_auphonic_reset_command_requeues_session(tmp_path: Path) -> None:
