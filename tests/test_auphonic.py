@@ -1675,6 +1675,59 @@ def test_session_offset_multitrack_dry_run_does_not_update_auphonic(
     assert client.offset_updates == []
 
 
+@pytest.mark.parametrize("apply", [False, True])
+def test_session_offset_equal_local_tracks_are_already_aligned(
+    app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path,
+    apply,
+) -> None:
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = session_factory(
+        runtime_paths.db_file,
+        session_uid="session-offset-local",
+        status="auphonic_prepared",
+        auphonic_production_id="prod-123",
+    )
+    tracks = []
+    for index, role in enumerate(["host1", "host2", "guest1", "guest2"], start=1):
+        path = tmp_path / f"Tr{index}.WAV"
+        path.write_bytes(f"track-{index}".encode())
+        artifact_registrar(
+            runtime_paths.db_file,
+            runtime_paths,
+            session_uid=session.session_uid,
+            kind="raw_track",
+            role=role,
+            path=path,
+            duration_seconds=5027.0,
+            source_provider="local_import",
+        )
+        tracks.append({"id": role, "type": "multitrack", "input_file": path.name})
+    client = FakeOffsetAuphonicClient(tracks=tracks)
+
+    class UnexpectedCozytrackClient:
+        def get_session(self, session_id):
+            raise AssertionError("Equal-duration local tracks need no Cozytrack lookup")
+
+    result = offset_session_auphonic_production(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        apply=apply,
+        client=client,
+        cozytrack_client=UnexpectedCozytrackClient(),
+    )
+
+    assert result.plan.reference_asset.filename == "Tr1.WAV"
+    assert [asset.filename for asset in result.plan.aligned_assets] == [
+        "Tr2.WAV", "Tr3.WAV", "Tr4.WAV",
+    ]
+    assert result.plan.targets == []
+    assert result.track_states == []
+    assert client.offset_updates == []
+
+
 def test_session_offset_requires_cozytrack_topology_for_more_than_two_tracks(
     app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
 ) -> None:

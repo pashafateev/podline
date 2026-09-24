@@ -1704,7 +1704,10 @@ def plan_session_auphonic_offset(
     ]
     local_assets = []
     created_at_by_source_id = {}
-    if len(asset_durations) > 2:
+    # Equal durations already produce no offset targets. Local multitrack
+    # recorder imports can take that path without Cozytrack metadata.
+    needs_offsets = len({item.duration_seconds for item in asset_durations}) > 1
+    if len(asset_durations) > 2 and needs_offsets:
         topology = _load_cozytrack_offset_topology(
             config=config,
             session=session,
