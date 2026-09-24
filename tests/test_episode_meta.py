@@ -103,6 +103,9 @@ def _ready_session_with_transcript(
 
 
 def test_episode_meta_prompt_preserves_editorial_contract() -> None:
+    assert "sentence case" in EPISODE_METADATA_PROMPT
+    assert "Do not use all caps" in EPISODE_METADATA_PROMPT
+    assert "proper names and acronyms" in EPISODE_METADATA_PROMPT
     assert "2–7 words" in EPISODE_METADATA_PROMPT
     assert "recurring transcript themes, phrases, or images" in EPISODE_METADATA_PROMPT
     assert "Slightly edgy and memorable, but newcomer-safe" in EPISODE_METADATA_PROMPT

@@ -25,7 +25,10 @@ class FakePodbeanClient:
 
     def list_episodes(self, access_token: str, limit: int = 100):
         assert access_token == "token-123"
-        return [{"episode_number": 15}]
+        return [
+            {"status": "publish", "title": "15. Previous episode"},
+            {"status": "draft", "episode_number": 99},
+        ]
 
     def authorize_upload(self, access_token: str, file_path: Path, content_type: str):
         return {
@@ -49,6 +52,8 @@ class FakePodbeanClient:
         transcript_key: str,
         episode_number: int,
     ):
+        self.created_title = title
+        self.created_number = episode_number
         return {
             "episode": {
                 "id": "pb-123",
@@ -58,11 +63,21 @@ class FakePodbeanClient:
 
 
 def test_next_episode_number_uses_max_existing_number() -> None:
-    assert _next_episode_number([{"episode_number": 15}, {"episode_number": 12}]) == 16
+    assert (
+        _next_episode_number(
+            [
+                {"status": "publish", "episode_number": 15},
+                {"status": "publish", "episode_number": 12},
+            ]
+        )
+        == 16
+    )
     assert _next_episode_number([]) == 1
 
 
+@pytest.mark.parametrize("number_reserved", [False, True])
 def test_create_podbean_draft_materializes_artifacts_and_updates_session(
+    number_reserved,
     app_config_factory,
     runtime_factory,
     session_factory,
@@ -105,6 +120,33 @@ def test_create_podbean_draft_materializes_artifacts_and_updates_session(
     )
     client = FakePodbeanClient()
 
+    if number_reserved:
+        from podline.db import connect
+
+        other = session_factory(runtime_paths.db_file, session_uid="other-draft")
+        upsert_episode_metadata(
+            runtime_paths.db_file,
+            session_uid=other.session_uid,
+            title="Other draft",
+            description="Description",
+        )
+        with connect(runtime_paths.db_file) as connection:
+            connection.execute(
+                "UPDATE episodes SET episode_number = 16 WHERE session_uid = ?",
+                (other.session_uid,),
+            )
+            connection.commit()
+        with pytest.raises(PodbeanError, match="already assigned"):
+            create_podbean_draft(
+                config=config,
+                runtime_paths=runtime_paths,
+                db_file=runtime_paths.db_file,
+                session=session,
+                client=client,
+            )
+        assert client.uploaded == []
+        return
+
     episode = create_podbean_draft(
         config=config,
         runtime_paths=runtime_paths,
@@ -113,6 +155,9 @@ def test_create_podbean_draft_materializes_artifacts_and_updates_session(
         client=client,
     )
 
+    assert client.created_title == "16. Is my sponsor God?"
+    assert client.created_number == 16
+    assert episode.title == client.created_title
     assert episode.episode_number == 16
     assert episode.podbean_post_id == "pb-123"
     assert episode.draft_url == "https://podbean.test/draft/pb-123"
@@ -225,9 +270,7 @@ def test_podbean_presigned_upload_stops_after_bounded_transport_retries(
     client._client = httpx.Client(transport=httpx.MockTransport(fail_upload))
     media_file = tmp_path / "final.mp3"
     media_file.write_bytes(b"final audio")
-    monkeypatch.setattr(
-        "podline.podbean.sleep", lambda seconds: delays.append(seconds)
-    )
+    monkeypatch.setattr("podline.podbean.sleep", lambda seconds: delays.append(seconds))
 
     with pytest.raises(PodbeanError, match="failed after 3 attempts"):
         client.upload_presigned_file(
@@ -238,3 +281,64 @@ def test_podbean_presigned_upload_stops_after_bounded_transport_retries(
 
     assert attempts == 3
     assert delays == [2.0, 4.0]
+
+
+@pytest.mark.parametrize("value", [None, "", "bad", 0])
+def test_number_falls_back_to_published_title(value):
+    assert (
+        _next_episode_number(
+            [
+                {
+                    "status": "publish",
+                    "episode_number": value,
+                    "title": "38. Last release",
+                },
+                {"status": "draft", "episode_number": 90},
+                {"status": "future", "episode_number": 91},
+                {"episode_number": 92},
+            ]
+        )
+        == 39
+    )
+
+
+def test_number_does_not_restart_when_published_history_is_unnumbered():
+    with pytest.raises(PodbeanError, match="published episode number"):
+        _next_episode_number([{"status": "publish", "title": "Unnumbered"}])
+
+
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    [
+        ("STARTING OVER AGAIN", "39. Starting over again"),
+        ("  38. STARTING OVER AGAIN  ", "39. Starting over again"),
+        ("I met God at AA", "39. I met God at AA"),
+        ("Why I love recovery", "39. Why I love recovery"),
+    ],
+)
+def test_draft_title(title, expected):
+    from podline.podbean import _draft_title
+
+    assert _draft_title(title, 39) == expected
+
+
+def test_episode_listing_follows_pagination(app_config_factory, tmp_path):
+    offsets = []
+
+    def respond(request):
+        offset = int(request.url.params["offset"])
+        offsets.append(offset)
+        return httpx.Response(
+            200,
+            json={
+                "episodes": [{"status": "draft", "episode_number": 90}]
+                if offset == 0
+                else [{"status": "publish", "episode_number": 38}],
+                "has_more": offset == 0,
+            },
+        )
+
+    client = PodbeanClient(app_config_factory(tmp_path, podbean_enabled=True))
+    client._client = httpx.Client(transport=httpx.MockTransport(respond))
+    assert _next_episode_number(client.list_episodes("token")) == 39
+    assert offsets == [0, 1]

@@ -191,6 +191,14 @@ pod podbean-draft @1
 pod status @1
 ```
 
+Draft titles use `N. Title`, where `N` is one more than the highest published
+Podbean episode number (falling back to the `N. ` title prefix for older releases).
+Drafts and scheduled episodes do not advance that number. If it is already
+assigned to another local session, resolve that draft before creating another.
+Metadata generation requests sentence case and preserves proper names and acronyms.
+Already saved all-caps titles receive a sentence-case fallback when drafted; review
+names and acronyms in those legacy titles. Existing Podbean drafts are not updated.
+
 Cleanup status
 - Source media and generated artifacts are authoritative in S3; the local cache under `~/podline/cache/` is a replaceable copy (`pod cache-clear`).
 - Workspaces under `~/podline/workspaces/` persist through editing and release, then get retired with `pod workspace-clean --apply` after the retention window (default 14 days untouched, `draft_created` sessions only). Everything except a Cubase project saved in the workspace re-materializes from S3.
