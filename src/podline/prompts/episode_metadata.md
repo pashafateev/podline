@@ -9,6 +9,8 @@ When references are available, the user input is a JSON object whose
 
 Title:
 - Write 2–7 words.
+- Use sentence case, preserving proper names and acronyms. Do not use all caps
+  or capitalize every word, even when published style references do.
 - Ground it in recurring transcript themes, phrases, or images.
 - Prefer the episode's central tension or story over an isolated joke or memorable aside.
 - Slightly edgy and memorable, but newcomer-safe.

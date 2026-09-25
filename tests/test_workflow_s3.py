@@ -169,7 +169,7 @@ class WorkflowPodbeanClient:
         return "token"
 
     def list_episodes(self, access_token, limit=100):
-        return [{"episode_number": 15}]
+        return [{"status": "publish", "episode_number": 15}]
 
     def authorize_upload(self, access_token, file_path, content_type):
         return {
