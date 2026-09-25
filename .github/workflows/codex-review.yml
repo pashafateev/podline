@@ -32,7 +32,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-    uses: pashafateev/codex-workflows/.github/workflows/codex-review.yml@86a12582f955d506cb6abcf9b0ae44ee4c8bb4c4 # codex-workflows#3
+    uses: pashafateev/codex-workflows/.github/workflows/codex-review.yml@581d87ab989153a2a26f303689b06d5584f0ced6 # codex-workflows#3
     with:
       fallback_model: ${{ vars.CODEX_REVIEW_FALLBACK_MODEL }}
     secrets:
