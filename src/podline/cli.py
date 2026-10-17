@@ -186,6 +186,13 @@ def _print_session_table(sessions, *, full: bool = False) -> None:
 
 
 def _resolve_config_path(config: Optional[Path]) -> Path:
+    if config == Path("personal"):
+        personal_config = Path.home() / "podline-personal" / "config.yaml"
+        if not personal_config.is_file():
+            raise typer.BadParameter(
+                f"Personal config not found: {personal_config}", param_hint="--config"
+            )
+        return personal_config.resolve()
     if config is not None:
         return config.expanduser().resolve()
     return (Path.home() / "podline" / "config.yaml").resolve()
@@ -321,7 +328,7 @@ def _resolve_finalize_master(
 def init(
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """Initialize runtime directories, logging, health file, and SQLite schema."""
@@ -356,7 +363,7 @@ def reset_db(
         help="Delete the current SQLite database without prompting.",
     ),
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """Delete and recreate the SQLite database for the current runtime."""
@@ -375,7 +382,7 @@ def reset_db(
 def refresh(
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """Retired: sessions now live in S3-backed storage."""
@@ -393,7 +400,7 @@ def refresh(
 def health(
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """Show current local health snapshot."""
@@ -437,7 +444,7 @@ def health(
 @app.command("cache-clear")
 def cache_clear(
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """Empty the local artifact cache. Cached files re-download from S3 on demand."""
@@ -468,7 +475,7 @@ def workspace_clean(
         help="Actually delete eligible workspaces (dry run without it).",
     ),
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """Remove editing workspaces for released episodes after a retention window.
@@ -552,7 +559,7 @@ def list_command(
     ),
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """List known sessions."""
@@ -566,7 +573,7 @@ def status(
     session_uid: str,
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """Show one tracked session."""
@@ -684,7 +691,7 @@ def status(
 def scan(
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """Retired: use pod import <folder> to register local recordings."""
@@ -703,7 +710,7 @@ def import_command(
     folder: Path = typer.Argument(..., help="Recording folder containing TrN track files."),
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """Register a local recording folder (e.g. Riverside) into S3 storage."""
@@ -744,7 +751,7 @@ def workspace(
     ),
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """Materialize a persistent editing folder, optionally with repair stems."""
@@ -816,7 +823,7 @@ def finalize_command(
     ),
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """Attach the final edited master and generate draft metadata."""
@@ -888,7 +895,7 @@ def episode_meta_command(
     session_uid: str,
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """Generate episode title and description with the OpenAI API."""
@@ -936,7 +943,7 @@ def transcript_refresh_command(
     ),
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """Regenerate the transcript from the finalized master."""
@@ -980,7 +987,7 @@ def podbean_draft_command(
     session_uid: str,
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """Upload the finalized master and create a Podbean draft."""
@@ -1026,7 +1033,7 @@ def auphonic_command(
     session_uid: str,
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """Upload one queued session to Auphonic and download outputs."""
@@ -1070,7 +1077,7 @@ def auphonic_prepare_command(
     session_uid: str,
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """Create an Auphonic production and upload files without starting it."""
@@ -1137,7 +1144,7 @@ def auphonic_preview_command(
     ),
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """Open the prepared Auphonic production for preview before starting."""
@@ -1191,7 +1198,7 @@ def auphonic_reset_command(
     session_uid: str,
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """Abandon the prepared Auphonic production and requeue the session.
@@ -1237,7 +1244,7 @@ def auphonic_start_command(
     session_uid: str,
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """Start an already-uploaded Auphonic production and fetch outputs."""
@@ -1284,7 +1291,7 @@ def auphonic_inspect_command(
     ),
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """Inspect an Auphonic production without starting it."""
@@ -1374,7 +1381,7 @@ def auphonic_offset_command(
     ),
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """Compute and optionally apply a duration-based Auphonic track offset."""
@@ -1473,7 +1480,7 @@ def auphonic_offset_command(
 def ct_list_command(
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """List Cozytrack sessions ready to ingest (excludes already-ingested)."""
@@ -1541,7 +1548,7 @@ def ct_ingest_command(
     ),
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """Download a Cozytrack session's tracks and register it in podline."""
@@ -1599,7 +1606,7 @@ def auphonic_sync_command(
     ),
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to config.yaml."
+        None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
     ),
 ) -> None:
     """Reconcile remote Auphonic state back into the local session DB."""

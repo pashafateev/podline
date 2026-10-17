@@ -74,6 +74,55 @@ def test_default_config_path_points_at_podline_checkout(monkeypatch, tmp_path: P
     assert cli_module._resolve_config_path(None) == tmp_path / "podline" / "config.yaml"
 
 
+def test_personal_config_alias_uses_separate_runtime_and_local_override(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cli_module.Path, "home", lambda: tmp_path)
+    personal_dir = tmp_path / "podline-personal"
+    personal_dir.mkdir()
+    _write_config(personal_dir / "config.yaml", tmp_path / "unused", tmp_path / "raw")
+    runtime = tmp_path / "personal-runtime"
+    (personal_dir / "config.local.yaml").write_text(
+        f"runtime_home: {runtime}\n", encoding="utf-8"
+    )
+    work_dir = tmp_path / "podline"
+    work_dir.mkdir()
+    _write_config(work_dir / "config.yaml", work_dir, tmp_path / "work-raw")
+
+    result = runner.invoke(app, ["init", "--config", "personal"])
+
+    assert result.exit_code == 0, result.output
+    assert (runtime / "state" / "state.db").is_file()
+    assert not (work_dir / "state").exists()
+    assert not (tmp_path / "unused").exists()
+
+
+def test_missing_personal_config_fails_without_falling_back(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(cli_module.Path, "home", lambda: tmp_path)
+    work_dir = tmp_path / "podline"
+    work_dir.mkdir()
+    _write_config(work_dir / "config.yaml", work_dir, tmp_path / "raw")
+
+    result = runner.invoke(app, ["init", "--config", "personal"])
+
+    assert result.exit_code == 2
+    assert "Personal config not found" in result.output
+    assert not (work_dir / "state").exists()
+
+
+@pytest.mark.parametrize("filename", ["custom.yaml", "personal"])
+def test_explicit_config_path_still_selects_file(monkeypatch, tmp_path: Path, filename: str) -> None:
+    monkeypatch.setattr(cli_module.Path, "home", lambda: tmp_path)
+    config_file = tmp_path / filename
+    runtime = tmp_path / "custom-runtime"
+    _write_config(config_file, runtime, tmp_path / "raw")
+
+    result = runner.invoke(app, ["init", "--config", str(config_file)])
+
+    assert result.exit_code == 0, result.output
+    assert (runtime / "state" / "state.db").is_file()
+
+
 def test_reset_db_recreates_database(tmp_path: Path) -> None:
     runtime_home = tmp_path / "runtime"
     raw_root = tmp_path / "raw"
