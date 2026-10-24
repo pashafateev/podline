@@ -43,6 +43,8 @@ pod health
 ```
 
 Local config
+- Commands use `~/podline/config.yaml` by default. Add `--config personal` to use the separate `~/podline-personal/config.yaml`, for example `pod list --config personal`.
+- Full config paths still work with `--config /path/to/config.yaml`. Each selected config loads its adjacent `config.local.yaml` overrides. If the personal config is missing, the command stops without using the default account.
 - Keep committed defaults in `config.yaml`.
 - Put machine-specific paths and secrets in `config.local.yaml`, which is gitignored.
 - Start from `config.local.yaml.example` and copy it to `config.local.yaml`.
