@@ -48,6 +48,20 @@ class CozytrackTrack:
     created_at: Optional[str]
     participant_id: Optional[str] = None
     duration_ms: Optional[int] = None
+    take_id: Optional[str] = None
+    partial: Optional[bool] = None
+    segment_count: Optional[int] = None
+    incomplete_segment_count: Optional[int] = None
+    updated_at: Optional[str] = None
+    s3_purged_at: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class CozytrackTake:
+    id: str
+    started_at: Optional[str]
+    stopped_at: Optional[str]
+    status: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -57,6 +71,7 @@ class CozytrackSession:
     status: Optional[str]
     finalized_at: Optional[str]
     tracks: List[CozytrackTrack]
+    recording_takes: Optional[List[CozytrackTake]] = None
 
 
 class CozytrackClientProtocol(Protocol):
@@ -151,12 +166,28 @@ def _parse_session(payload: Dict[str, Any]) -> CozytrackSession:
         raise CozytrackError(f"Cozytrack session payload missing 'id': {payload!r:.300}")
     raw_tracks = payload.get("tracks") or []
     tracks = [_parse_track(item) for item in raw_tracks if isinstance(item, dict)]
+    raw_takes = payload.get("recordingTakes")
+    takes = None
+    if raw_takes is not None:
+        if not isinstance(raw_takes, list):
+            raise CozytrackError("Cozytrack recordingTakes must be an array")
+        takes = []
+        for item in raw_takes:
+            if not isinstance(item, dict) or not item.get("id"):
+                raise CozytrackError("Cozytrack take payload is missing id")
+            takes.append(CozytrackTake(
+                id=str(item["id"]),
+                started_at=_optional_str(item.get("startedAt")),
+                stopped_at=_optional_str(item.get("stoppedAt")),
+                status=_optional_str(item.get("status")),
+            ))
     return CozytrackSession(
         id=str(payload["id"]),
         name=_optional_str(payload.get("name")),
         status=_optional_str(payload.get("status")),
         finalized_at=_optional_str(payload.get("finalizedAt")),
         tracks=tracks,
+        recording_takes=takes,
     )
 
 
@@ -170,7 +201,27 @@ def _parse_track(payload: Dict[str, Any]) -> CozytrackTrack:
         created_at=_optional_str(payload.get("createdAt")),
         participant_id=_optional_str(payload.get("participantId")),
         duration_ms=_optional_int(payload.get("durationMs")),
+        take_id=_optional_str(payload.get("takeId")),
+        partial=_optional_bool(payload.get("partial")),
+        segment_count=_optional_count(payload.get("segmentCount")),
+        incomplete_segment_count=_optional_count(payload.get("incompleteSegmentCount")),
+        updated_at=_optional_str(payload.get("updatedAt")),
+        s3_purged_at=_optional_str(payload.get("s3PurgedAt")),
     )
+
+
+def _optional_bool(value: Any) -> Optional[bool]:
+    if value is None or isinstance(value, bool):
+        return value
+    raise CozytrackError(f"Expected boolean value, received {value!r}")
+
+
+def _optional_count(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise CozytrackError(f"Expected nonnegative segment count, received {value!r}")
+    return value
 
 
 def _optional_str(value: Any) -> Optional[str]:

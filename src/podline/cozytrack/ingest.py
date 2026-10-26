@@ -99,6 +99,14 @@ def ingest_session(
                 f"Could not load Cozytrack session {cozytrack_session_id} to "
                 f"verify roles for {existing.session_uid}: {exc}"
             ) from exc
+        if _has_part_metadata(cozytrack_session):
+            from podline.cozytrack.parts import ingest_parts
+            return ingest_parts(
+                config=config, runtime_paths=runtime_paths, db_file=db_file,
+                session=cozytrack_session, client=client, name_override=name_override,
+                excluded_track_selectors=excluded_track_selectors, storage=storage,
+                duration_probe=duration_probe, logger=logger,
+            )
         missing_ids = _spoken_tracks_missing_source_ids(db_file, existing.session_uid)
         if missing_ids:
             # A previous run associated the session but never persisted the
@@ -133,6 +141,14 @@ def ingest_session(
 
     client = client or CozytrackClient(config)
     session = client.get_session(cozytrack_session_id)
+    if _has_part_metadata(session):
+        from podline.cozytrack.parts import ingest_parts
+        return ingest_parts(
+            config=config, runtime_paths=runtime_paths, db_file=db_file,
+            session=session, client=client, name_override=name_override,
+            excluded_track_selectors=excluded_track_selectors, storage=storage,
+            duration_probe=duration_probe, logger=logger,
+        )
     if not session.tracks:
         raise CozytrackIngestError(
             f"Cozytrack session {cozytrack_session_id} has no tracks"
@@ -264,6 +280,13 @@ def ingest_session(
         record.session_uid,
     )
     return record
+
+
+def _has_part_metadata(session: CozytrackSession) -> bool:
+    return session.recording_takes is not None or any(
+        track.take_id or track.partial is not None or track.segment_count is not None
+        for track in session.tracks
+    )
 
 
 def _heal_associated_session(
@@ -588,6 +611,9 @@ def format_session_track_table(session: CozytrackSession) -> str:
     """Render stable, copyable track choices for an ingest operator."""
     if not session.tracks:
         return "(no tracks)"
+    if _has_part_metadata(session):
+        from podline.cozytrack.parts import format_part_tracks
+        return format_part_tracks(session)
     roles_by_track_id = _display_roles_by_track_id(session.tracks)
     sorted_tracks = sorted(
         session.tracks,

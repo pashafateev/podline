@@ -364,7 +364,13 @@ class AuphonicClient:
 
     def _request_with_retries(self, method: str, url: str, **kwargs) -> httpx.Response:
         last_error: Optional[Exception] = None
-        for _attempt in range(3):
+        # A lost response is not proof these side effects failed remotely.
+        # The owning workflow must inspect/reconcile before another attempt.
+        non_idempotent = method.upper() == "POST" and (
+            url == "/productions.json" or url.endswith("/start.json")
+        )
+        attempts = 1 if non_idempotent else 3
+        for _attempt in range(attempts):
             try:
                 logging.getLogger("podline").debug(
                     "Auphonic request method=%s url=%s attempt=%s",
@@ -402,7 +408,8 @@ class AuphonicClient:
                     url,
                     exc,
                 )
-                sleep(1)
+                if _attempt + 1 < attempts:
+                    sleep(1)
             except (httpx.HTTPError, httpx.TransportError) as exc:
                 last_error = exc
                 logging.getLogger("podline").debug(
@@ -411,7 +418,8 @@ class AuphonicClient:
                     url,
                     exc,
                 )
-                sleep(1)
+                if _attempt + 1 < attempts:
+                    sleep(1)
         raise AuphonicError(f"Auphonic request failed: {last_error}") from last_error
 
 
@@ -841,10 +849,11 @@ def resolve_auphonic_service_id(config: AppConfig) -> str:
 
 
 def _spoken_raw_tracks(
-    config: AppConfig, db_file: str, session_uid: str
+    config: AppConfig, db_file: str, session_uid: str, part_id: Optional[str] = None
 ) -> List[MediaArtifactRecord]:
     artifacts = list_media_artifacts(
-        db_file, session_uid, kind=ArtifactKind.RAW_TRACK.value
+        db_file, session_uid, kind=ArtifactKind.RAW_TRACK.value,
+        **({"part_id": part_id} if part_id is not None else {}),
     )
     tracks = [artifact for artifact in artifacts if artifact.role != "mix"]
     if not tracks:
@@ -899,6 +908,13 @@ def validate_auphonic_config(config: AppConfig) -> None:
         raise AuphonicError("Auphonic base_url is missing in config.yaml")
 
 
+def _download_output(client, url: str, destination: Path) -> None:
+    # A previous attempt may have seeded an immutable cache hardlink and then
+    # failed before staging cleanup. Never download into that existing inode.
+    destination.unlink(missing_ok=True)
+    client.download_file(url, destination)
+
+
 def _persist_outputs(
     *,
     client: AuphonicClientProtocol,
@@ -909,9 +925,14 @@ def _persist_outputs(
     production: AuphonicProduction,
     production_details: Optional[Dict] = None,
     logger: Optional[logging.Logger] = None,
+    part_id: Optional[str] = None,
+    output_basename: Optional[str] = None,
 ) -> Dict[str, object]:
     staging_dir = Path(runtime_paths.staging_dir) / session_uid
+    if part_id is not None:
+        staging_dir = staging_dir / part_id
     staging_dir.mkdir(parents=True, exist_ok=True)
+    scope = {"part_id": part_id} if part_id is not None else {}
 
     master_output = next(
         (item for item in production.output_files if item.extension == "mp3"),
@@ -924,10 +945,10 @@ def _persist_outputs(
     if master_output is None or transcript_output is None:
         raise AuphonicError("Auphonic outputs did not include both mp3 and vtt files")
 
-    staged_master = staging_dir / f"{session_uid}_pre_edit.mp3"
-    staged_transcript = staging_dir / f"{session_uid}.vtt"
-    client.download_file(master_output.download_url, staged_master)
-    client.download_file(transcript_output.download_url, staged_transcript)
+    staged_master = staging_dir / f"{output_basename or session_uid + '_pre_edit'}.mp3"
+    staged_transcript = staging_dir / f"{output_basename or session_uid}.vtt"
+    _download_output(client, master_output.download_url, staged_master)
+    _download_output(client, transcript_output.download_url, staged_transcript)
 
     master_artifact = store_artifact_file(
         config=config,
@@ -939,6 +960,7 @@ def _persist_outputs(
         content_type="audio/mpeg",
         source_provider="auphonic",
         source_id=production.production_id,
+        **scope,
     )
     transcript_artifact = store_artifact_file(
         config=config,
@@ -950,7 +972,22 @@ def _persist_outputs(
         content_type="text/vtt",
         source_provider="auphonic",
         source_id=production.production_id,
+        **scope,
     )
+    if part_id is not None:
+        from podline.repository import list_recording_parts, register_media_artifact
+        session = get_session(db_file, session_uid)
+        if (len(list_recording_parts(db_file, session_uid)) == 1
+                and session.status not in {"finalize_started", "ready_for_draft", "draft_created"}):
+            register_media_artifact(
+                db_file, session_uid=session_uid, kind="transcript", role="",
+                filename=transcript_artifact.filename, content_type="text/vtt",
+                byte_size=transcript_artifact.byte_size, sha256=transcript_artifact.sha256,
+                duration_seconds=transcript_artifact.duration_seconds,
+                s3_uri=transcript_artifact.s3_uri, source_provider="auphonic",
+                source_id=production.production_id,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            )
     # The cache holds hardlinks to these staged files; unlink the staging
     # names so a later re-download cannot write through the shared inode.
     staged_master.unlink()
@@ -979,6 +1016,7 @@ def _persist_outputs(
                 production_id=production.production_id,
                 tracks_output=tracks_output,
                 multi_input_files=details.get("multi_input_files") or [],
+                **scope,
             )
             result["stems"] = stems
         except Exception as exc:
@@ -986,6 +1024,7 @@ def _persist_outputs(
                 db_file,
                 session_uid,
                 kind=ArtifactKind.PRE_EDIT_STEM.value,
+                **scope,
             )
             if any(
                 stem.source_id == production.production_id
@@ -995,6 +1034,7 @@ def _persist_outputs(
                     db_file,
                     session_uid=session_uid,
                     kind=ArtifactKind.PRE_EDIT_STEM.value,
+                    **scope,
                 )
                 disposition = "invalidated stems from the reprocessed production"
             else:
@@ -1013,6 +1053,7 @@ def _persist_outputs(
             db_file,
             session_uid=session_uid,
             kind=ArtifactKind.PRE_EDIT_STEM.value,
+            **scope,
         )
     return result
 
@@ -1027,8 +1068,11 @@ def _persist_stem_archive(
     production_id: str,
     tracks_output: AuphonicOutputFile,
     multi_input_files: List[Dict],
+    part_id: Optional[str] = None,
 ) -> List[MediaArtifactRecord]:
     staging_dir = Path(runtime_paths.staging_dir) / session_uid
+    if part_id is not None:
+        staging_dir = staging_dir / part_id
     staging_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         prefix=f"{session_uid}_pre_edit_stems_",
@@ -1045,6 +1089,7 @@ def _persist_stem_archive(
             db_file=db_file,
             session_uid=session_uid,
             multi_input_files=multi_input_files,
+            part_id=part_id,
         )
         with tempfile.TemporaryDirectory(
             prefix="pre_edit_stems_", dir=staging_dir
@@ -1073,6 +1118,7 @@ def _persist_stem_archive(
                 kind=ArtifactKind.PRE_EDIT_STEM.value,
                 files=files,
                 expected_roles=[binding.role for binding in bindings],
+                **({"part_id": part_id} if part_id is not None else {}),
             )
     finally:
         archive_path.unlink(missing_ok=True)
@@ -1084,9 +1130,10 @@ def _stem_track_bindings(
     db_file: str,
     session_uid: str,
     multi_input_files: List[Dict],
+    part_id: Optional[str] = None,
 ) -> List[StemTrackBinding]:
     raw_tracks = sorted(
-        _spoken_raw_tracks(config, db_file, session_uid),
+        _spoken_raw_tracks(config, db_file, session_uid, part_id=part_id),
         key=lambda artifact: _recorder_order_key(artifact.role),
     )
     prepared_tracks = [
@@ -1290,7 +1337,7 @@ def _persist_transcript_output(
         raise AuphonicError("Auphonic outputs did not include a vtt transcript")
 
     staged_transcript = staging_dir / f"{session_uid}.vtt"
-    client.download_file(transcript_output.download_url, staged_transcript)
+    _download_output(client, transcript_output.download_url, staged_transcript)
 
     artifact = store_artifact_file(
         config=config,
@@ -2053,6 +2100,7 @@ def _resolve_artifact_duration(
         role=artifact.role,
         duration_seconds=validated,
         timestamp=datetime.now(timezone.utc).isoformat(),
+        **({"part_id": artifact.part_id} if artifact.part_id is not None else {}),
     )
     return validated
 

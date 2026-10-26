@@ -81,23 +81,43 @@ pod list
 
 Notes on ingest:
 - Tracks are hashed and uploaded to `s3://<bucket>/sessions/<uid>/raw_track/...`; packet-derived durations are stored for the offset step. Nothing is written to the external drive.
-- Cozytrack roles come from stable participant ids (`host-local-ch-N` → hostN, guests numbered by recorder start order), and files are named in recorder order — not row-creation order, which can interleave a guest between host channels. Sessions without participant ids keep the legacy creation-order naming.
-- If reconnects leave more than four active source tracks, inspect them with `pod ct-ingest <id> --list-tracks`, then explicitly omit known-irrelevant clips with repeated selectors such as `--exclude guest4 --exclude guest5`. A selector may be the displayed role or exact Cozytrack track id. Podline never discards a track automatically based on its duration, and exclusions do not delete the Cozytrack source files.
+- Cozytrack take IDs define ordered recording parts under one episode. Host stop/start creates a new part; a participant reconnect does not. Stable participant IDs keep `hostN` / `guestN` roles consistent across parts, regardless of API track order or a guest's absence. Historical single-part sessions without participant IDs retain legacy ordering.
+- One `pod ct-ingest <id>` imports all included source tracks. The session can still say `recording` if its takes are stopped and tracks complete; do not finalize it just to ingest. Active takes, incomplete uploads, unresolved take IDs, or missing multipart metadata produce an actionable error.
+- Inspect sources with `pod ct-ingest <id> --list-tracks`. An explicit `--exclude` can name an exact track ID or a displayed selector such as `part-02:guest1`. An unqualified role is rejected when it matches several parts. Short or quiet Cozytrack source tracks are not silently discarded; exclusions never delete remote files. Unsupported simultaneous counts fail at prepare rather than splitting takes or dropping participants.
 - Re-running `pod ct-ingest` on an already-ingested session reconciles its stored roles against Cozytrack participant ids (the migration path for sessions ingested before identity-based roles). If roles change on a session that already has a prepared production, run `pod auphonic-reset` and re-run `pod auphonic-prepare`/`auphonic-offset` so the preset wiring picks up the corrected roles.
 - When `pod ct-ingest` dedups onto a session that was first registered via `pod import`, the surviving session gains the Cozytrack source ids (tracks paired by content hash) before roles are reconciled — without them, multitrack offset topology cannot resolve. The ids are persisted in the same transaction as the association, and a session left half-migrated by an interrupted or pre-migration run is detected on the next `pod ct-ingest`, which re-downloads and heals it in place by content hash — recovery never depends on fingerprints or file naming, and content that matches nothing is reported rather than guessed at.
-- Cozytrack downloads land in a disposable staging folder that is removed after registration; re-running `pod ct-ingest <id>` is a no-op, and re-importing an identical folder is detected by content fingerprint.
+- Cozytrack downloads use disposable staging. Repeated ingest reuses registered sources and resumes unfinished parts. New stopped takes can append before finalization without renumbering or reprocessing completed parts; changed prepared sources and post-finalization additions require explicit reconciliation instead of automatic replacement. Single-part local-import content deduplication remains supported, but matching only one part is not treated as matching a whole multipart episode.
 - WebM/Opus stems are passed through to Auphonic as-is via the S3 service reference.
 
 2. Prepare the Auphonic production without starting it
 ```bash
 pod auphonic-prepare @1 --debug   # creates the production and attaches S3 tracks
 pod auphonic-offset @1            # dry run; uses durations stored at ingest
-pod auphonic-offset @1 --apply    # offset every track shorter than the reference
+pod auphonic-offset @1 --apply    # apply only after selected parts pass timing checks
 pod auphonic-preview @1
 pod auphonic-inspect --session @1
 ```
 
-Run `pod auphonic-offset` before preview/start. Durations come from audio packet timing recorded at ingest. Cozytrack starts each track's recorder sequentially and stops them all together, so a track's start offset equals its duration shortfall against the reference (the longest track). Every shorter track is offset — remote tracks and additional host-local channels alike; for sessions with more than 2 tracks and unequal durations, stable participant identity validates that all registered tracks belong to a topology containing both host-local and remote channels. The longest validated track is the reference even when a remote recorder started first. For those sessions, duration-derived offsets must also agree with Cozytrack recorder creation times within 0.5 seconds, preventing a delayed stop from being mistaken for an early start. Two-track sessions remain duration-derived even when Cozytrack topology is available. Tracks already equal to the reference are reported as aligned and skipped. When all spoken tracks have exactly equal durations, including local recorder imports, no Cozytrack metadata is required and no offsets are updated (also with `--apply`). The command updates the prepared production and does not start processing.
+These commands handle an episode's parts in order, using one existing 2-, 3-, or
+4-speaker preset/production per part. They do not start processing until the
+explicit start step. Add `--part 2` for targeted inspection, alignment, or recovery;
+a normal single-part recording needs no selector or new command.
+
+Run `pod auphonic-offset` before preview/start. Duration shortfalls are valid
+start offsets only when the tracks share a stop time. Known partial media,
+reconnect segments, incomplete segments, or contradictory recorder timing flag
+the affected part and block automatic offsets, even with two tracks or equal
+durations. Take-aware two-track and larger recordings use available recorder
+creation times to validate duration differences within 0.5 seconds. Historical
+single-part/local alignment behavior remains available without the new metadata;
+missing evidence is not proof of uninterrupted recording.
+
+A bulk `--apply` makes no offset writes if any selected part is unsafe. Select a
+healthy part separately, or use the flagged part's preview/source tracks for
+manual alignment. Preview and explicit start remain available; they do not clear
+the warning or claim to repair reconnect gaps. See
+[part processing and recovery](docs/part-processing.md) for resume, sync, reset,
+unknown-creation recovery, and timing-guard details.
 
 3. Start Auphonic after previewing the edit page
 ```bash
