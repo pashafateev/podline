@@ -571,6 +571,7 @@ def list_command(
 @app.command()
 def status(
     session_uid: str,
+    part: Optional[int] = typer.Option(None, "--part", min=1, help="Show one recording part."),
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
         None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
@@ -587,6 +588,8 @@ def status(
         )
         raise typer.Exit(code=1)
 
+    from podline.repository import list_recording_parts
+    parts = list_recording_parts(runtime_paths.db_file, session.session_uid)
     _print_header("Session")
     _print_section(
         "Overview",
@@ -608,14 +611,24 @@ def status(
     _print_section(
         "Auphonic",
         [
-            ("auphonic_production_id", session.auphonic_production_id or "none"),
+            ("auphonic_production_id", "per-part (see below)" if len(parts) > 1
+             else session.auphonic_production_id or "none"),
             (
                 "transcript_refresh_production_id",
                 session.transcript_refresh_production_id or "none",
             ),
         ],
     )
+    selected_part = next((item for item in parts if item.part_number == part), None)
+    if part is not None and selected_part is None:
+        typer.echo(f"Recording part not found: {part}")
+        raise typer.Exit(code=1)
+    if len(parts) > 1 or any(part.source_snapshot.get("tracks") for part in parts):
+        _print_recording_parts(runtime_paths, session.session_uid, part)
     artifacts = list_media_artifacts(runtime_paths.db_file, session.session_uid)
+    if selected_part is not None:
+        artifacts = [artifact for artifact in artifacts
+                     if artifact.part_id in {None, selected_part.part_id}]
     if artifacts:
         workspace_dir = workspace_path_for(runtime_paths, session.session_uid)
         rows = []
@@ -623,6 +636,9 @@ def status(
             label = (
                 f"{artifact.kind}:{artifact.role}" if artifact.role else artifact.kind
             )
+            if len(parts) > 1 and artifact.part_id:
+                owner = next(part for part in parts if part.part_id == artifact.part_id)
+                label = f"part-{owner.part_number:02d}/{label}"
             cached = cache_path_for(
                 runtime_paths, artifact.sha256, artifact.filename
             ).exists()
@@ -744,6 +760,8 @@ def import_command(
 @app.command()
 def workspace(
     session_uid: str,
+    part: Optional[int] = typer.Option(None, "--part", min=1, help="Choose one recording part."),
+    sources: bool = typer.Option(False, "--sources", help="Export unchanged source tracks for manual repair, even before processing."),
     stems: bool = typer.Option(
         False,
         "--stems",
@@ -765,8 +783,13 @@ def workspace(
         raise typer.Exit(code=1)
 
     try:
+        from podline import part_processing
+        part_aware = part_processing.uses_part_workflow(runtime_paths.db_file, session)
         stem_metadata = (
-            resolve_stem_workspace_metadata(
+            part_processing.stem_metadata(
+                config=loaded_config, db_file=runtime_paths.db_file,
+                session=session, part_number=part,
+            ) if stems and part_aware else resolve_stem_workspace_metadata(
                 config=loaded_config,
                 db_file=runtime_paths.db_file,
                 session=session,
@@ -781,8 +804,10 @@ def workspace(
             session_uid=session.session_uid,
             include_stems=stems,
             stem_metadata=stem_metadata,
+            **({"include_sources": sources, "part_number": part}
+               if sources or part is not None else {}),
         )
-    except (ArtifactError, AuphonicError) as exc:
+    except (ArtifactError, AuphonicError, ValueError) as exc:
         logger.error("Workspace creation failed for %s: %s", session.session_uid, exc)
         typer.echo(f"Workspace error: {exc}")
         raise typer.Exit(code=1)
@@ -798,7 +823,7 @@ def workspace(
             ("contents", ", ".join(contents) or "empty"),
             (
                 "stems",
-                str(len(list((workspace_dir / "stems").glob("*.flac"))))
+                str(len(list((workspace_dir / "stems").rglob("*.flac"))))
                 if stems
                 else "not requested",
             ),
@@ -1046,6 +1071,8 @@ def auphonic_command(
         )
         raise typer.Exit(code=1)
 
+    if _run_part_command("process", loaded_config, runtime_paths, session):
+        return
     try:
         updated = process_session_with_auphonic(
             config=loaded_config,
@@ -1075,6 +1102,7 @@ def auphonic_command(
 @app.command("auphonic-prepare")
 def auphonic_prepare_command(
     session_uid: str,
+    part: Optional[int] = typer.Option(None, "--part", min=1, help="Choose one recording part."),
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
         None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
@@ -1090,6 +1118,8 @@ def auphonic_prepare_command(
         )
         raise typer.Exit(code=1)
 
+    if _run_part_command("prepare", loaded_config, runtime_paths, session, part_number=part):
+        return
     try:
         updated = prepare_session_with_auphonic(
             config=loaded_config,
@@ -1137,6 +1167,7 @@ def auphonic_prepare_command(
 @app.command("auphonic-preview")
 def auphonic_preview_command(
     session_uid: str,
+    part: Optional[int] = typer.Option(None, "--part", min=1, help="Choose one recording part."),
     open_browser: bool = typer.Option(
         True,
         "--open/--no-open",
@@ -1157,6 +1188,9 @@ def auphonic_preview_command(
         )
         raise typer.Exit(code=1)
 
+    if _run_part_command("preview", loaded_config, runtime_paths, session,
+                         part_number=part, open_browser=open_browser):
+        return
     try:
         preview = preview_prepared_session_with_auphonic(
             config=loaded_config,
@@ -1196,6 +1230,7 @@ def auphonic_preview_command(
 @app.command("auphonic-reset")
 def auphonic_reset_command(
     session_uid: str,
+    part: Optional[int] = typer.Option(None, "--part", min=1, help="Choose one recording part to reset."),
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
         None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
@@ -1216,6 +1251,8 @@ def auphonic_reset_command(
         )
         raise typer.Exit(code=1)
 
+    if _run_part_command("reset", _loaded_config, runtime_paths, session, part_number=part):
+        return
     abandoned_production_id = session.auphonic_production_id or "none"
     try:
         refreshed = reset_session_auphonic_production(
@@ -1242,6 +1279,7 @@ def auphonic_reset_command(
 @app.command("auphonic-start")
 def auphonic_start_command(
     session_uid: str,
+    part: Optional[int] = typer.Option(None, "--part", min=1, help="Choose one recording part."),
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
         None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
@@ -1257,6 +1295,8 @@ def auphonic_start_command(
         )
         raise typer.Exit(code=1)
 
+    if _run_part_command("start", loaded_config, runtime_paths, session, part_number=part):
+        return
     try:
         updated = start_prepared_session_with_auphonic(
             config=loaded_config,
@@ -1286,6 +1326,7 @@ def auphonic_start_command(
 @app.command("auphonic-inspect")
 def auphonic_inspect_command(
     production_id: Optional[str] = typer.Argument(None),
+    part: Optional[int] = typer.Option(None, "--part", min=1, help="Choose one recording part."),
     session_uid: Optional[str] = typer.Option(
         None, "--session", help="Resolve production id from a tracked session."
     ),
@@ -1297,6 +1338,9 @@ def auphonic_inspect_command(
     """Inspect an Auphonic production without starting it."""
     config_path = _resolve_config_path(config)
     loaded_config, runtime_paths, _logger = _bootstrap(config_path, debug=debug)
+    if part is not None and session_uid is None:
+        typer.echo("Use --session <episode> with --part.")
+        raise typer.Exit(code=1)
 
     resolved_production_id = production_id
     if session_uid is not None:
@@ -1306,6 +1350,9 @@ def auphonic_inspect_command(
                 f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
             )
             raise typer.Exit(code=1)
+        if _run_part_command("inspect", loaded_config, runtime_paths, session,
+                             part_number=part, production_id=production_id):
+            return
         if not session.auphonic_production_id:
             typer.echo(f"Session has no Auphonic production id: {session_uid}")
             raise typer.Exit(code=1)
@@ -1371,9 +1418,111 @@ def _print_auphonic_tracks(tracks) -> None:
         )
 
 
+def _print_recording_parts(runtime_paths, session_uid, part_number=None) -> None:
+    from podline.repository import list_recording_parts
+    for part in list_recording_parts(runtime_paths.db_file, session_uid):
+        if part_number is not None and part.part_number != part_number:
+            continue
+        bindings = part.source_snapshot.get("auphonic_bindings", {})
+        _print_section(
+            f"Part {part.part_number:02d}",
+            [
+                ("take_id", part.take_id or "legacy/default"),
+                ("status", part.status),
+                ("ingest_complete", str(part.ingest_complete)),
+                ("production_id", part.auphonic_production_id or "none"),
+                ("speaker_bindings", ", ".join(f"{role} -> {track}" for role, track in bindings.items()) or "not prepared"),
+                ("sources", ", ".join(
+                    f"{track.get('role', '?')}:{track.get('id', '?')}"
+                    for track in part.source_snapshot.get("tracks", [])
+                ) or "legacy source metadata unavailable"),
+                ("timing_warnings", str(part.timing_warnings) if part.timing_warnings else "none known (not a guarantee of uninterrupted audio)"),
+                ("failure", part.failure_reason or "none"),
+            ],
+        )
+
+
+def _run_part_command(action, config, runtime_paths, session, *, part_number=None,
+                      apply=False, open_browser=True, production_id=None) -> bool:
+    from podline import part_processing as parts
+    if part_number is None and not parts.uses_part_workflow(runtime_paths.db_file, session):
+        return False
+    common = dict(config=config, db_file=runtime_paths.db_file, session=session,
+                  part_number=part_number)
+    try:
+        if action == "prepare":
+            parts.prepare_parts(**common)
+        elif action == "preview":
+            for part, details in parts.preview_parts(**common):
+                _print_header(f"Part {part.part_number:02d} Preview")
+                typer.echo(details["edit_page"])
+                if open_browser:
+                    webbrowser.open(details["edit_page"])
+                _print_auphonic_tracks([
+                    {**track, "input_file": redact_url(str(track.get("input_file") or ""))}
+                    for track in details["multi_input_files"]
+                ])
+        elif action == "start":
+            parts.start_parts(**common, runtime_paths=runtime_paths)
+        elif action == "sync":
+            parts.sync_parts(**common, runtime_paths=runtime_paths, production_id=production_id)
+        elif action == "reset":
+            parts.reset_parts(db_file=runtime_paths.db_file, session=session, part_number=part_number)
+        elif action == "offset":
+            for part, result in parts.offset_parts(**common, runtime_paths=runtime_paths, apply=apply):
+                _print_header(f"Part {part.part_number:02d} Offset {'Applied' if apply else 'Plan'}")
+                _print_key_values([
+                    ("production_id", result.plan.production_id),
+                    ("reference", result.plan.reference_asset.role),
+                    ("applied", str(result.applied)),
+                ])
+                for target in result.plan.targets:
+                    typer.echo(f"{target.asset.role}: {target.offset_seconds:.3f}s -> {target.track_id}")
+                if not result.plan.targets:
+                    typer.echo("No duration offsets needed")
+        elif action == "inspect":
+            selected = parts.select_parts(runtime_paths.db_file, session, part_number)
+            if production_id:
+                selected = [part for part in selected if part.auphonic_production_id == production_id]
+                if not selected:
+                    raise AuphonicError("Production does not belong to the selected part")
+            for part in selected:
+                _print_header(f"Part {part.part_number:02d} Inspection")
+                if not part.auphonic_production_id:
+                    typer.echo("No prepared production")
+                    continue
+                details = inspect_production(config, part.auphonic_production_id)
+                _print_key_values([
+                    ("production_id", part.auphonic_production_id),
+                    ("remote_status", details["status_string"]),
+                    ("edit_page", details["edit_page"] or "none"),
+                ])
+                _print_auphonic_tracks(details["multi_input_files"])
+        elif action == "process" and len(parts.select_parts(runtime_paths.db_file, session)) == 1:
+            # Preserve the existing explicit single-part convenience command.
+            # Multipart episodes keep their separate review/start gate.
+            parts.prepare_parts(**common)
+            parts.preview_parts(**common)
+            parts.start_parts(**common, runtime_paths=runtime_paths)
+        else:
+            raise AuphonicError(
+                "Part-aware episodes require auphonic-prepare, auphonic-offset, "
+                "auphonic-preview, then explicit auphonic-start"
+            )
+    except (AuphonicError, ArtifactError, ValueError) as exc:
+        typer.echo(f"Auphonic error: {exc}")
+        _print_recording_parts(runtime_paths, session.session_uid, part_number)
+        raise typer.Exit(code=1)
+    updated = get_session(runtime_paths.db_file, session.session_uid)
+    _print_key_values([("session_uid", updated.session_uid), ("status", _format_status(updated.status))])
+    _print_recording_parts(runtime_paths, session.session_uid, part_number)
+    return True
+
+
 @app.command("auphonic-offset")
 def auphonic_offset_command(
     session_uid: str,
+    part: Optional[int] = typer.Option(None, "--part", min=1, help="Choose one recording part."),
     apply: bool = typer.Option(
         False,
         "--apply",
@@ -1394,6 +1543,8 @@ def auphonic_offset_command(
         )
         raise typer.Exit(code=1)
 
+    if _run_part_command("offset", loaded_config, runtime_paths, session, part_number=part, apply=apply):
+        return
     try:
         result = offset_session_auphonic_production(
             config=loaded_config,
@@ -1596,11 +1747,13 @@ def ct_ingest_command(
             ("status", _format_status(record.status)),
         ]
     )
+    _print_recording_parts(runtime_paths, record.session_uid)
 
 
 @app.command("auphonic-sync")
 def auphonic_sync_command(
     production_id: Optional[str] = typer.Argument(None),
+    part: Optional[int] = typer.Option(None, "--part", min=1, help="Choose one recording part."),
     session_uid: Optional[str] = typer.Option(
         None, "--session", help="Tracked session to reconcile."
     ),
@@ -1624,6 +1777,9 @@ def auphonic_sync_command(
         )
         raise typer.Exit(code=1)
 
+    if _run_part_command("sync", loaded_config, runtime_paths, session,
+                         part_number=part, production_id=production_id):
+        return
     resolved_production_id = production_id or session.auphonic_production_id
     if not resolved_production_id:
         typer.echo("Provide a production id or sync a session that already stores one.")

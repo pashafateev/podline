@@ -27,6 +27,7 @@ from podline.models import (
 from podline.repository import (
     create_session_with_artifacts,
     get_session_by_fingerprint,
+    list_recording_parts,
     set_cozytrack_session_id,
 )
 from podline.scanner import _parse_session_dir
@@ -84,6 +85,7 @@ def register_candidate_with_storage(
     storage: Optional[MediaStorage] = None,
     duration_probe: Optional[DurationProbe] = None,
     logger: Optional[logging.Logger] = None,
+    part_metadata: Optional[dict] = None,
 ) -> Tuple[SessionRecord, bool]:
     """Upload a classified session's tracks to S3 and register it.
 
@@ -99,6 +101,11 @@ def register_candidate_with_storage(
     fingerprint = build_fingerprint(candidate)
     existing = get_session_by_fingerprint(db_file, fingerprint)
     if existing is not None:
+        if len(list_recording_parts(db_file, existing.session_uid)) > 1:
+            raise IngestError(
+                f"Content matches only part of multipart episode {existing.session_uid}; "
+                "refusing to deduplicate it as a complete episode"
+            )
         if cozytrack_session_id and existing.cozytrack_session_id is None:
             # Same content was registered without a Cozytrack association
             # (e.g. via pod import). Backfill it so ct-list stops offering
@@ -116,6 +123,7 @@ def register_candidate_with_storage(
                     (track.path, (track_source_ids or {}).get(track.path.name, ""))
                     for track in candidate.spoken_tracks
                 ),
+                part_metadata=part_metadata,
             )
             _log(
                 logger,
@@ -216,6 +224,7 @@ def register_candidate_with_storage(
         timestamp=datetime.now(timezone.utc).isoformat(),
         artifacts=[spec for _track, _sha, spec in uploads],
         cozytrack_session_id=cozytrack_session_id,
+        part_metadata=part_metadata,
     )
     for track, sha256, _spec in uploads:
         seed_cache(runtime_paths, source_path=track.path, sha256=sha256)

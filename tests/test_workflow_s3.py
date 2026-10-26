@@ -369,3 +369,76 @@ def test_full_s3_pipeline_without_any_drive_paths(
         "transcript",
         "final_master",
     }
+
+
+def test_multipart_s3_pipeline_uses_one_assembled_final_master(
+    moto_s3, app_config_factory, runtime_factory, tmp_path,
+):
+    import pytest
+    from podline.part_processing import (
+        prepare_parts, preview_parts, start_parts, sync_parts,
+    )
+    from test_part_processing import MultiProductionClient
+    from test_recording_parts import PartsClient, ingest, session_payload
+
+    config = app_config_factory(tmp_path, podbean_enabled=True)
+    runtime = runtime_factory(config)
+    episode = ingest(config, runtime, PartsClient(session_payload()))
+    client = MultiProductionClient()
+    prepare_parts(config=config, db_file=runtime.db_file, session=episode, client=client)
+    preview_parts(config=config, db_file=runtime.db_file, session=episode, client=client)
+    processed = start_parts(
+        config=config, runtime_paths=runtime, db_file=runtime.db_file,
+        session=episode, client=client,
+    )
+    assert processed.status == "waiting_for_finalize"
+    assert [preset for _id, _count, preset in client.created] == [
+        "preset-3", "preset-3", "preset-2",
+    ]
+    workspace = workspace_path_for(runtime, episode.session_uid)
+    for number in (1, 2, 3):
+        assert (workspace / f"part-{number:02d}.mp3").exists()
+        assert (workspace / f"part-{number:02d}.vtt").exists()
+    assert get_media_artifact(runtime.db_file, episode.session_uid, kind="final_master") is None
+
+    # This file represents the user's Cubase assembly, not a Podline stitch.
+    exported = workspace / "assembled.wav"
+    exported.write_bytes(b"editor-assembled-final-master")
+    finalized = finalize_session(
+        config=config, runtime_paths=runtime, db_file=runtime.db_file,
+        session=processed, master_path=exported,
+    )
+    client.fail_wait = "prod-final-refresh"
+    with pytest.raises(RuntimeError, match="poll interrupted"):
+        refresh_transcript_with_auphonic(
+            config=config, runtime_paths=runtime, db_file=runtime.db_file,
+            session=finalized, client=client,
+        )
+    client.fail_wait = None
+    refreshed = refresh_transcript_with_auphonic(
+        config=config, runtime_paths=runtime, db_file=runtime.db_file,
+        session=get_session(runtime.db_file, episode.session_uid), client=client,
+    )
+    assert len(client.single_created) == 1
+    assert client.single_created[0]["input_key"].endswith("/assembled.wav")
+    generate_episode_metadata(
+        config=config, runtime_paths=runtime, db_file=runtime.db_file,
+        session=refreshed, client=WorkflowOpenAIClient(),
+    )
+    podbean = WorkflowPodbeanClient()
+    draft = create_podbean_draft(
+        config=config, runtime_paths=runtime, db_file=runtime.db_file,
+        session=refreshed, client=podbean,
+    )
+    assert draft.podbean_post_id == "pb-flow"
+    assert podbean.uploaded == ["assembled.wav", f"{episode.session_uid}.vtt"]
+    final_before = get_media_artifact(runtime.db_file, episode.session_uid, kind="final_master")
+    transcript_before = get_media_artifact(runtime.db_file, episode.session_uid, kind="transcript")
+    after_sync = sync_parts(
+        config=config, runtime_paths=runtime, db_file=runtime.db_file,
+        session=get_session(runtime.db_file, episode.session_uid), client=client,
+    )
+    assert after_sync.status == "draft_created"
+    assert get_media_artifact(runtime.db_file, episode.session_uid, kind="final_master") == final_before
+    assert get_media_artifact(runtime.db_file, episode.session_uid, kind="transcript") == transcript_before
+    assert client.started == ["prod-1", "prod-2", "prod-3", "prod-final-refresh"]
