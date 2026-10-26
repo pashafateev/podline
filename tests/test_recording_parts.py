@@ -232,6 +232,21 @@ def test_ambiguous_role_exclusion_requires_a_part_or_exact_id(
     assert client.downloads == []
 
 
+def test_known_active_take_blocks_legacy_unassociated_tracks(
+    moto_s3, app_config_factory, runtime_factory, tmp_path,
+):
+    config = app_config_factory(tmp_path)
+    runtime = runtime_factory(config)
+    payload = session_payload((2,))
+    for track in payload["tracks"]:
+        track["takeId"] = None
+    payload["recordingTakes"][0]["status"] = "recording"
+    client = PartsClient(payload)
+    with pytest.raises(CozytrackIngestError, match="not stopped"):
+        ingest(config, runtime, client)
+    assert client.downloads == []
+
+
 def test_modern_single_take_deduplicates_a_verified_local_import(
     moto_s3, app_config_factory, runtime_factory, tmp_path,
 ):

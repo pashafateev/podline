@@ -49,6 +49,9 @@ def group_tracks(session: CozytrackSession):
     ids = [track.id for track in session.tracks]
     if len(ids) != len(set(ids)):
         raise _error("Cozytrack response contains duplicate track IDs")
+    for take in session.recording_takes or []:
+        if take.status != "stopped":
+            raise _error(f"Take {take.id} is not stopped; finish recording before ingest")
     take_ids = {track.take_id for track in session.tracks}
     if None in take_ids and len(take_ids) > 1:
         raise _error("Mixed take IDs: inspect tracks before ingest")
@@ -64,9 +67,6 @@ def group_tracks(session: CozytrackSession):
     missing = take_ids - set(takes)
     if missing:
         raise _error(f"Tracks reference missing takes: {sorted(missing)}")
-    for take in takes.values():
-        if take.status != "stopped":
-            raise _error(f"Take {take.id} is not stopped; finish recording before ingest")
     ordered = sorted(takes.values(), key=lambda take: (_time(take.started_at, take.id), take.id))
     return [
         (take, [track for track in session.tracks if track.take_id == take.id])
