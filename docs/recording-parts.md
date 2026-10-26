@@ -194,20 +194,20 @@ pytest 9.1.1, macOS. Test databases/files are temporary; S3 tests use moto and
 synthetic bytes. Migration tests forbid socket connections, storage construction,
 and subprocess execution.
 
-- Initial new suites (`tests/test_recording_parts.py`,
+- Initial new suites (`tests/test_part_repository.py`,
   `tests/test_recording_parts_migration.py`, `tests/test_part_artifacts.py`,
   `--tb=short`): **22 failed, 40 setup errors** before implementation.
 - After adding schema/model/part helpers but before artifact scoping, the same
   command: **51 failed, 11 passed**, exposing the old artifact APIs and missing
   default creation.
-- Parent-requested legacy projection regressions (`tests/test_recording_parts.py
+- Parent-requested legacy projection regressions (`tests/test_part_repository.py
   -k 'legacy_session_status or legacy_reset or session_projection or
   concurrent_default' --tb=short`): **9 failed, 2 passed, 36 deselected** before
   adding the projection.
 - Focused database/artifact/ownership/migration command:
 
   ```sh
-  uv run --locked --extra dev python -m pytest tests/test_db.py tests/test_artifacts.py tests/test_recording_parts.py tests/test_recording_parts_migration.py tests/test_part_artifacts.py --tb=short
+  uv run --locked --extra dev python -m pytest tests/test_db.py tests/test_artifacts.py tests/test_part_repository.py tests/test_recording_parts_migration.py tests/test_part_artifacts.py --tb=short
   ```
 
   **95 passed** after implementation (including all 73 new cases).
