@@ -39,6 +39,28 @@ class MediaArtifactRecord:
     source_id: Optional[str]
     created_at: str
     updated_at: str
+    part_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class RecordingPartRecord:
+    part_id: str
+    session_uid: str
+    part_number: int
+    take_id: Optional[str]
+    status: str
+    auphonic_production_id: Optional[str]
+    ingest_complete: bool
+    source_snapshot: dict
+    timing_warnings: list
+    started_at: Optional[str]
+    stopped_at: Optional[str]
+    take_status: Optional[str]
+    output_basename: Optional[str]
+    operation: Optional[str]
+    failure_reason: Optional[str]
+    created_at: str
+    updated_at: str
 
 
 @dataclass(frozen=True)

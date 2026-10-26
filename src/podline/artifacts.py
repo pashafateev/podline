@@ -31,6 +31,7 @@ from podline.repository import (
     list_media_artifacts,
     register_media_artifact,
     replace_media_artifact_set,
+    resolve_artifact_part_id,
 )
 from podline.storage import MediaStorage, StorageError, parse_s3_uri, sha256_of_file
 
@@ -64,10 +65,14 @@ def store_artifact_file(
     source_provider: Optional[str] = None,
     source_id: Optional[str] = None,
     storage: Optional[MediaStorage] = None,
+    part_id: Optional[str] = None,
 ) -> MediaArtifactRecord:
     if not source_path.exists():
         raise ArtifactError(f"Cannot store missing file: {source_path}")
 
+    part_id = resolve_artifact_part_id(
+        db_file, session_uid, kind=kind, part_id=part_id
+    )
     storage = storage or MediaStorage(config.storage)
     sha256 = sha256_of_file(source_path)
     byte_size = source_path.stat().st_size
@@ -90,6 +95,7 @@ def store_artifact_file(
     record = register_media_artifact(
         db_file,
         session_uid=session_uid,
+        part_id=part_id,
         kind=kind,
         role=role,
         filename=source_path.name,
@@ -116,6 +122,7 @@ def store_artifact_files(
     files: List[dict],
     expected_roles: List[str],
     storage: Optional[MediaStorage] = None,
+    part_id: Optional[str] = None,
 ) -> List[MediaArtifactRecord]:
     """Upload, verify, and atomically register a complete role-keyed set."""
     roles = [str(item.get("role") or "") for item in files]
@@ -138,6 +145,9 @@ def store_artifact_files(
         ]
         raise ArtifactError(f"Cannot store missing files: {missing_paths}")
 
+    part_id = resolve_artifact_part_id(
+        db_file, session_uid, kind=kind, part_id=part_id
+    )
     storage = storage or MediaStorage(config.storage)
     timestamp = datetime.now(timezone.utc).isoformat()
     uploaded = []
@@ -178,6 +188,7 @@ def store_artifact_files(
     records = replace_media_artifact_set(
         db_file,
         session_uid=session_uid,
+        part_id=part_id,
         kind=kind,
         artifacts=uploaded,
         timestamp=timestamp,
@@ -200,8 +211,11 @@ def materialize_artifact(
     kind: str,
     role: str = "",
     storage: Optional[MediaStorage] = None,
+    part_id: Optional[str] = None,
 ) -> Path:
-    artifact = get_media_artifact(db_file, session_uid, kind=kind, role=role)
+    artifact = get_media_artifact(
+        db_file, session_uid, kind=kind, role=role, part_id=part_id
+    )
     if artifact is None:
         raise ArtifactError(
             f"No {kind} artifact registered for session {session_uid}"
