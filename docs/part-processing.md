@@ -60,6 +60,11 @@ client. Podline therefore does not blindly retry creation/start POST requests.
 Creation intent is durable and cannot be claimed again after another command has
 already bound a production.
 
+An explicit server rejection (such as invalid credentials) is not an unknown
+creation outcome: fix the configuration and rerun the command. A received
+production ID is checkpointed even if preset-metadata validation then fails, so
+correcting a preset configuration cannot silently create a duplicate production.
+
 When creation has no stored ID, inspect the Auphonic account. The new production's
 title includes a stable episode/part marker. Once its identity is established:
 
@@ -69,7 +74,10 @@ pod auphonic-prepare @1 --part 2
 ```
 
 Explicit adoption checks the marker, preset/slots, and any existing source
-attachments. An unmatched or unverified candidate is rejected. An incomplete
+attachments. When the production response omits its original preset UUID,
+Podline reads the configured preset definition to verify the declared slots;
+configure a preset UUID for that read-only recovery lookup. An unmatched or
+unverified candidate is rejected. An incomplete
 adopted production still needs preparation; sync does not falsely mark missing
 inputs ready or start processing.
 

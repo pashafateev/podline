@@ -423,6 +423,7 @@ def ingest_parts(*, config, runtime_paths, db_file, session, client,
                 db_file, session_uid=existing.session_uid, from_state=existing.status,
                 to_state="queued", timestamp=datetime.now(timezone.utc).isoformat(),
                 detail="Cozytrack part sources registered",
+                replace_auphonic_production_id=len(parts) > 1,
             )
         return get_session(db_file, existing.session_uid)
     except Exception as exc:

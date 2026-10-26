@@ -192,6 +192,38 @@ def test_attachment_failure_reuses_created_production(multipart):
     assert len(client.created) == 3
 
 
+def test_dynamic_preset_slots_resume_after_partial_attachment(multipart, monkeypatch):
+    _, _, _, client = multipart
+    original_create = client.create_production
+    attached = []
+    fail_once = True
+
+    def without_declared_slots(**kwargs):
+        production = original_create(**kwargs)
+        client.productions[production.production_id]["multi_input_files"] = []
+        return AuphonicPreparedProduction(
+            production.production_id, [], production.status_page, production.edit_page,
+        )
+
+    def attach(production_id, track_id, service_id, input_key):
+        nonlocal fail_once
+        if track_id == "host2" and fail_once:
+            fail_once = False
+            raise RuntimeError("dynamic attachment interrupted")
+        attached.append((production_id, track_id))
+        client.productions[production_id]["multi_input_files"].append(
+            dict(id=track_id, type="multitrack", input_file=input_key)
+        )
+
+    monkeypatch.setattr(client, "create_production", without_declared_slots)
+    monkeypatch.setattr(client, "attach_service_input", attach)
+    with pytest.raises(AuphonicError, match="attachment interrupted"):
+        prepare(multipart)
+    prepare(multipart)
+    assert len(client.created) == 3
+    assert attached.count(("prod-1", "host1")) == 1
+
+
 def test_stale_concurrent_prepare_cannot_create_second_production(multipart, monkeypatch):
     from podline import part_processing as processing
     config, runtime, episode, client = multipart
@@ -319,6 +351,79 @@ def test_unknown_creation_blocks_blind_retry_and_can_be_adopted(multipart):
                for track in production["multi_input_files"])
 
 
+def test_unknown_creation_adoption_uses_preset_definition_when_uuid_is_not_returned(
+    multipart, monkeypatch,
+):
+    from podline.part_processing import sync_parts
+    config, runtime, episode, client = multipart
+    client.lose_create = True
+    with pytest.raises(AuphonicError, match="create"):
+        prepare(multipart)
+    original_get = client.get_production
+
+    def without_template_uuid(production_id):
+        result = original_get(production_id)
+        result["data"].pop("preset", None)
+        return result
+
+    monkeypatch.setattr(client, "get_production", without_template_uuid)
+    monkeypatch.setattr(client, "get_preset", lambda preset_id: {"data": {
+        "multi_input_files": [dict(id=f"slot-{n}", type="multitrack") for n in (1, 2, 3)],
+    }}, raising=False)
+    client.lose_create = False
+    sync_parts(config=config, runtime_paths=runtime, db_file=runtime.db_file,
+               session=episode, production_id="prod-1", part_number=1, client=client)
+    prepare(multipart)
+    assert len(client.created) == 3
+
+
+def test_rejected_create_can_resume_after_configuration_is_fixed(multipart, monkeypatch):
+    _, _, _, client = multipart
+    original = client.create_production
+    rejected = False
+
+    def reject_once(**kwargs):
+        nonlocal rejected
+        if not rejected:
+            rejected = True
+            error = AuphonicError("credentials rejected")
+            error.rejected = True
+            raise error
+        return original(**kwargs)
+
+    monkeypatch.setattr(client, "create_production", reject_once)
+    with pytest.raises(AuphonicError, match="rejected"):
+        prepare(multipart)
+    prepare(multipart)
+    assert len(client.created) == 3
+
+
+def test_known_created_id_is_checkpointed_even_when_metadata_validation_fails(
+    multipart, monkeypatch,
+):
+    from podline.repository import list_recording_parts
+    _, runtime, episode, client = multipart
+    original = client.create_production
+    failed = False
+
+    def invalid_metadata_once(**kwargs):
+        nonlocal failed
+        result = original(**kwargs)
+        if not failed:
+            failed = True
+            error = AuphonicError("invalid preset metadata")
+            error.production_id = result.production_id
+            raise error
+        return result
+
+    monkeypatch.setattr(client, "create_production", invalid_metadata_once)
+    with pytest.raises(AuphonicError, match="metadata"):
+        prepare(multipart)
+    assert list_recording_parts(runtime.db_file, episode.session_uid)[0].auphonic_production_id == "prod-1"
+    prepare(multipart)
+    assert len(client.created) == 3
+
+
 def test_lost_start_response_inspects_without_restarting(multipart):
     _, _, _, client = multipart
     prepare(multipart)
@@ -329,6 +434,22 @@ def test_lost_start_response_inspects_without_restarting(multipart):
     client.lose_start = False
     start(multipart)
     assert client.started == ["prod-1", "prod-2", "prod-3"]
+
+
+def test_single_part_reset_clears_legacy_production_projection(
+    moto_s3, app_config_factory, runtime_factory, tmp_path,
+):
+    from podline.part_processing import prepare_parts, reset_parts
+    config = app_config_factory(tmp_path)
+    runtime = runtime_factory(config)
+    episode = ingest(config, runtime, PartsClient(session_payload((2,))))
+    client = MultiProductionClient()
+    prepared = prepare_parts(
+        config=config, db_file=runtime.db_file, session=episode, client=client,
+    )
+    assert prepared.auphonic_production_id == "prod-1"
+    reset = reset_parts(db_file=runtime.db_file, session=prepared)
+    assert reset.auphonic_production_id is None
 
 
 @pytest.mark.parametrize("risk", ["partial", "reconnect", "incomplete", "early-ending"])

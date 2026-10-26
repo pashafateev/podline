@@ -51,3 +51,28 @@ def test_read_only_inspection_still_retries(app_config_factory, tmp_path, monkey
     )
     assert client.get_production("production")["data"]["uuid"] == "production"
     assert len(requests) == 2
+
+
+def test_definitive_rejection_is_not_reported_as_unknown_creation(app_config_factory, tmp_path):
+    client = AuphonicClient(app_config_factory(tmp_path))
+    client._client = httpx.Client(
+        base_url="https://auphonic.invalid",
+        transport=httpx.MockTransport(lambda _: httpx.Response(401, text="bad credentials")),
+    )
+    with pytest.raises(AuphonicError) as caught:
+        client.create_production(title="episode", track_count=2, preset_id="p2")
+    assert caught.value.rejected is True
+
+
+def test_created_id_survives_invalid_preset_metadata(app_config_factory, tmp_path):
+    client = AuphonicClient(app_config_factory(tmp_path))
+    client._client = httpx.Client(
+        base_url="https://auphonic.invalid",
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"data": {
+            "uuid": "known-created-production",
+            "multi_input_files": [{"id": "one"}, {"id": "two"}, {"id": "three"}],
+        }})),
+    )
+    with pytest.raises(AuphonicError) as caught:
+        client.create_production(title="episode", track_count=2, preset_id="p2")
+    assert caught.value.production_id == "known-created-production"

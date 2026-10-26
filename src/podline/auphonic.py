@@ -59,7 +59,10 @@ _MAX_STEM_COMPRESSION_RATIO = 200
 
 
 class AuphonicError(RuntimeError):
-    pass
+    def __init__(self, message="", *, production_id=None, rejected=False):
+        super().__init__(message)
+        self.production_id = production_id
+        self.rejected = rejected
 
 
 @dataclass(frozen=True)
@@ -171,6 +174,8 @@ class AuphonicClientProtocol(Protocol):
 
     def get_production(self, production_id: str) -> Dict: ...
 
+    def get_preset(self, preset_id: str) -> Dict: ...
+
     def update_multi_input_file_offset(
         self, production_id: str, track_id: str, offset: float
     ) -> Dict: ...
@@ -219,11 +224,16 @@ class AuphonicClient:
             raise AuphonicError(
                 "Auphonic create response did not include a production id"
             )
-        upload_track_ids = (
-            ["input_file"]
-            if track_count == 1
-            else _resolve_preset_track_ids(data_node, track_count)
-        )
+        try:
+            upload_track_ids = (
+                ["input_file"]
+                if track_count == 1
+                else _resolve_preset_track_ids(data_node, track_count)
+            )
+        except AuphonicError as exc:
+            # Creation already happened. Preserve its identity even if the
+            # configured preset cannot be used; retry must not create another.
+            raise AuphonicError(str(exc), production_id=str(production_id)) from exc
         logging.getLogger("podline").debug(
             "Auphonic create details production_id=%s status_page=%s edit_page=%s start_allowed=%s change_allowed=%s upload_track_ids=%s",
             production_id,
@@ -345,6 +355,12 @@ class AuphonicClient:
         )
         return response.json()
 
+    def get_preset(self, preset_id: str) -> Dict:
+        response = self._request_with_retries(
+            "GET", f"/preset/{quote(str(preset_id), safe='')}.json",
+        )
+        return response.json()
+
     def update_multi_input_file_offset(
         self, production_id: str, track_id: str, offset: float
     ) -> Dict:
@@ -400,7 +416,8 @@ class AuphonicClient:
                 status_code = exc.response.status_code
                 if 400 <= status_code < 500 and status_code != 429:
                     raise AuphonicError(
-                        f"Auphonic request failed with status {status_code}: {exc.response.text[:300]}"
+                        f"Auphonic request failed with status {status_code}: {exc.response.text[:300]}",
+                        rejected=True,
                     ) from exc
                 logging.getLogger("podline").debug(
                     "Auphonic retry method=%s url=%s error=%s",

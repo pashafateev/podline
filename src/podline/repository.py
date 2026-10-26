@@ -476,6 +476,7 @@ def update_session_status(
     final_master_path: Optional[str] = None,
     failure_reason: Optional[str] = None,
     failed_at_stage: Optional[str] = None,
+    replace_auphonic_production_id: bool = False,
 ) -> None:
     with connect(db_file) as connection:
         connection.execute(
@@ -483,7 +484,7 @@ def update_session_status(
             UPDATE sessions
             SET status = ?,
                 updated_at = ?,
-                auphonic_production_id = COALESCE(?, auphonic_production_id),
+                auphonic_production_id = CASE WHEN ? THEN ? ELSE COALESCE(?, auphonic_production_id) END,
                 pre_edit_master_path = COALESCE(?, pre_edit_master_path),
                 transcript_path = COALESCE(?, transcript_path),
                 final_master_path = COALESCE(?, final_master_path),
@@ -494,6 +495,8 @@ def update_session_status(
             (
                 to_state,
                 timestamp,
+                replace_auphonic_production_id,
+                auphonic_production_id,
                 auphonic_production_id,
                 pre_edit_master_path,
                 transcript_path,

@@ -65,6 +65,7 @@ def aggregate_status(db_file, session):
         to_state=status, timestamp=datetime.now(timezone.utc).isoformat(),
         detail="aggregated recording-part progress",
         auphonic_production_id=parts[0].auphonic_production_id if len(parts) == 1 else None,
+        replace_auphonic_production_id=True,
         failure_reason=(f"Part {failure.part_number}: {failure.failure_reason}" if failure else None),
         failed_at_stage="auphonic" if failure else None,
     )
@@ -81,6 +82,47 @@ def _fail(db_file, session, part, exc):
 
 def _marker(session, part):
     return f"[podline:{session.session_uid}/{part.part_id}]"
+
+
+def _checkpoint_created(db_file, session, part, production_id):
+    if not production_id:
+        raise AuphonicError("create response has no usable production identity")
+    if any(
+        other.part_id != part.part_id and other.auphonic_production_id == production_id
+        for other in list_recording_parts(db_file, session.session_uid)
+    ):
+        raise AuphonicError("production already belongs to another part")
+    return update_recording_part(
+        db_file, part.part_id, auphonic_production_id=production_id, operation=None,
+    )
+
+
+def _verify_adoption_preset(config, db_file, part, data, client):
+    expected = resolve_preset_id(config, len(_raw(config, db_file, part)))
+    remote = data.get("preset")
+    if isinstance(remote, dict):
+        remote = remote.get("uuid") or remote.get("id")
+    if remote is not None:
+        if remote != expected:
+            raise AuphonicError("production preset does not match the configured preset")
+        return
+    # Production detail need not retain its original template UUID. Verify
+    # the configured template's declared slots through the read-only API.
+    payload = client.get_preset(expected)
+    preset = payload.get("data", payload)
+    template_tracks = preset.get("multi_input_files") or []
+    actual_tracks = data.get("multi_input_files") or []
+    expected_ids = [str(track.get("id") or "") for track in template_tracks]
+    actual_ids = [str(track.get("id") or "") for track in actual_tracks]
+    if expected_ids:
+        if (len(expected_ids) != len(_raw(config, db_file, part))
+                or len(set(expected_ids)) != len(expected_ids)
+                or set(actual_ids) != set(expected_ids)):
+            raise AuphonicError("production slots do not match the configured preset")
+    elif actual_ids and set(actual_ids) != {track.role for track in _raw(config, db_file, part)}:
+        raise AuphonicError("production slots do not match the source roles")
+    if any(track.get("type") != "multitrack" for track in template_tracks + actual_tracks):
+        raise AuphonicError("production/preset has unsupported non-part inputs")
 
 
 def _raw(config, db_file, part):
@@ -121,7 +163,7 @@ def _bindings(config, db_file, part, details, track_ids=None, *, require_attache
         by_id = {str(track.get("id")): track for track in remote}
         if set(saved) != {artifact.role for artifact in tracks}:
             raise AuphonicError("stored preset bindings no longer match source roles")
-        if any(track_id not in by_id for track_id in saved.values()):
+        if require_attached and any(track_id not in by_id for track_id in saved.values()):
             raise AuphonicError("prepared preset track IDs changed; inspect before retry")
         pairs = [(saved[artifact.role], artifact) for artifact in tracks]
     else:
@@ -174,22 +216,20 @@ def prepare_parts(*, config, db_file, session, client=None, part_number=None, lo
                     )
                 owns_operation = True
                 update_recording_part(db_file, part.part_id, status="preparing")
-                prepared = client.create_production(
-                    title=f"{session.source_basename or session.session_uid} "
-                          f"Part {part.part_number:02d} {_marker(session, part)}",
-                    track_count=len(_raw(config, db_file, part)),
-                    preset_id=presets[part.part_id],
-                )
-                if any(
-                    other.part_id != part.part_id and
-                    other.auphonic_production_id == prepared.production_id
-                    for other in list_recording_parts(db_file, session.session_uid)
-                ):
-                    raise AuphonicError("production already belongs to another part")
-                part = update_recording_part(
-                    db_file, part.part_id, auphonic_production_id=prepared.production_id,
-                    operation=None,
-                )
+                try:
+                    prepared = client.create_production(
+                        title=f"{session.source_basename or session.session_uid} "
+                              f"Part {part.part_number:02d} {_marker(session, part)}",
+                        track_count=len(_raw(config, db_file, part)),
+                        preset_id=presets[part.part_id],
+                    )
+                except AuphonicError as exc:
+                    if exc.production_id:
+                        part = _checkpoint_created(db_file, session, part, exc.production_id)
+                    elif exc.rejected:
+                        update_recording_part(db_file, part.part_id, operation=None)
+                    raise
+                part = _checkpoint_created(db_file, session, part, prepared.production_id)
                 track_ids = prepared.upload_track_ids
             details = inspect_production(config, part.auphonic_production_id, client=client)
             if _is_failed_status(details):
@@ -305,7 +345,12 @@ def start_parts(*, config, runtime_paths, db_file, session, client=None,
                     if not claim_recording_part_operation(db_file, part.part_id, "start"):
                         raise AuphonicError("another start operation owns this part")
                     update_recording_part(db_file, part.part_id, status="starting")
-                    client.start_production(part.auphonic_production_id)
+                    try:
+                        client.start_production(part.auphonic_production_id)
+                    except AuphonicError as exc:
+                        if exc.rejected:
+                            update_recording_part(db_file, part.part_id, operation=None)
+                        raise
                 update_recording_part(db_file, part.part_id, status="started", operation="poll")
                 production = client.wait_for_production(part.auphonic_production_id)
             update_recording_part(db_file, part.part_id, operation="outputs")
@@ -346,12 +391,7 @@ def sync_parts(*, config, runtime_paths, db_file, session, production_id=None,
                 data = payload.get("data", payload)
                 if _marker(session, part) not in (data.get("metadata") or {}).get("title", ""):
                     raise AuphonicError("production title does not identify this episode/part")
-                expected_preset = resolve_preset_id(config, len(_raw(config, db_file, part)))
-                remote_preset = data.get("preset")
-                if isinstance(remote_preset, dict):
-                    remote_preset = remote_preset.get("uuid") or remote_preset.get("id")
-                if remote_preset != expected_preset:
-                    raise AuphonicError("production preset could not be verified")
+                _verify_adoption_preset(config, db_file, part, data, client)
                 _bindings(config, db_file, part, data)
                 part = update_recording_part(
                     db_file, part.part_id, auphonic_production_id=remote_id, operation=None,
@@ -456,7 +496,7 @@ def _offset_plan(config, runtime_paths, db_file, part, client, duration_probe):
         _unsafe(db_file, part, "recorder topology is unavailable")
     details = inspect_production(config, part.auphonic_production_id, client=client)
     _validate_offset_production_state(details)
-    _bindings(config, db_file, part, details)
+    _bindings(config, db_file, part, details, require_attached=True)
     targets = []
     aligned = []
     for item in durations:
