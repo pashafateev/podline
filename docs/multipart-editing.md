@@ -100,8 +100,10 @@ pod episode-meta @1
 pod podbean-draft @1
 ```
 
-Finalize requires every part's source ingest and registered mix/VTT pair, and
-names a missing/unfinished part instead of accepting the last completed part.
+Finalize requires every part's source ingest and completed processing, with its
+mix/VTT pair bound to the current part production. A stale caller's aggregate
+status cannot make old outputs eligible during reprocessing. Finalize names a
+missing/unfinished part instead of accepting the last completed part.
 It uploads exactly one editor-supplied, episode-scoped `final_master`. Existing
 workspace/deliverables master-path resolution, including paths with spaces,
 remains unchanged.

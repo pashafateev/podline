@@ -115,6 +115,16 @@ def create_part_workspace(
         pending = ([] if part.ingest_complete else ["ingest"]) + [
             kind for kind, artifact in outputs.items() if artifact is None
         ]
+        if not single_part:
+            pending.extend(
+                f"current_{kind}" for kind, artifact in outputs.items()
+                if artifact is not None and (
+                    not part.auphonic_production_id
+                    or artifact.source_id != part.auphonic_production_id
+                )
+            )
+            if not pending and part.status != "complete":
+                pending.append("processing")
         ready = ready and not pending
         old = previous_parts.get(part.part_id, {})
         # Adopt an old, flat manifest without renaming or moving Part 1's media.

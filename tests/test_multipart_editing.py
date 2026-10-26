@@ -149,6 +149,24 @@ def test_workspace_lists_ordered_parts_and_exposes_completed_siblings(editing_ep
     )
 
 
+def test_workspace_readiness_does_not_accept_an_obsolete_part_pair(editing_episode):
+    e = editing_episode
+    one, two = e.part(1), e.part(2)
+    e.outputs(one)
+    e.outputs(two)
+    e.artifact(
+        two, "transcript", "part-02.vtt", b"previous-production",
+        production="obsolete-production",
+    )
+
+    workspace = e.workspace()
+    manifest = _manifest(workspace)
+
+    assert manifest["ready_for_finalize"] is False
+    assert "current_transcript" in manifest["parts"][1]["pending"]
+    assert (workspace / "part-01.mp3").read_bytes() == b"mix-1"
+
+
 def test_sources_only_before_processing_exports_exact_bytes_for_selected_part(
     editing_episode, monkeypatch,
 ):
@@ -454,6 +472,41 @@ def test_finalize_rejects_missing_middle_part_before_storing_master(
         e.runtime.db_file, e.session.session_uid, kind="final_master",
     ) is None
     assert get_session(e.runtime.db_file, e.session.session_uid) == e.session
+
+
+@pytest.mark.parametrize("stale", ["status", "pre_edit_master", "transcript"])
+def test_finalize_rejects_unfinished_or_obsolete_middle_part_outputs(
+    editing_episode, moto_s3, tmp_path, stale,
+):
+    from podline.repository import update_recording_part
+
+    e = editing_episode
+    one, two, three = e.part(1), e.part(2), e.part(3)
+    for owner in (one, two, three):
+        e.outputs(owner)
+    if stale == "status":
+        update_recording_part(e.runtime.db_file, two.part_id, status="started")
+        message = r"Part 2.*complete"
+    else:
+        extension = "mp3" if stale == "pre_edit_master" else "vtt"
+        e.artifact(
+            two, stale, f"part-02.{extension}", b"obsolete-output",
+            production="replaced-production",
+        )
+        message = r"Part 2.*production"
+    master = tmp_path / "assembled.wav"
+    master.write_bytes(b"must-not-register")
+
+    # The caller may still hold the old aggregate waiting_for_finalize record.
+    with pytest.raises(FinalizeError, match=message):
+        finalize_session(
+            config=e.config, runtime_paths=e.runtime, db_file=e.runtime.db_file,
+            session=e.session, master_path=master,
+        )
+
+    assert get_media_artifact(
+        e.runtime.db_file, e.session.session_uid, kind="final_master",
+    ) is None
 
 
 def _finalize(e, tmp_path):

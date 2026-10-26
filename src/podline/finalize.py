@@ -33,15 +33,29 @@ def finalize_session(
                     f"Part {part.part_number} has incomplete source ingest; "
                     "finish ct-ingest before finalizing the assembled master"
                 )
+            if part.status != "complete":
+                raise FinalizeError(
+                    f"Part {part.part_number} is {part.status}, not complete; "
+                    "finish this part's processing before finalizing"
+                )
             for kind in (
                 ArtifactKind.PRE_EDIT_MASTER.value, ArtifactKind.TRANSCRIPT.value,
             ):
-                if get_media_artifact(
+                artifact = get_media_artifact(
                     db_file, session.session_uid, kind=kind, part_id=part.part_id,
-                ) is None:
+                )
+                if artifact is None:
                     raise FinalizeError(
                         f"Part {part.part_number} has no {kind} artifact; "
                         "finish this part's processing before finalizing"
+                    )
+                if (
+                    not part.auphonic_production_id
+                    or artifact.source_id != part.auphonic_production_id
+                ):
+                    raise FinalizeError(
+                        f"Part {part.part_number} {kind} does not belong to its "
+                        "current Auphonic production; run auphonic-sync for this part"
                     )
     if session.status != SessionStatus.WAITING_FOR_FINALIZE.value:
         raise FinalizeError(
