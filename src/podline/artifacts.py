@@ -17,6 +17,7 @@ import math
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -288,20 +289,48 @@ def create_workspace(
     include_stems: bool = False,
     stem_metadata: Optional[Dict[str, Dict[str, object]]] = None,
     expected_auphonic_production_id: Optional[str] = None,
+    include_sources: bool = False,
+    part_number: Optional[int] = None,
 ) -> Path:
-    """Materialize the current pre-edit master and transcript for editing.
+    """Refresh managed editing files without assembling audio or transcripts.
 
-    Workspaces persist until removed by hand and are never subject to cache
-    clearing; re-running refreshes the copies to the current artifacts.
+    Multipart workspaces expose completed siblings even while others are
+    pending. Explicit source export works before processing. Single-part callers
+    retain their current filenames, current transcript, and flat repair layout.
     """
     from podline.models import ArtifactKind
+    from podline.repository import list_recording_parts
+    from podline.workspace_parts import create_part_workspace, part_manifest_entry
+
+    parts = list_recording_parts(db_file, session_uid)
+    if len(parts) > 1 or include_sources or part_number is not None:
+        return create_part_workspace(
+            config=config,
+            runtime_paths=runtime_paths,
+            db_file=db_file,
+            session_uid=session_uid,
+            parts=parts,
+            storage=storage,
+            include_stems=include_stems,
+            stem_metadata=stem_metadata or {},
+            expected_auphonic_production_id=expected_auphonic_production_id,
+            include_sources=include_sources,
+            part_number=part_number,
+        )
 
     workspace = workspace_path_for(runtime_paths, session_uid)
+    _workspace_target(workspace, "manifest.json")
     workspace.mkdir(parents=True, exist_ok=True)
+    previous_manifest = _read_json_object(workspace / "manifest.json")
+    part = parts[0] if parts else None
 
     manifest_entries = {}
     for kind in (ArtifactKind.PRE_EDIT_MASTER.value, ArtifactKind.TRANSCRIPT.value):
         artifact = get_media_artifact(db_file, session_uid, kind=kind)
+        if artifact is None and part is not None:
+            artifact = get_media_artifact(
+                db_file, session_uid, kind=kind, part_id=part.part_id
+            )
         if artifact is None:
             raise ArtifactError(
                 f"No {kind} artifact registered for session {session_uid}; "
@@ -313,26 +342,49 @@ def create_workspace(
             artifact=artifact,
             storage=storage,
         )
-        target = workspace / artifact.filename
-        if not target.exists() or sha256_of_file(target) != artifact.sha256:
-            shutil.copy2(cached, target)
+        _copy_workspace_artifact(
+            workspace,
+            artifact.filename,
+            cached,
+            artifact.sha256,
+            managed=artifact.filename in {
+                item.get("filename")
+                for item in previous_manifest.get("artifacts", {}).values()
+                if isinstance(item, dict)
+            },
+        )
         manifest_entries[kind] = {
             "filename": artifact.filename,
             "sha256": artifact.sha256,
             "s3_uri": artifact.s3_uri,
         }
 
+    manifest_data = {
+        "session_uid": session_uid,
+        "artifacts": manifest_entries,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if part is not None:
+        previous_part = next(
+            (
+                item for item in previous_manifest.get("parts", [])
+                if isinstance(item, dict) and item.get("part_id") == part.part_id
+            ),
+            {},
+        )
+        manifest_data["parts"] = [
+            part_manifest_entry(
+                part,
+                artifacts=manifest_entries,
+                stems_dir="stems",
+                repair_manifest="repair-manifest.json",
+            )
+        ]
+        manifest_data["parts"][0]["sources"] = previous_part.get("sources", [])
+        manifest_data["ready_for_finalize"] = bool(part.ingest_complete)
     manifest = workspace / "manifest.json"
     manifest.write_text(
-        json.dumps(
-            {
-                "session_uid": session_uid,
-                "artifacts": manifest_entries,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            },
-            indent=2,
-        )
-        + "\n",
+        json.dumps(manifest_data, indent=2) + "\n",
         encoding="utf-8",
     )
     registered_stems = list_media_artifacts(
@@ -340,16 +392,21 @@ def create_workspace(
     )
     current_production_id = expected_auphonic_production_id
     if current_production_id is None:
-        session = get_session(db_file, session_uid)
-        current_production_id = (
-            session.auphonic_production_id if session is not None else None
-        )
+        if part is not None:
+            current_production_id = part.auphonic_production_id
+        if current_production_id is None:
+            session = get_session(db_file, session_uid)
+            current_production_id = (
+                session.auphonic_production_id if session is not None else None
+            )
+    timing_warnings = part.timing_warnings if part is not None else []
     if not registered_stems or (
         not include_stems
         and not _stem_workspace_matches_registered(
             workspace,
             registered_stems,
             current_production_id=current_production_id,
+            timing_warnings=timing_warnings,
         )
     ):
         _remove_obsolete_stem_workspace_outputs(workspace)
@@ -362,8 +419,62 @@ def create_workspace(
             workspace=workspace,
             stem_metadata=stem_metadata or {},
             storage=storage,
+            part_id=part.part_id if part is not None else None,
+            part_number=part.part_number if part is not None else None,
+            timing_warnings=timing_warnings,
+            expected_auphonic_production_id=current_production_id,
         )
     return workspace
+
+
+def _workspace_target(workspace: Path, relative: str) -> Path:
+    """Reject traversal and symlinks, including symlinked parent directories."""
+    path = Path(relative)
+    if (
+        not relative
+        or path.is_absolute()
+        or ".." in path.parts
+        or "\\" in relative
+    ):
+        raise ArtifactError(f"Unsafe workspace filename: {relative!r}")
+    target = workspace / path
+    for entry in [workspace] + [
+        workspace.joinpath(*path.parts[:index])
+        for index in range(1, len(path.parts) + 1)
+    ]:
+        if entry.is_symlink():
+            raise ArtifactError(f"Refusing to follow workspace symlink: {entry}")
+    return target
+
+
+def _copy_workspace_artifact(
+    workspace: Path,
+    relative: str,
+    cached: Path,
+    sha256: str,
+    *,
+    managed: bool,
+) -> None:
+    target = _workspace_target(workspace, relative)
+    if target.exists():
+        if not target.is_file():
+            raise ArtifactError(f"Workspace output is not a file: {target}")
+        if sha256_of_file(target) == sha256:
+            return
+        if not managed:
+            raise ArtifactError(f"Refusing to overwrite unmanaged workspace file: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Replacing the destination also breaks any previous cache hardlink. Never
+    # write through an editor's link into the immutable checksum cache.
+    with tempfile.NamedTemporaryFile(
+        dir=target.parent, prefix=".podline-", delete=False
+    ) as handle:
+        temporary = Path(handle.name)
+    try:
+        shutil.copy2(cached, temporary)
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _stem_workspace_matches_registered(
@@ -371,8 +482,11 @@ def _stem_workspace_matches_registered(
     stems: List[MediaArtifactRecord],
     *,
     current_production_id: Optional[str],
+    stems_subdir: str = "stems",
+    repair_manifest_name: str = "repair-manifest.json",
+    timing_warnings: Optional[List[dict]] = None,
 ) -> bool:
-    manifest = _read_json_object(workspace / "repair-manifest.json")
+    manifest = _read_json_object(_workspace_target(workspace, repair_manifest_name))
     production_ids = {stem.source_id for stem in stems}
     if (
         production_ids != {current_production_id}
@@ -387,15 +501,30 @@ def _stem_workspace_matches_registered(
     }
     if set(manifest_by_role) != {stem.role for stem in stems}:
         return False
+    if timing_warnings and (
+        manifest.get("timing_warnings") != timing_warnings
+        or manifest.get("offsets_rendered_by_auphonic") is not None
+        or any(
+            entry.get("podline_offset_applied_seconds") != 0
+            for entry in manifest_by_role.values()
+        )
+    ):
+        return False
     return all(
         manifest_by_role[stem.role].get("filename") == stem.filename
         and manifest_by_role[stem.role].get("source_sha256") == stem.sha256
+        and _workspace_target(workspace, f"{stems_subdir}/{stem.filename}").is_file()
         for stem in stems
     )
 
 
-def _remove_obsolete_stem_workspace_outputs(workspace: Path) -> None:
-    repair_manifest_path = workspace / "repair-manifest.json"
+def _remove_obsolete_stem_workspace_outputs(
+    workspace: Path,
+    *,
+    stems_subdir: str = "stems",
+    repair_manifest_name: str = "repair-manifest.json",
+) -> None:
+    repair_manifest_path = _workspace_target(workspace, repair_manifest_name)
     previous_manifest = _read_json_object(repair_manifest_path)
     managed_filenames = {
         Path(str(entry.get("filename") or "")).name
@@ -403,7 +532,7 @@ def _remove_obsolete_stem_workspace_outputs(workspace: Path) -> None:
         if isinstance(entry, dict) and entry.get("filename")
     }
     repair_manifest_path.unlink(missing_ok=True)
-    stems_dir = workspace / "stems"
+    stems_dir = _workspace_target(workspace, stems_subdir)
     if not stems_dir.is_dir():
         return
     for filename in managed_filenames:
@@ -425,11 +554,18 @@ def _materialize_workspace_stems(
     workspace: Path,
     stem_metadata: Dict[str, Dict[str, object]],
     storage: Optional[MediaStorage],
+    part_id: Optional[str] = None,
+    part_number: Optional[int] = None,
+    stems_subdir: str = "stems",
+    repair_manifest_name: str = "repair-manifest.json",
+    timing_warnings: Optional[List[dict]] = None,
+    expected_auphonic_production_id: Optional[str] = None,
 ) -> None:
     from podline.models import ArtifactKind
 
+    scope = {"part_id": part_id} if part_id is not None else {}
     stems = list_media_artifacts(
-        db_file, session_uid, kind=ArtifactKind.PRE_EDIT_STEM.value
+        db_file, session_uid, kind=ArtifactKind.PRE_EDIT_STEM.value, **scope
     )
     if not stems:
         raise ArtifactError(
@@ -444,55 +580,87 @@ def _materialize_workspace_stems(
             f"missing={sorted(roles - metadata_roles) or 'none'} "
             f"extra={sorted(metadata_roles - roles) or 'none'}"
         )
+    if len({stem.filename for stem in stems}) != len(stems):
+        raise ArtifactError("Persisted stem filenames must be unique within a part")
 
-    production_ids = {stem.source_id for stem in stems if stem.source_id}
-    if len(production_ids) != 1:
+    production_ids = {stem.source_id for stem in stems}
+    if len(production_ids) != 1 or None in production_ids:
         raise ArtifactError(
             "Persisted stems must all reference one Auphonic production"
         )
     production_id = next(iter(production_ids))
+    if (
+        expected_auphonic_production_id is not None
+        and production_id != expected_auphonic_production_id
+    ):
+        raise ArtifactError(
+            f"Persisted stems belong to Auphonic production {production_id}, "
+            f"not {expected_auphonic_production_id}; rerun auphonic-sync"
+        )
 
     durations = {}
     offsets = {}
     for stem in stems:
-        if stem.duration_seconds is None or not math.isfinite(stem.duration_seconds):
-            raise ArtifactError(
-                f"Stem {stem.filename} has no valid duration for alignment"
-            )
-        duration = float(stem.duration_seconds)
         offset = float(stem_metadata[stem.role].get("offset_seconds") or 0)
-        if duration < 0 or offset < 0 or not math.isfinite(offset):
+        if offset < 0 or not math.isfinite(offset):
             raise ArtifactError(
                 f"Stem {stem.filename} has invalid duration/offset metadata"
             )
-        durations[stem.role] = duration
         offsets[stem.role] = offset
+        if not timing_warnings:
+            if (
+                stem.duration_seconds is None
+                or not math.isfinite(stem.duration_seconds)
+                or stem.duration_seconds < 0
+            ):
+                raise ArtifactError(
+                    f"Stem {stem.filename} has no valid duration for alignment"
+                )
+            durations[stem.role] = float(stem.duration_seconds)
 
-    raw_values = list(durations.values())
-    shifted_values = [durations[role] + offsets[role] for role in roles]
-    raw_spread = max(raw_values) - min(raw_values)
-    shifted_spread = max(shifted_values) - min(shifted_values)
-    alignment_tolerance_seconds = 0.05
-    has_offsets = any(offset > 0 for offset in offsets.values())
-    apply_offsets = (
-        has_offsets
-        and shifted_spread + alignment_tolerance_seconds < raw_spread
-    )
-    offsets_rendered_by_auphonic = (
-        has_offsets
-        and raw_spread + alignment_tolerance_seconds < shifted_spread
-    )
-    target_duration = max(shifted_values) if apply_offsets else None
+    if timing_warnings:
+        # Known reconnect/partial/timing risks invalidate the shared-stop
+        # assumption. Durations cannot establish whether offsets were rendered.
+        apply_offsets = False
+        offsets_rendered_by_auphonic = None
+        target_duration = None
+    else:
+        raw_values = list(durations.values())
+        shifted_values = [durations[role] + offsets[role] for role in roles]
+        raw_spread = max(raw_values) - min(raw_values)
+        shifted_spread = max(shifted_values) - min(shifted_values)
+        alignment_tolerance_seconds = 0.05
+        has_offsets = any(offset > 0 for offset in offsets.values())
+        apply_offsets = (
+            has_offsets
+            and shifted_spread + alignment_tolerance_seconds < raw_spread
+        )
+        offsets_rendered_by_auphonic = (
+            has_offsets
+            and raw_spread + alignment_tolerance_seconds < shifted_spread
+        )
+        target_duration = max(shifted_values) if apply_offsets else None
 
-    stems_dir = workspace / "stems"
+    stems_dir = _workspace_target(workspace, stems_subdir)
     stems_dir.mkdir(parents=True, exist_ok=True)
-    repair_manifest_path = workspace / "repair-manifest.json"
+    repair_manifest_path = _workspace_target(workspace, repair_manifest_name)
     previous_manifest = _read_json_object(repair_manifest_path)
     previous_entries = {
         str(entry.get("role")): entry
         for entry in previous_manifest.get("stems", [])
         if isinstance(entry, dict) and entry.get("role")
     }
+    managed_filenames = {
+        entry.get("filename") for entry in previous_entries.values()
+    }
+    for stem in stems:
+        target = _workspace_target(workspace, f"{stems_subdir}/{stem.filename}")
+        if (
+            target.exists()
+            and stem.filename not in managed_filenames
+            and sha256_of_file(target) != stem.sha256
+        ):
+            raise ArtifactError(f"Refusing to overwrite unmanaged workspace file: {target}")
     current_filenames = {stem.filename for stem in stems}
     for entry in previous_entries.values():
         previous_filename = str(entry.get("filename") or "")
@@ -509,7 +677,7 @@ def _materialize_workspace_stems(
             artifact=stem,
             storage=storage,
         )
-        target = stems_dir / stem.filename
+        target = _workspace_target(workspace, f"{stems_subdir}/{stem.filename}")
         podline_offset = offsets[stem.role] if apply_offsets else 0.0
         previous = previous_entries.get(stem.role, {})
         reusable = (
@@ -527,14 +695,23 @@ def _materialize_workspace_stems(
                     offset_seconds=offsets[stem.role],
                     target_duration_seconds=float(target_duration),
                 )
-            elif not target.exists() or sha256_of_file(target) != stem.sha256:
-                shutil.copy2(cached, target)
+            else:
+                _copy_workspace_artifact(
+                    workspace,
+                    f"{stems_subdir}/{stem.filename}",
+                    cached,
+                    stem.sha256,
+                    managed=stem.filename in managed_filenames,
+                )
 
         manifest_stems.append(
             {
                 "role": stem.role,
                 "filename": stem.filename,
                 "track_id": str(stem_metadata[stem.role].get("track_id") or ""),
+                "input_filename": str(
+                    stem_metadata[stem.role].get("input_filename") or ""
+                ),
                 "sha256": sha256_of_file(target),
                 "source_sha256": stem.sha256,
                 "auphonic_production_id": production_id,
@@ -548,7 +725,10 @@ def _materialize_workspace_stems(
         json.dumps(
             {
                 "session_uid": session_uid,
+                "part_id": part_id,
+                "part_number": part_number,
                 "auphonic_production_id": production_id,
+                "timing_warnings": timing_warnings or [],
                 "loudness_normalized": False,
                 "final_loudness_check_required": True,
                 "offsets_rendered_by_auphonic": offsets_rendered_by_auphonic,

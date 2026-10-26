@@ -292,14 +292,60 @@ def test_flagged_stems_keep_bytes_and_configured_offsets_without_timing_inferenc
     assert healthy["offsets_rendered_by_auphonic"] is True
 
 
-def test_single_workspace_append_keeps_legacy_media_and_flat_stem_paths(editing_episode):
+def test_flagged_single_part_keeps_flat_stems_and_original_sources(
+    editing_episode, monkeypatch,
+):
+    from podline.repository import update_recording_part
+
+    e = editing_episode
+    one = e.part(1, output_basename=e.session.session_uid)
+    e.outputs(one)
+    e.artifact(None, "transcript", f"{e.session.session_uid}.vtt", b"WEBVTT\n")
+    e.artifact(
+        one, "raw_track", "original.webm", b"partial-original",
+        role="guest2", source_id="partial-source",
+    )
+    metadata = _stems(e, one, durations=(10, 8.2))
+    update_recording_part(
+        e.runtime.db_file, one.part_id,
+        timing_warnings=[{"track_id": "partial-source", "reason": "partial"}],
+    )
+    monkeypatch.setattr(
+        "podline.artifacts._materialize_aligned_stem",
+        lambda *_a, **_kw: pytest.fail("flagged single-part stems must not align"),
+    )
+
+    workspace = e.workspace(
+        include_sources=True, include_stems=True, stem_metadata=metadata,
+    )
+
+    assert (workspace / "stems" / "Guest.flac").read_bytes() == b"1:guest2"
+    assert (
+        workspace / "sources" / "part-01" / "guest2-partial-source.webm"
+    ).read_bytes() == b"partial-original"
+    repair = json.loads((workspace / "repair-manifest.json").read_text())
+    assert repair["offsets_rendered_by_auphonic"] is None
+    assert repair["final_loudness_check_required"] is True
+
+
+@pytest.mark.parametrize("legacy_manifest", [False, True])
+def test_single_workspace_append_keeps_legacy_media_and_flat_stem_paths(
+    editing_episode, legacy_manifest,
+):
     e = editing_episode
     one = e.part(1, output_basename="old-session")
     e.outputs(one)
     # The single workflow retains its episode-current transcript alias.
-    e.artifact(None, "transcript", "old-session.vtt", b"WEBVTT\n\nPart 1 only\n", production="prod-1")
+    e.artifact(
+        None, "transcript", "old-session.vtt", b"WEBVTT\n\nPart 1 only\n",
+        production="prod-1",
+    )
     metadata = _stems(e, one)
     workspace = e.workspace(include_stems=True, stem_metadata=metadata)
+    if legacy_manifest:
+        manifest = _manifest(workspace)
+        manifest.pop("parts", None)
+        (workspace / "manifest.json").write_text(json.dumps(manifest))
     project = workspace / "edit.cpr"
     project.write_bytes(b"references old-session.mp3 and stems/Jonathan.flac")
     original_stem = (workspace / "stems" / "Jonathan.flac").read_bytes()
@@ -322,6 +368,24 @@ def test_single_workspace_append_keeps_legacy_media_and_flat_stem_paths(editing_
     assert _manifest(workspace)["parts"][0]["repair_manifest"] == "repair-manifest.json"
 
 
+def test_single_sources_manifest_survives_default_refresh(editing_episode):
+    e = editing_episode
+    one = e.part(1, output_basename=e.session.session_uid)
+    e.outputs(one)
+    e.artifact(None, "transcript", f"{e.session.session_uid}.vtt", b"WEBVTT\n")
+    e.artifact(
+        one, "raw_track", "original.webm", b"exact-raw",
+        role="host1", source_id="source-1",
+    )
+    workspace = e.workspace(include_sources=True)
+    sources = _manifest(workspace)["parts"][0]["sources"]
+
+    e.workspace()
+
+    assert _manifest(workspace)["parts"][0]["sources"] == sources
+    assert (workspace / sources[0]["filename"]).read_bytes() == b"exact-raw"
+
+
 def test_workspace_sources_use_safe_collision_resistant_names(editing_episode):
     e = editing_episode
     one, two = e.part(1), e.part(2)
@@ -330,7 +394,10 @@ def test_workspace_sources_use_safe_collision_resistant_names(editing_episode):
         (one, "guest2", "..\\..\\outside", "guest.wav"),
         (two, "host1", "normal", "input.opus"),
     ]:
-        e.artifact(owner, "raw_track", filename, source_id.encode(), role=role, source_id=source_id)
+        e.artifact(
+            owner, "raw_track", filename, source_id.encode(),
+            role=role, source_id=source_id,
+        )
 
     workspace = e.workspace(include_sources=True)
 
