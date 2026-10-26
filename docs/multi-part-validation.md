@@ -107,6 +107,7 @@ passes unchanged.
 
 ## Delivery and rollout
 
+- Implementation PR: [Podline #55](https://github.com/pashafateev/podline/pull/55).
 - Companion API PR: [CozyTrack #205](https://github.com/pashafateev/cozytrack/pull/205).
 - Deploy the additive CozyTrack metadata endpoint before relying on multipart
   ingest in Podline. No CozyTrack schema migration is needed.
