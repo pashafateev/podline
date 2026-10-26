@@ -107,6 +107,16 @@ pod status @1
 
 The pre-edit master and transcript are persisted to S3 and a workspace is created automatically at `~/podline/workspaces/<session_uid>/` with both files. `pod workspace @1` recreates or refreshes it at any time.
 
+For multipart episodes, that same workspace contains independent ordered
+`part-01.mp3` / `part-01.vtt` pairs and a manifest listing all parts, including
+pending work and timing warnings. `pod workspace @1 --sources` exports exact
+original source bytes after ingest, even before processing; add `--part 2` to
+refresh only Part 2. Optional `pod workspace @1 --stems --part 2` uses
+`stems/part-02/` and a per-part repair manifest. Existing single-part filenames,
+flat stems, Cubase projects, and assembled exports are preserved, including when
+a later take appends. See [multipart editing and repair](docs/multipart-editing.md)
+for the layout, managed-file rules, and conservative flagged-part stem behavior.
+
 Optional repair branch after reviewing the Auphonic master
 
 Normal episodes continue directly to the master edit. If an episode needs microphone-level repair, enable **Individual Tracks / FLAC** on the existing Auphonic production, reprocess it, then run:
@@ -151,6 +161,10 @@ pod finalize @1 --master ep16
 Notes:
 - `--master ep16` resolves against the session workspace first, then `04_deliverables/masters/` when the drive is mounted. Full paths and bare filenames also work.
 - Finalize uploads the edited master to S3 as the session's `final_master` artifact.
+- Multipart finalize requires every part's completed ingest and mix/transcript
+  pair, then accepts one user-assembled export. It does not stitch audio or VTT.
+  Run `transcript-refresh` before metadata or draft creation: a part's transcript
+  (including the last part) is not the final episode transcript.
 
 5. Refresh the transcript from the edited final master
 ```bash

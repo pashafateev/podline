@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from podline.artifacts import ArtifactError, materialize_artifact
 from podline.config import AppConfig
+from podline.finalize import FinalizeError, require_final_transcript_for_multipart
 from podline.models import (
     ArtifactKind,
     EpisodeRecord,
@@ -59,6 +60,7 @@ def generate_episode_metadata(
         )
 
     try:
+        require_final_transcript_for_multipart(db_file, session.session_uid)
         transcript_path = materialize_artifact(
             config=config,
             runtime_paths=runtime_paths,
@@ -66,7 +68,7 @@ def generate_episode_metadata(
             session_uid=session.session_uid,
             kind=ArtifactKind.TRANSCRIPT.value,
         )
-    except ArtifactError as exc:
+    except (ArtifactError, FinalizeError) as exc:
         raise EpisodeMetaError(str(exc)) from exc
 
     transcript_text = transcript_path.read_text(encoding="utf-8-sig")

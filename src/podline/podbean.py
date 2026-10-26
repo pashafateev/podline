@@ -9,6 +9,7 @@ import httpx
 
 from podline.artifacts import ArtifactError, materialize_artifact
 from podline.config import AppConfig
+from podline.finalize import FinalizeError, require_final_transcript_for_multipart
 from podline.models import (
     ArtifactKind,
     EpisodeRecord,
@@ -196,6 +197,11 @@ def create_podbean_draft(
         raise PodbeanError(
             f"Session {session.session_uid} must be ready_for_draft before creating a Podbean draft"
         )
+
+    try:
+        require_final_transcript_for_multipart(db_file, session.session_uid)
+    except FinalizeError as exc:
+        raise PodbeanError(str(exc)) from exc
 
     episode = get_episode(db_file, session.session_uid)
     if episode is None or not episode.title or not episode.description:

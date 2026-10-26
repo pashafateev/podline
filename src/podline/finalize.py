@@ -8,6 +8,7 @@ from podline.repository import (
     get_episode,
     get_media_artifact,
     get_session,
+    list_recording_parts,
     update_session_status,
 )
 
@@ -24,15 +25,34 @@ def finalize_session(
     session: SessionRecord,
     master_path: Path,
 ) -> SessionRecord:
+    parts = list_recording_parts(db_file, session.session_uid)
+    if len(parts) > 1:
+        for part in parts:
+            if not part.ingest_complete:
+                raise FinalizeError(
+                    f"Part {part.part_number} has incomplete source ingest; "
+                    "finish ct-ingest before finalizing the assembled master"
+                )
+            for kind in (
+                ArtifactKind.PRE_EDIT_MASTER.value, ArtifactKind.TRANSCRIPT.value,
+            ):
+                if get_media_artifact(
+                    db_file, session.session_uid, kind=kind, part_id=part.part_id,
+                ) is None:
+                    raise FinalizeError(
+                        f"Part {part.part_number} has no {kind} artifact; "
+                        "finish this part's processing before finalizing"
+                    )
     if session.status != SessionStatus.WAITING_FOR_FINALIZE.value:
         raise FinalizeError(
             f"Session {session.session_uid} must be waiting_for_finalize before finalize"
         )
-    for kind in (ArtifactKind.TRANSCRIPT.value, ArtifactKind.PRE_EDIT_MASTER.value):
-        if get_media_artifact(db_file, session.session_uid, kind=kind) is None:
-            raise FinalizeError(
-                f"Session {session.session_uid} has no {kind} artifact"
-            )
+    if len(parts) <= 1:
+        for kind in (ArtifactKind.TRANSCRIPT.value, ArtifactKind.PRE_EDIT_MASTER.value):
+            if get_media_artifact(db_file, session.session_uid, kind=kind) is None:
+                raise FinalizeError(
+                    f"Session {session.session_uid} has no {kind} artifact"
+                )
 
     resolved_master_path = _resolve_master_path(master_path)
     if not resolved_master_path.exists():
@@ -54,6 +74,7 @@ def finalize_session(
             runtime_paths=runtime_paths,
             db_file=db_file,
             session_uid=session.session_uid,
+            part_id=None,
             kind=ArtifactKind.FINAL_MASTER.value,
             source_path=resolved_master_path,
             content_type=content_type_for(resolved_master_path),
@@ -77,6 +98,47 @@ def finalize_session(
     if updated is None:
         raise FinalizeError(f"Finalized session disappeared: {session.session_uid}")
     return updated
+
+
+def require_final_transcript_for_multipart(db_file: str, session_uid: str) -> None:
+    """Fail before consumer side effects when only part transcripts exist.
+
+    Final refresh already records its Auphonic production as source provenance.
+    That episode-owned record, not the latest part or its compatibility alias,
+    is the factual transcript for metadata and draft creation.
+    """
+    parts = list_recording_parts(db_file, session_uid)
+    if len(parts) <= 1:
+        return
+    transcript = get_media_artifact(
+        db_file, session_uid, kind=ArtifactKind.TRANSCRIPT.value, part_id=None,
+    )
+    part_transcripts = [
+        get_media_artifact(
+            db_file, session_uid, kind=ArtifactKind.TRANSCRIPT.value,
+            part_id=part.part_id,
+        )
+        for part in parts
+    ]
+    part_production_ids = {part.auphonic_production_id for part in parts}
+    part_production_ids.update(
+        item.source_id for item in part_transcripts if item is not None
+    )
+    if (
+        transcript is None
+        or transcript.source_provider != "auphonic"
+        or not transcript.source_id
+        or transcript.source_id in part_production_ids
+        or any(
+            item is not None and item.s3_uri == transcript.s3_uri
+            for item in part_transcripts
+        )
+    ):
+        raise FinalizeError(
+            f"Multipart session {session_uid} needs a refreshed final-master "
+            f"transcript. Run pod transcript-refresh {session_uid} after "
+            "pod finalize; a part transcript is not the assembled episode."
+        )
 
 
 def get_episode_metadata(db_file: str, session_uid: str):
