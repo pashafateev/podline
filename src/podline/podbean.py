@@ -1,4 +1,5 @@
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,6 +10,7 @@ import httpx
 
 from podline.artifacts import ArtifactError, materialize_artifact
 from podline.config import AppConfig
+from podline.db import connect
 from podline.models import (
     ArtifactKind,
     EpisodeRecord,
@@ -83,13 +85,26 @@ class PodbeanClient:
         return str(token)
 
     def list_episodes(self, access_token: str, limit: int = 100) -> List[Dict]:
-        response = self._client.get(
-            f"{self._config.podbean.base_url.rstrip('/')}/episodes",
-            params={"access_token": access_token, "offset": 0, "limit": limit},
-        )
-        self._raise_for_status(response, "Podbean episode listing")
-        payload = response.json()
-        return list(payload.get("episodes") or [])
+        episodes = []
+        while True:
+            response = self._client.get(
+                f"{self._config.podbean.base_url.rstrip('/')}/episodes",
+                params={
+                    "access_token": access_token,
+                    "offset": len(episodes),
+                    "limit": limit,
+                },
+            )
+            self._raise_for_status(response, "Podbean episode listing")
+            payload = response.json()
+            page = list(payload.get("episodes") or [])
+            episodes.extend(page)
+            if not payload.get("has_more"):
+                return episodes
+            if not page:
+                raise PodbeanError(
+                    "Podbean episode listing returned an empty page with has_more"
+                )
 
     def authorize_upload(
         self, access_token: str, file_path: Path, content_type: str
@@ -131,8 +146,7 @@ class PodbeanClient:
                     ) from exc
                 delay = _PRESIGNED_UPLOAD_BACKOFF_BASE_SECONDS * 2 ** (attempt - 1)
                 logger.warning(
-                    "%s failed transiently on attempt %d/%d: %s; "
-                    "retrying in %.1fs",
+                    "%s failed transiently on attempt %d/%d: %s; retrying in %.1fs",
                     context,
                     attempt,
                     _PRESIGNED_UPLOAD_ATTEMPTS,
@@ -224,6 +238,17 @@ def create_podbean_draft(
     client = client or PodbeanClient(config)
     access_token = client.get_access_token()
     next_episode_number = _next_episode_number(client.list_episodes(access_token))
+    with connect(db_file) as connection:
+        reserved = connection.execute(
+            "SELECT session_uid FROM episodes WHERE episode_number = ? AND session_uid != ?",
+            (next_episode_number, session.session_uid),
+        ).fetchone()
+    if reserved:
+        raise PodbeanError(
+            f"Episode {next_episode_number} is already assigned to {reserved['session_uid']}. "
+            "Resolve that draft before creating another episode."
+        )
+    draft_title = _draft_title(episode.title, next_episode_number)
     media_auth = client.authorize_upload(
         access_token, final_master, _content_type_for(final_master)
     )
@@ -240,7 +265,7 @@ def create_podbean_draft(
 
     payload = client.create_draft_episode(
         access_token,
-        title=episode.title,
+        title=draft_title,
         description=episode.description,
         media_key=media_auth["file_key"],
         transcript_key=transcript_auth["file_key"],
@@ -266,6 +291,7 @@ def create_podbean_draft(
         db_file,
         session_uid=session.session_uid,
         episode_number=next_episode_number,
+        title=draft_title,
         podbean_post_id=post_id,
         draft_url=draft_url,
     )
@@ -291,17 +317,37 @@ def validate_podbean_config(config: AppConfig) -> None:
         raise PodbeanError("Podbean base_url is missing in config.yaml")
 
 
+# Match the show's existing "38. Title" prefix, not numbers within a title.
+_NUMBERED_TITLE = re.compile(r"^\s*(\d+)\.\s+")
+
+
 def _next_episode_number(episodes: List[Dict]) -> int:
+    published = [episode for episode in episodes if episode.get("status") == "publish"]
     numbers = []
-    for episode in episodes:
-        value = episode.get("episode_number")
-        if value in (None, ""):
-            continue
+    for episode in published:
         try:
-            numbers.append(int(value))
+            number = int(episode.get("episode_number") or 0)
         except (TypeError, ValueError):
-            continue
-    return (max(numbers) + 1) if numbers else 1
+            number = 0
+        if number <= 0:
+            match = _NUMBERED_TITLE.match(str(episode.get("title") or ""))
+            number = int(match.group(1)) if match else 0
+        if number > 0:
+            numbers.append(number)
+    if published and not numbers:
+        raise PodbeanError(
+            "Cannot determine a published episode number from Podbean history"
+        )
+    return max(numbers) + 1 if numbers else 1
+
+
+def _draft_title(title: str, episode_number: int) -> str:
+    title = _NUMBERED_TITLE.sub("", title.strip())
+    # Legacy all-caps metadata needs a fallback; retain already edited casing.
+    if title.isupper():
+        title = title.capitalize()
+        title = re.sub(r"\bi\b", "I", title)
+    return f"{episode_number}. {title}"
 
 
 def _content_type_for(path: Path) -> str:
@@ -324,17 +370,16 @@ def _persist_podbean_draft(
     episode_number: int,
     podbean_post_id: str,
     draft_url: str,
+    title: str,
 ) -> EpisodeRecord:
-    from podline.db import connect
-
     with connect(db_file) as connection:
         connection.execute(
             """
             UPDATE episodes
-            SET episode_number = ?, podbean_post_id = ?, draft_url = ?
+            SET episode_number = ?, podbean_post_id = ?, draft_url = ?, title = ?
             WHERE session_uid = ?
             """,
-            (episode_number, podbean_post_id, draft_url, session_uid),
+            (episode_number, podbean_post_id, draft_url, title, session_uid),
         )
         connection.commit()
 
