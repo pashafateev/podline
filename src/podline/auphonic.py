@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import json
 import logging
+from math import isclose
 import stat
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -37,7 +38,9 @@ from podline.models import (
     SessionRecord,
     SessionStatus,
 )
+from podline.podbean import protect_draft_inputs
 from podline.repository import (
+    record_offsets_applied,
     complete_transcript_refresh,
     delete_media_artifacts,
     discard_transcript_refresh_production,
@@ -204,6 +207,7 @@ class AuphonicClient:
         response = self._request_with_retries(
             "POST",
             "/productions.json",
+            attempts=1,
             json=payload,
             headers={"Content-Type": "application/json"},
         )
@@ -273,6 +277,7 @@ class AuphonicClient:
         response = self._request_with_retries(
             "POST",
             "/productions.json",
+            attempts=1,
             json={
                 "preset": preset_id,
                 "metadata": {"title": title},
@@ -294,6 +299,7 @@ class AuphonicClient:
         self._request_with_retries(
             "POST",
             f"/production/{production_id}/start.json",
+            attempts=1,
         )
 
     def wait_for_production(self, production_id: str) -> AuphonicProduction:
@@ -362,9 +368,9 @@ class AuphonicClient:
             )
         return payload
 
-    def _request_with_retries(self, method: str, url: str, **kwargs) -> httpx.Response:
+    def _request_with_retries(self, method: str, url: str, *, attempts: int = 3, **kwargs) -> httpx.Response:
         last_error: Optional[Exception] = None
-        for _attempt in range(3):
+        for _attempt in range(attempts):
             try:
                 logging.getLogger("podline").debug(
                     "Auphonic request method=%s url=%s attempt=%s",
@@ -402,7 +408,8 @@ class AuphonicClient:
                     url,
                     exc,
                 )
-                sleep(1)
+                if _attempt + 1 < attempts:
+                    sleep(1)
             except (httpx.HTTPError, httpx.TransportError) as exc:
                 last_error = exc
                 logging.getLogger("podline").debug(
@@ -411,7 +418,8 @@ class AuphonicClient:
                     url,
                     exc,
                 )
-                sleep(1)
+                if _attempt + 1 < attempts:
+                    sleep(1)
         raise AuphonicError(f"Auphonic request failed: {last_error}") from last_error
 
 
@@ -455,6 +463,12 @@ def prepare_session_with_auphonic(
             f"Session {session.session_uid} must be queued before Auphonic prepare"
         )
 
+    if session.auphonic_production_id:
+        raise AuphonicError(
+            f"Preparation already created {session.auphonic_production_id}; inspect it "
+            f"with pod auphonic-inspect --session {session.session_uid}"
+        )
+
     tracks = _spoken_raw_tracks(config, db_file, session.session_uid)
     preset_id = resolve_preset_id(config, len(tracks))
     service_id = resolve_auphonic_service_id(config)
@@ -478,6 +492,15 @@ def prepare_session_with_auphonic(
             preset_id=preset_id,
         )
         production_id = prepared_production.production_id
+        update_session_status(
+            db_file,
+            session_uid=session.session_uid,
+            from_state=session.status,
+            to_state=session.status,
+            timestamp=timestamp,
+            detail="created Auphonic production; attaching S3 tracks",
+            auphonic_production_id=production_id,
+        )
         _log(
             logger,
             "Created Auphonic production %s for %s",
@@ -649,44 +672,17 @@ def start_prepared_session_with_auphonic(
         )
 
         production = client.wait_for_production(production_id)
-        _log(
-            logger,
-            "Auphonic production %s finished; persisting outputs to S3",
-            production_id,
-        )
-        artifacts = _persist_outputs(
-            client=client,
+        started = get_session(db_file, session.session_uid)
+        if started is None:
+            raise AuphonicError(f"Started session disappeared: {session.session_uid}")
+        return complete_pre_edit_production(
             config=config,
             runtime_paths=runtime_paths,
             db_file=db_file,
-            session_uid=session.session_uid,
+            session=started,
             production=production,
+            client=client,
             logger=logger,
-        )
-        workspace = create_workspace(
-            config=config,
-            runtime_paths=runtime_paths,
-            db_file=db_file,
-            session_uid=session.session_uid,
-            expected_auphonic_production_id=production.production_id,
-        )
-
-        update_session_status(
-            db_file,
-            session_uid=session.session_uid,
-            from_state=SessionStatus.AUPHONIC_STARTED.value,
-            to_state=SessionStatus.WAITING_FOR_FINALIZE.value,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            detail=f"persisted Auphonic outputs to S3; workspace at {workspace}",
-            auphonic_production_id=production.production_id,
-        )
-        _log(
-            logger,
-            "Stored Auphonic outputs for %s master=%s transcript=%s workspace=%s",
-            session.session_uid,
-            artifacts["master"].s3_uri,
-            artifacts["transcript"].s3_uri,
-            workspace,
         )
     except Exception as exc:
         _log(logger, "Auphonic start failed for %s: %s", session.session_uid, exc)
@@ -703,12 +699,52 @@ def start_prepared_session_with_auphonic(
         )
         raise
 
+
+def complete_pre_edit_production(
+    *,
+    config: AppConfig,
+    runtime_paths: RuntimePaths,
+    db_file: str,
+    session: SessionRecord,
+    production: AuphonicProduction,
+    client: AuphonicClientProtocol,
+    production_details: Optional[Dict] = None,
+    logger: Optional[logging.Logger] = None,
+) -> SessionRecord:
+    _persist_outputs(
+        client=client,
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=db_file,
+        session_uid=session.session_uid,
+        production=production,
+        production_details=production_details,
+        logger=logger,
+    )
+    workspace = create_workspace(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=db_file,
+        session_uid=session.session_uid,
+        expected_auphonic_production_id=production.production_id,
+    )
+    update_session_status(
+        db_file,
+        session_uid=session.session_uid,
+        from_state=session.status,
+        to_state=SessionStatus.WAITING_FOR_FINALIZE.value,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        detail=f"persisted Auphonic outputs to S3; workspace at {workspace}",
+        auphonic_production_id=production.production_id,
+    )
+    _log(logger, "Stored outputs for %s in workspace %s", session.session_uid, workspace)
     updated = get_session(db_file, session.session_uid)
     if updated is None:
         raise AuphonicError(f"Processed session disappeared: {session.session_uid}")
     return updated
 
 
+@protect_draft_inputs(AuphonicError)
 def refresh_transcript_with_auphonic(
     *,
     config: AppConfig,
@@ -1801,17 +1837,32 @@ def offset_session_auphonic_production(
             plan.production_id, target.track_id, target.offset_seconds
         )
     details = inspect_production(config, plan.production_id, client=client)
-    track_states = []
-    for target in plan.targets:
-        track_state = _find_multi_input_track_by_id(
-            details.get("multi_input_files") or [], target.track_id
-        )
-        if track_state is None:
-            raise AuphonicError(
-                f"Auphonic offset was applied but updated track {target.track_id} was not present on re-inspection"
-            )
-        track_states.append(track_state)
+    track_states = verify_production_offsets(plan, details)
+    record_offsets_applied(db_file, session.session_uid, plan.production_id)
     return AuphonicOffsetResult(plan=plan, applied=True, track_states=track_states)
+
+
+def verify_production_offsets(plan: AuphonicOffsetPlan, details: Dict) -> List[Dict]:
+    """Verify targeted delays and the zero-offset reference against remote tracks."""
+    _validate_offset_production_state(details)
+    tracks = details.get("multi_input_files") or []
+    expected = {target.asset: target.offset_seconds for target in plan.targets}
+    track_states = []
+    for item in plan.asset_durations:
+        track = _find_multi_input_track_for_asset(tracks, item.asset)
+        offset = expected.get(item.asset, 0.0)
+        try:
+            actual = float(track.get("offset", 0))
+        except (TypeError, ValueError):
+            actual = float("nan")
+        if not isclose(actual, offset, rel_tol=0.0, abs_tol=1e-6):
+            raise AuphonicError(
+                f"Auphonic track {track.get('id')} has offset {track.get('offset')!r}; "
+                f"expected {offset} seconds"
+            )
+        if item.asset in expected:
+            track_states.append(track)
+    return track_states
 
 
 _AUPHONIC_RESETTABLE_STATUSES = {
@@ -1885,40 +1936,34 @@ def reconcile_production_to_session(
         session.session_uid,
     )
 
-    if _is_done_status(details):
+    if _is_failed_status(details):
+        update_session_status(
+            db_file,
+            session_uid=session.session_uid,
+            from_state=current_state,
+            to_state=SessionStatus.FAILED.value,
+            timestamp=timestamp,
+            detail=f"reconciled failed Auphonic production: {details.get('error_message') or details.get('status_string')}",
+            auphonic_production_id=production_id,
+            failure_reason=details.get("error_message") or details.get("status_string"),
+            failed_at_stage="auphonic",
+        )
+    elif _is_done_status(details):
         production = AuphonicProduction(
             production_id=production_id,
             output_files=_extract_output_files(
                 {"output_files": details["output_files"]}
             ),
         )
-        _persist_outputs(
-            client=client,
+        return complete_pre_edit_production(
             config=config,
             runtime_paths=runtime_paths,
             db_file=db_file,
-            session_uid=session.session_uid,
+            session=session,
             production=production,
+            client=client,
             production_details=details,
             logger=logger,
-        )
-        workspace = create_workspace(
-            config=config,
-            runtime_paths=runtime_paths,
-            db_file=db_file,
-            session_uid=session.session_uid,
-            expected_auphonic_production_id=production_id,
-        )
-        update_session_status(
-            db_file,
-            session_uid=session.session_uid,
-            from_state=current_state,
-            to_state=SessionStatus.WAITING_FOR_FINALIZE.value,
-            timestamp=timestamp,
-            detail=f"reconciled completed Auphonic production; workspace at {workspace}",
-            auphonic_production_id=production_id,
-            failure_reason=None,
-            failed_at_stage=None,
         )
     elif details.get("start_allowed"):
         # Auphonic has no notion of "previewed"; both prepared and previewed
@@ -1939,18 +1984,6 @@ def reconcile_production_to_session(
             auphonic_production_id=production_id,
             failure_reason=None,
             failed_at_stage=None,
-        )
-    elif _is_failed_status(details):
-        update_session_status(
-            db_file,
-            session_uid=session.session_uid,
-            from_state=current_state,
-            to_state=SessionStatus.FAILED.value,
-            timestamp=timestamp,
-            detail=f"reconciled failed Auphonic production: {details.get('error_message') or details.get('status_string')}",
-            auphonic_production_id=production_id,
-            failure_reason=details.get("error_message") or details.get("status_string"),
-            failed_at_stage="auphonic",
         )
     else:
         update_session_status(
@@ -2110,15 +2143,6 @@ def _find_multi_input_track_for_asset(
     raise AuphonicError(
         f"Ambiguous Auphonic track match for {asset.filename}; inspected tracks: {inspected}"
     )
-
-
-def _find_multi_input_track_by_id(
-    multi_input_files: List[Dict], track_id: str
-) -> Optional[Dict]:
-    for track in multi_input_files:
-        if str(track.get("id") or "") == track_id:
-            return track
-    return None
 
 
 def _input_file_basename(value) -> str:

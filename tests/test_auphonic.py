@@ -2060,6 +2060,41 @@ def test_session_offset_dry_run_does_not_update_auphonic(
     assert client.offset_updates == []
 
 
+def test_offsets_applied_marker_tracks_successful_production_only(
+    app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path,
+    monkeypatch,
+):
+    from podline import repository
+
+    config = app_config_factory(tmp_path)
+    runtime_paths = runtime_factory(config)
+    session = _offset_session(tmp_path, runtime_paths, session_factory, artifact_registrar)
+    client = FakeOffsetAuphonicClient()
+    args = dict(
+        config=config,
+        runtime_paths=runtime_paths,
+        db_file=runtime_paths.db_file,
+        session=session,
+        client=client,
+    )
+    marker = runtime_paths.db_file, session.session_uid, "prod-123"
+    offset_session_auphonic_production(**args, apply=False)
+    assert not repository.offsets_applied(*marker)
+    with monkeypatch.context() as patch:
+        def fail_update(*args):
+            raise AuphonicError("update failed")
+
+        patch.setattr(client, "update_multi_input_file_offset", fail_update)
+        with pytest.raises(AuphonicError, match="update failed"):
+            offset_session_auphonic_production(**args, apply=True)
+    assert not repository.offsets_applied(*marker)
+    for _ in range(2):
+        offset_session_auphonic_production(**args, apply=True)
+        assert repository.offsets_applied(*marker)
+    assert not repository.offsets_applied(runtime_paths.db_file, session.session_uid, "new-prod")
+    assert not repository.offsets_applied(runtime_paths.db_file, "other-session", "prod-123")
+
+
 def test_session_offset_apply_updates_matched_track_id(
     app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path
 ) -> None:
@@ -2642,3 +2677,42 @@ def test_start_failure_after_persist_recovers_via_reconcile_without_restart(
         assert copy.exists()
         assert entry["sha256"] == artifact.sha256
         assert sha256_of_file(copy) == artifact.sha256
+
+
+def test_single_input_create_submits_once_on_lost_response(app_config_factory, tmp_path, monkeypatch):
+    config = app_config_factory(tmp_path)
+    client = AuphonicClient(config)
+    requests = []
+
+    def lose_response(request):
+        requests.append(request)
+        raise httpx.ReadTimeout("lost reply", request=request)
+
+    monkeypatch.setattr("podline.auphonic.sleep", lambda seconds: None)
+    client._client = httpx.Client(
+        base_url=config.auphonic.base_url, transport=httpx.MockTransport(lose_response)
+    )
+    with pytest.raises(AuphonicError, match="lost reply"):
+        client.create_single_input_production(
+            title="Refresh", preset_id="preset", service_id="service", input_key="master.wav"
+        )
+    assert [request.method for request in requests] == ["POST"]
+
+
+def test_sync_prioritizes_remote_failure_over_permission_to_start(
+    app_config_factory, runtime_factory, session_factory, tmp_path
+):
+    config = app_config_factory(tmp_path)
+    paths = runtime_factory(config)
+    session = session_factory(paths.db_file, session_uid="stopped", status="auphonic_started")
+    client = FakeAuphonicClient()
+    client._status = 2
+    client._status_string = "Error"
+
+    updated = reconcile_production_to_session(
+        config=config, runtime_paths=paths, db_file=paths.db_file, session=session,
+        production_id="prod-failed", client=client,
+    )
+    assert updated.status == "failed"
+    assert updated.failure_reason == "Error"
+    assert updated.auphonic_production_id == "prod-failed"

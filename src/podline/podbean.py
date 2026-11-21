@@ -1,14 +1,19 @@
 import logging
+import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 from time import sleep
 from typing import Dict, List, Optional, Protocol
+from urllib.parse import quote
 
 import httpx
 
 from podline.artifacts import ArtifactError, materialize_artifact
 from podline.config import AppConfig
+from podline.db import connect
 from podline.models import (
     ArtifactKind,
     EpisodeRecord,
@@ -16,7 +21,8 @@ from podline.models import (
     SessionRecord,
     SessionStatus,
 )
-from podline.repository import get_episode, update_session_status
+from podline.repository import get_episode, get_session
+from podline.workflow_lock import WorkflowBusy, session_lock
 
 
 logger = logging.getLogger("podline")
@@ -36,10 +42,19 @@ class PodbeanDraftResult:
     draft_url: str
 
 
+@dataclass(frozen=True)
+class PendingDraft:
+    episode_number: int
+    title: str
+    started_at: str
+
+
 class PodbeanClientProtocol(Protocol):
     def get_access_token(self) -> str: ...
 
     def list_episodes(self, access_token: str, limit: int = 100) -> List[Dict]: ...
+
+    def get_remote_episode(self, access_token: str, post_id: str) -> Dict: ...
 
     def authorize_upload(
         self, access_token: str, file_path: Path, content_type: str
@@ -90,6 +105,14 @@ class PodbeanClient:
         self._raise_for_status(response, "Podbean episode listing")
         payload = response.json()
         return list(payload.get("episodes") or [])
+
+    def get_remote_episode(self, access_token: str, post_id: str) -> Dict:
+        response = self._client.get(
+            f"{self._config.podbean.base_url.rstrip('/')}/episodes/{quote(post_id, safe='')}",
+            params={"access_token": access_token},
+        )
+        self._raise_for_status(response, "Podbean episode lookup")
+        return response.json()
 
     def authorize_upload(
         self, access_token: str, file_path: Path, content_type: str
@@ -191,13 +214,40 @@ def create_podbean_draft(
     session: SessionRecord,
     client: Optional[PodbeanClientProtocol] = None,
 ) -> EpisodeRecord:
+    with _draft_lock(db_file, session.session_uid):
+        current = get_session(db_file, session.session_uid)
+        if current is None:
+            raise PodbeanError(f"Unknown session {session.session_uid}")
+        episode = get_episode(db_file, current.session_uid)
+        if episode and episode.podbean_post_id:
+            # Earlier versions committed the episode ID before changing the state.
+            if current.status == SessionStatus.READY_FOR_DRAFT.value:
+                with connect(db_file) as connection:
+                    _mark_draft_created(connection, current.session_uid)
+            return episode
+        pending = get_pending_draft(db_file, current.session_uid)
+        if pending:
+            raise PodbeanError(_recovery_message(pending))
+        try:
+            return _submit_draft(config, runtime_paths, db_file, current, episode, client)
+        except (httpx.HTTPError, ValueError) as exc:
+            raise PodbeanError("Podbean preparation failed before draft submission. Retry this step.") from exc
+
+
+def _submit_draft(
+    config: AppConfig,
+    runtime_paths: RuntimePaths,
+    db_file: str,
+    session: SessionRecord,
+    episode: Optional[EpisodeRecord],
+    client: Optional[PodbeanClientProtocol],
+) -> EpisodeRecord:
     validate_podbean_config(config)
     if session.status != SessionStatus.READY_FOR_DRAFT.value:
         raise PodbeanError(
             f"Session {session.session_uid} must be ready_for_draft before creating a Podbean draft"
         )
 
-    episode = get_episode(db_file, session.session_uid)
     if episode is None or not episode.title or not episode.description:
         raise PodbeanError(
             f"Session {session.session_uid} does not have saved episode metadata. Run pod episode-meta first."
@@ -238,48 +288,136 @@ def create_podbean_draft(
         transcript_auth["presigned_url"], transcript, _content_type_for(transcript)
     )
 
-    payload = client.create_draft_episode(
-        access_token,
-        title=episode.title,
-        description=episode.description,
-        media_key=media_auth["file_key"],
-        transcript_key=transcript_auth["file_key"],
-        episode_number=next_episode_number,
-    )
-    episode_node = payload.get("episode") or payload
-    draft_url = str(
-        episode_node.get("url")
-        or episode_node.get("link")
-        or episode_node.get("share_url")
-        or ""
-    )
-    post_id = str(
-        episode_node.get("id")
-        or episode_node.get("episode_id")
-        or episode_node.get("post_id")
-        or ""
-    )
-    if not post_id:
-        raise PodbeanError("Podbean draft response did not include an episode id")
+    started_at = datetime.now(timezone.utc).isoformat()
+    with connect(db_file) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        current_inputs = connection.execute(
+            """SELECT 1 FROM sessions JOIN episodes USING(session_uid)
+               WHERE session_uid=? AND status='ready_for_draft'
+               AND transcript_refresh_production_id IS NULL
+               AND COALESCE(podbean_post_id, '')=''
+               AND title=? AND description=?""",
+            (session.session_uid, episode.title, episode.description),
+        ).fetchone()
+        if current_inputs is None:
+            raise PodbeanError("Draft inputs changed. Review the current transcript and metadata.")
+        # Podbean's listing can omit drafts. Reserve numbers held locally as well.
+        highest = connection.execute(
+            """SELECT MAX(episode_number) FROM (
+                   SELECT episode_number FROM episodes
+                   UNION ALL SELECT episode_number FROM pending_podbean_drafts
+               )"""
+        ).fetchone()[0]
+        next_episode_number = max(next_episode_number, (highest or 0) + 1)
+        pending = PendingDraft(next_episode_number, episode.title, started_at)
+        connection.execute(
+            """INSERT INTO pending_podbean_drafts(session_uid, episode_number, title, started_at)
+               VALUES (?, ?, ?, ?)""",
+            (session.session_uid, pending.episode_number, pending.title, pending.started_at),
+        )
 
-    updated_episode = _persist_podbean_draft(
-        db_file,
-        session_uid=session.session_uid,
-        episode_number=next_episode_number,
-        podbean_post_id=post_id,
-        draft_url=draft_url,
+    try:
+        payload = client.create_draft_episode(
+            access_token,
+            title=episode.title,
+            description=episode.description,
+            media_key=media_auth["file_key"],
+            transcript_key=transcript_auth["file_key"],
+            episode_number=next_episode_number,
+        )
+        return _record_remote_draft(db_file, session.session_uid, pending, payload)
+    except (PodbeanError, httpx.HTTPError, ValueError, sqlite3.Error) as exc:
+        raise PodbeanError(f"{exc}. {_recovery_message(pending)}") from exc
+
+
+def get_pending_draft(db_file: str, session_uid: str) -> Optional[PendingDraft]:
+    with connect(db_file) as connection:
+        row = connection.execute(
+            "SELECT episode_number, title, started_at FROM pending_podbean_drafts WHERE session_uid=?",
+            (session_uid,),
+        ).fetchone()
+    return PendingDraft(**row) if row else None
+
+
+def _recovery_message(pending: PendingDraft) -> str:
+    return (
+        f"Check Podbean for draft #{pending.episode_number} ({pending.title}) "
+        f"from {pending.started_at}. Run pod podbean-draft for this session with "
+        "--existing-id ID to record the matching draft, or --confirm-absent "
+        "after verifying the submission did not create an episode."
     )
-    update_session_status(
-        db_file,
-        session_uid=session.session_uid,
-        from_state=session.status,
-        to_state=SessionStatus.DRAFT_CREATED.value,
-        timestamp=datetime.now(timezone.utc).isoformat(),
-        detail="created Podbean draft episode",
-        failure_reason=None,
-        failed_at_stage=None,
-    )
-    return updated_episode
+
+
+@contextmanager
+def _draft_lock(db_file: str, uid: str):
+    try:
+        with session_lock(db_file, uid, "podbean"):
+            yield
+    except WorkflowBusy as exc:
+        raise PodbeanError(f"A Podbean request is in progress for {uid}.") from exc
+
+
+def protect_draft_inputs(error_type):
+    """Serialize manual and guided edits with submission and preserve ambiguous drafts."""
+
+    def decorate(operation):
+        @wraps(operation)
+        def guarded(*, db_file, session, **kwargs):
+            try:
+                with _draft_lock(db_file, session.session_uid):
+                    pending = get_pending_draft(db_file, session.session_uid)
+                    if pending:
+                        raise PodbeanError(_recovery_message(pending))
+                    current = get_session(db_file, session.session_uid)
+                    if current is None:
+                        raise PodbeanError(f"Unknown session {session.session_uid}")
+                    episode = get_episode(db_file, session.session_uid)
+                    if episode and episode.podbean_post_id and current.status == "ready_for_draft":
+                        raise PodbeanError("Run pod podbean-draft to record the saved draft's status.")
+                    return operation(db_file=db_file, session=current, **kwargs)
+            except PodbeanError as exc:
+                raise error_type(str(exc)) from exc
+
+        return guarded
+
+    return decorate
+
+
+def recover_podbean_draft(
+    *,
+    config: AppConfig,
+    db_file: str,
+    session: SessionRecord,
+    existing_id: Optional[str] = None,
+    confirm_absent: bool = False,
+    client: Optional[PodbeanClientProtocol] = None,
+) -> Optional[EpisodeRecord]:
+    if bool(existing_id) == confirm_absent:
+        raise PodbeanError("Choose either --existing-id ID or --confirm-absent.")
+    uid = session.session_uid
+    with _draft_lock(db_file, uid):
+        pending = get_pending_draft(db_file, uid)
+        if pending is None:
+            raise PodbeanError("This session has no pending Podbean submission.")
+        if confirm_absent:
+            with connect(db_file) as connection:
+                connection.execute("DELETE FROM pending_podbean_drafts WHERE session_uid=?", (uid,))
+            return None
+        validate_podbean_config(config)
+        client = client or PodbeanClient(config)
+        try:
+            payload = client.get_remote_episode(client.get_access_token(), existing_id)
+        except (httpx.HTTPError, ValueError) as exc:
+            raise PodbeanError("Unable to verify the episode with Podbean. The submission remains pending.") from exc
+        return _record_remote_draft(db_file, uid, pending, payload, verified_id=existing_id)
+
+
+def _episode_node(payload: Dict) -> Dict:
+    if isinstance(payload, dict):
+        node = payload.get("episode", payload)
+        if isinstance(node, dict):
+            return node
+    raise PodbeanError("Invalid Podbean episode response")
 
 
 def validate_podbean_config(config: AppConfig) -> None:
@@ -317,28 +455,61 @@ def _content_type_for(path: Path) -> str:
     return "application/octet-stream"
 
 
-def _persist_podbean_draft(
+def _mark_draft_created(connection: sqlite3.Connection, uid: str) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    changed = connection.execute(
+        """UPDATE sessions SET status='draft_created', updated_at=?, failure_reason=NULL,
+                  failed_at_stage=NULL WHERE session_uid=? AND status='ready_for_draft'""",
+        (now, uid),
+    )
+    if changed.rowcount != 1:
+        raise PodbeanError("Session state changed during Podbean submission.")
+    connection.execute(
+        """INSERT INTO events(session_uid, from_state, to_state, timestamp, detail)
+           VALUES (?, 'ready_for_draft', 'draft_created', ?, 'recorded Podbean draft episode')""",
+        (uid, now),
+    )
+
+
+def _record_remote_draft(
     db_file: str,
+    uid: str,
+    pending: PendingDraft,
+    payload: Dict,
     *,
-    session_uid: str,
-    episode_number: int,
-    podbean_post_id: str,
-    draft_url: str,
+    verified_id: Optional[str] = None,
 ) -> EpisodeRecord:
-    from podline.db import connect
-
+    remote = _episode_node(payload)
+    post_id = remote.get("id") or remote.get("episode_id") or remote.get("post_id")
+    if type(post_id) not in (str, int) or not str(post_id).strip():
+        raise PodbeanError("Podbean draft response did not include an episode id")
+    expected = {"status": "draft", "title": pending.title, "episode_number": pending.episode_number}
+    # Creation may return only the ID. Recovery must positively identify the draft.
+    if verified_id is not None:
+        expected["id"] = verified_id
+    for field, value in expected.items():
+        if verified_id is None and field not in remote:
+            continue
+        if str(remote.get(field)) != str(value):
+            raise PodbeanError(f"Podbean {field} does not match the pending submission.")
+    url = (
+        remote.get("url")
+        or remote.get("link")
+        or remote.get("share_url")
+        or remote.get("permalink_url")
+        or ""
+    )
     with connect(db_file) as connection:
-        connection.execute(
-            """
-            UPDATE episodes
-            SET episode_number = ?, podbean_post_id = ?, draft_url = ?
-            WHERE session_uid = ?
-            """,
-            (episode_number, podbean_post_id, draft_url, session_uid),
+        updated = connection.execute(
+            """UPDATE episodes SET episode_number=?, podbean_post_id=?, draft_url=?
+               WHERE session_uid=?""",
+            (pending.episode_number, str(post_id), str(url), uid),
         )
-        connection.commit()
-
-    episode = get_episode(db_file, session_uid)
+        if updated.rowcount != 1:
+            raise PodbeanError("Saved episode metadata disappeared during Podbean submission.")
+        _mark_draft_created(connection, uid)
+        connection.execute("DELETE FROM pending_podbean_drafts WHERE session_uid=?", (uid,))
+    episode = get_episode(db_file, uid)
     if episode is None:
-        raise PodbeanError(f"Failed to persist Podbean draft for {session_uid}")
+        raise PodbeanError(f"Could not read recorded Podbean draft for {uid}")
     return episode

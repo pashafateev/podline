@@ -238,3 +238,168 @@ def test_podbean_presigned_upload_stops_after_bounded_transport_retries(
 
     assert attempts == 3
     assert delays == [2.0, 4.0]
+
+
+@pytest.fixture
+def draft_args(app_config_factory, runtime_factory, session_factory, monkeypatch, tmp_path):
+    config = app_config_factory(tmp_path, podbean_enabled=True)
+    paths = runtime_factory(config)
+    session = session_factory(paths.db_file, session_uid="resume", status="ready_for_draft")
+    upsert_episode_metadata(paths.db_file, session_uid="resume", title="Title", description="Notes")
+    media = tmp_path / "audio.mp3"
+    media.touch()
+    monkeypatch.setattr("podline.podbean.materialize_artifact", lambda **kwargs: media)
+    return dict(config=config, runtime_paths=paths, db_file=paths.db_file, session=session)
+
+
+def test_saved_draft_replay_returns_without_uploads_even_with_stale_session(draft_args):
+    original = create_podbean_draft(**draft_args, client=FakePodbeanClient())
+    retry_client = FakePodbeanClient()
+    assert create_podbean_draft(**draft_args, client=retry_client) == original
+    assert retry_client.uploaded == []
+
+
+@pytest.mark.parametrize("found", [True, False])
+def test_lost_draft_response_requires_reconciliation_before_retry(draft_args, found):
+    from podline import podbean
+
+    recovery = {k: v for k, v in draft_args.items() if k != "runtime_paths"}
+
+    class InterruptedClient(FakePodbeanClient):
+        def create_draft_episode(self, access_token, **fields):
+            pending = podbean.get_pending_draft(draft_args["db_file"], "resume")
+            assert (pending.title, pending.episode_number) == ("Title", 16)
+            with pytest.raises(PodbeanError, match="in progress"):
+                create_podbean_draft(**draft_args, client=self)
+            with pytest.raises(PodbeanError, match="in progress"):
+                podbean.recover_podbean_draft(**recovery, confirm_absent=True)
+            raise httpx.ReadTimeout("lost reply")
+
+    with pytest.raises(PodbeanError, match="Podbean"):
+        create_podbean_draft(**draft_args, client=InterruptedClient())
+    fresh_client = FakePodbeanClient()
+    with pytest.raises(PodbeanError, match="confirm-absent"):
+        create_podbean_draft(**draft_args, client=fresh_client)
+    assert fresh_client.uploaded == []
+    if found:
+        result = {"id": "abc", "title": "Different", "episode_number": 16, "status": "draft"}
+        fresh_client.get_remote_episode = lambda token, post_id: {"episode": result}
+        with pytest.raises(PodbeanError, match="match"):
+            podbean.recover_podbean_draft(**recovery, existing_id="abc", client=fresh_client)
+        result["title"] = "Title"
+        saved = podbean.recover_podbean_draft(**recovery, existing_id="abc", client=fresh_client)
+        assert saved.podbean_post_id == "abc"
+        assert get_session(draft_args["db_file"], "resume").status == "draft_created"
+    else:
+        assert podbean.recover_podbean_draft(**recovery, confirm_absent=True) is None
+        assert create_podbean_draft(**draft_args, client=fresh_client).podbean_post_id == "pb-123"
+    assert podbean.get_pending_draft(draft_args["db_file"], "resume") is None
+
+
+def test_legacy_partial_save_repairs_status_without_contacting_podbean(draft_args):
+    from podline.db import connect
+
+    with connect(draft_args["db_file"]) as connection:
+        connection.execute("UPDATE episodes SET podbean_post_id='legacy', episode_number=7")
+    client = FakePodbeanClient()
+    saved = create_podbean_draft(**draft_args, client=client)
+    assert saved.podbean_post_id == "legacy"
+    assert client.uploaded == []
+    assert get_session(draft_args["db_file"], "resume").status == "draft_created"
+
+
+def test_draft_stops_when_metadata_changes_during_upload(draft_args):
+    from podline.podbean import get_pending_draft
+
+    class ChangedMetadata(FakePodbeanClient):
+        def upload_presigned_file(self, *args):
+            upsert_episode_metadata(
+                draft_args["db_file"], session_uid="resume",
+                title="Revised", description="Revised notes",
+            )
+
+        def create_draft_episode(self, *args, **kwargs):
+            pytest.fail("Draft submission used obsolete metadata")
+
+    with pytest.raises(PodbeanError, match="changed"):
+        create_podbean_draft(**draft_args, client=ChangedMetadata())
+    assert get_pending_draft(draft_args["db_file"], "resume") is None
+
+
+def test_draft_recording_failure_rolls_back_and_blocks_duplicate(draft_args):
+    from podline.db import connect
+    from podline.podbean import get_pending_draft
+
+    db_file = draft_args["db_file"]
+    with connect(db_file) as conn:
+        conn.execute(
+            """CREATE TRIGGER fail_draft_event BEFORE INSERT ON events
+               WHEN NEW.to_state='draft_created'
+               BEGIN SELECT RAISE(ABORT, 'event save failed'); END"""
+        )
+    with pytest.raises(PodbeanError, match="event save failed"):
+        create_podbean_draft(**draft_args, client=FakePodbeanClient())
+    assert get_episode(db_file, "resume").podbean_post_id is None
+    assert get_session(db_file, "resume").status == "ready_for_draft"
+    assert get_pending_draft(db_file, "resume").episode_number == 16
+    with pytest.raises(PodbeanError, match="confirm-absent"):
+        create_podbean_draft(**draft_args, client=FakePodbeanClient())
+
+
+def test_pending_draft_preserves_metadata_and_transcript(draft_args):
+    from podline.auphonic import AuphonicError, refresh_transcript_with_auphonic
+    from podline.episode_meta import EpisodeMetaError, generate_episode_metadata
+
+    class MissingId(FakePodbeanClient):
+        def create_draft_episode(self, *args, **kwargs):
+            return {"episode": {}}
+
+    with pytest.raises(PodbeanError, match="episode id"):
+        create_podbean_draft(**draft_args, client=MissingId())
+    with pytest.raises(AuphonicError, match="confirm-absent"):
+        refresh_transcript_with_auphonic(**draft_args, client=object())
+    with pytest.raises(EpisodeMetaError, match="confirm-absent"):
+        generate_episode_metadata(**draft_args, client=object())
+    assert get_episode(draft_args["db_file"], "resume").title == "Title"
+
+
+@pytest.mark.parametrize("details", [
+    {"status": "publish"}, {"title": "Another"}, {"episode_number": 2}, {"id": []},
+])
+def test_unexpected_create_response_keeps_attempt_pending(draft_args, details):
+    from podline.podbean import get_pending_draft
+
+    class UnexpectedResult(FakePodbeanClient):
+        def create_draft_episode(self, *args, **kwargs):
+            return {"episode": {"id": "pb-123", **details}}
+
+    with pytest.raises(PodbeanError, match="confirm-absent"):
+        create_podbean_draft(**draft_args, client=UnexpectedResult())
+    assert get_pending_draft(draft_args["db_file"], "resume") is not None
+
+
+def test_recovery_reads_authenticated_episode_endpoint(app_config_factory, tmp_path):
+    config = app_config_factory(tmp_path, podbean_enabled=True)
+    client = PodbeanClient(config)
+    def lookup(request):
+        assert request.method == "GET"
+        assert request.url.path.endswith("/episodes/abc123")
+        assert request.url.params["access_token"] == "scoped-token"
+        return httpx.Response(200, json={"episode": {"id": "abc123"}})
+
+    client._client = httpx.Client(transport=httpx.MockTransport(lookup))
+    assert client.get_remote_episode("scoped-token", "abc123")["episode"]["id"] == "abc123"
+
+
+def test_preparation_timeout_retries_without_reconciliation(draft_args):
+    from podline.podbean import get_pending_draft
+
+    class Unavailable(FakePodbeanClient):
+        def authorize_upload(self, *args):
+            raise httpx.ConnectTimeout("down")
+
+    with pytest.raises(PodbeanError, match="before draft submission"):
+        create_podbean_draft(**draft_args, client=Unavailable())
+    assert get_pending_draft(draft_args["db_file"], "resume") is None
+    saved = create_podbean_draft(**draft_args, client=FakePodbeanClient())
+    assert saved.podbean_post_id == "pb-123"

@@ -16,6 +16,7 @@ from podline.models import (
     SessionRecord,
     SessionStatus,
 )
+from podline.podbean import protect_draft_inputs
 from podline.repository import upsert_episode_metadata
 from podline.title_history import load_published_titles
 
@@ -42,6 +43,7 @@ class EpisodeMetadataDraft(BaseModel):
         return value
 
 
+@protect_draft_inputs(EpisodeMetaError)
 def generate_episode_metadata(
     *,
     config: AppConfig,

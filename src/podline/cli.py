@@ -1,5 +1,7 @@
+from contextlib import contextmanager
 from pathlib import Path
 import re
+import shlex
 from typing import List, Optional
 import webbrowser
 
@@ -45,14 +47,21 @@ from podline.episode_meta import (
 from podline.finalize import (
     FinalizeError,
     finalize_session,
+    resolve_master_path,
     get_episode_metadata,
 )
+from podline.guidance import next_step
+from podline.preedit import advance_pre_edit
+from podline.workflow_lock import WorkflowBusy, session_lock
 from podline.health import read_health_snapshot, write_health_snapshot
 from podline.ingest import IngestError, import_local_folder
 from podline.logging_setup import configure_logging
 from podline.paths import build_runtime_paths, ensure_runtime_dirs
-from podline.podbean import PodbeanError, create_podbean_draft
-from podline.repository import get_session, list_media_artifacts, list_sessions
+from podline.podbean import PodbeanError, create_podbean_draft, recover_podbean_draft
+from podline.repository import (
+    get_media_artifact, get_session, list_media_artifacts, list_sessions,
+    remember_unresolved_export, unresolved_export,
+)
 
 app = typer.Typer(help="podline automation CLI.")
 
@@ -251,6 +260,32 @@ def _resolve_session_arg(runtime_paths, session_arg: str):
     return get_session(runtime_paths.db_file, session_arg)
 
 
+@contextmanager
+def _locked_session(runtime_paths, session_arg: str):
+    selected = _resolve_session_arg(runtime_paths, session_arg)
+    if selected is None:
+        typer.secho(f"✖ Session not found: {session_arg}", fg=typer.colors.RED, bold=True)
+        raise typer.Exit(code=1)
+    uid = selected.session_uid
+    try:
+        with session_lock(runtime_paths.db_file, uid, "continue"):
+            current = get_session(runtime_paths.db_file, uid)
+            if current is None:
+                typer.secho(f"✖ Session not found: {uid}", fg=typer.colors.RED, bold=True)
+                raise typer.Exit(code=1)
+            yield current
+    except WorkflowBusy as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+
+class MasterSelectionError(FinalizeError):
+    def __init__(self, message: str, candidates: list[Path]):
+        self.candidates = tuple(sorted(candidates))
+        options = "".join(f"\n  {path}" for path in self.candidates)
+        super().__init__(message + options)
+
+
 def _resolve_finalize_master(
     loaded_config, master: Optional[Path], *, workspace_dir: Optional[Path] = None
 ) -> Path:
@@ -264,11 +299,27 @@ def _resolve_finalize_master(
 
     if master is not None:
         if not master.is_absolute() and master.parent == Path("."):
+            episode_match = re.fullmatch(r"ep(\d+)", master.name.lower())
+            projects_root = loaded_config.paths.cubase_projects_root
+            if episode_match and projects_root is not None:
+                episode = master.name.lower()
+                mixdown = projects_root / episode / "Mixdown"
+                expected = mixdown / f"{episode}.mp3"
+                if expected.is_file():
+                    return expected
+                candidates = [
+                    path for path in mixdown.glob("*")
+                    if path.is_file() and path.suffix.lower() in allowed_suffixes
+                ]
+                raise MasterSelectionError(
+                    f"Cubase export missing: {expected}. Provide --master <path>.",
+                    candidates,
+                )
+
             cwd_candidate = master.resolve()
-            if cwd_candidate.exists():
+            if cwd_candidate.is_file():
                 return cwd_candidate
 
-            episode_match = re.fullmatch(r"ep(\d+)", master.name.lower())
             if episode_match:
                 episode_number = int(episode_match.group(1))
                 candidates = sorted(
@@ -286,8 +337,9 @@ def _resolve_finalize_master(
                 if len(candidates) == 1:
                     return candidates[0]
                 if len(candidates) > 1:
-                    raise FinalizeError(
-                        f"Multiple masters matched shortcut {master.name} in {', '.join(str(d) for d in search_dirs)}. Provide --master <filename> or --master <path>."
+                    raise MasterSelectionError(
+                        f"Multiple masters matched shortcut {master.name}. Provide --master <path>.",
+                        candidates,
                     )
 
             for directory in search_dirs:
@@ -318,9 +370,9 @@ def _resolve_finalize_master(
             "No --master provided and no exported masters were found in "
             f"{', '.join(str(d) for d in search_dirs)}. Provide --master <path>."
         )
-    raise FinalizeError(
-        "No --master provided and multiple masters were found in "
-        f"{', '.join(str(d) for d in search_dirs)}. Provide --master <filename> or --master <path>."
+    raise MasterSelectionError(
+        "No --master provided and multiple masters were found. Provide --master <path>.",
+        candidates,
     )
 
 
@@ -676,15 +728,123 @@ def status(
                     "status",
                     _styled("AI metadata pending", fg=typer.colors.YELLOW, bold=True),
                 ),
-                (
-                    "next_step",
-                    _styled(
-                        "Run pod episode-meta @n before Podbean draft",
-                        fg=typer.colors.WHITE,
-                    ),
-                ),
             ],
         )
+
+    _show_next_step(runtime_paths, session, config, _loaded_config)
+
+
+def _command(arguments, config):
+    args = ["pod", *arguments]
+    if config is not None:
+        args.extend(["--config", str(config if config == Path("personal") else config.expanduser().resolve())])
+    return shlex.join(args)
+
+
+def _show_next_step(paths, session, config, loaded):
+    step = next_step(paths, session)
+    uid = session.session_uid
+    rows = [("Action", step.reason)]
+    if step.manual:
+        rows.append(("Manual", _command(step.manual, config)))
+    if step.action == "blocked" and session.auphonic_production_id:
+        rows.append(("After checking Auphonic", _command(["auphonic-sync", "--session", uid], config)))
+    if step.action == "verify":
+        rows.extend([
+            ("If found", _command(["podbean-draft", uid, "--existing-id", "PODBEAN_ID"], config)),
+            ("If confirmed absent", _command(["podbean-draft", uid, "--confirm-absent"], config)),
+        ])
+    elif step.action == "master":
+        selector = unresolved_export(paths.db_file, uid)
+        if selector:
+            try:
+                _resolve_finalize_master(loaded, Path(selector), workspace_dir=workspace_path_for(paths, uid))
+            except MasterSelectionError as exc:
+                rows.append(("Expected export", str(exc).splitlines()[0]))
+                for path in exc.candidates:
+                    rows.append(("Select export", _command(["continue", uid, "--master", str(path)], config)))
+        rows.append(("After export", _command(["continue", uid, "--master", selector or "EPISODE_OR_PATH"], config)))
+    elif step.action not in {"done", "blocked"} and step.manual != ("continue", uid):
+        rows.append(("Guided", _command(["continue", uid], config)))
+    _print_section("Next", rows)
+
+
+@app.command("continue")
+def continue_command(
+    session_uid: str,
+    master: Optional[Path] = typer.Option(None, "--master", help="Finished Cubase export or episode shortcut."),
+    config: Optional[Path] = typer.Option(None, "--config", help="Show config path or personal."),
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
+) -> None:
+    """Advance an ingested episode until it needs editing or draft review."""
+    loaded, paths, logger = _bootstrap(_resolve_config_path(config), debug=debug)
+    session = _resolve_session_arg(paths, session_uid)
+    if session is None:
+        typer.echo(f"Session not found: {session_uid}. Run {_command(['list'], config)}.")
+        raise typer.Exit(code=1)
+
+    uid = session.session_uid
+    try:
+        with session_lock(paths.db_file, uid, "continue"):
+            previous_action = None
+            while True:
+                session = get_session(paths.db_file, uid)
+                if session is None:
+                    raise FinalizeError(f"Session disappeared: {uid}")
+                step = next_step(paths, session)
+                if step.action == previous_action:
+                    raise RuntimeError("The completed step did not advance the saved workflow. Check status before retrying.")
+                previous_action = step.action
+                if master is not None and session.status in {"ready_for_draft", "draft_created"}:
+                    # Repeating the original invocation is safe only for the same export.
+                    saved = get_media_artifact(paths.db_file, uid, kind="final_master")
+                    resolved = _resolve_finalize_master(loaded, master, workspace_dir=workspace_path_for(paths, uid))
+                    resolved = resolve_master_path(resolved)
+                    if not saved or not resolved.is_file() or sha256_of_file(resolved) != saved.sha256:
+                        raise FinalizeError("This export does not match the registered final master. "
+                                            "To use the registered master, resume without --master.")
+                    master = None
+                if master is not None and step.action != "master":
+                    raise FinalizeError("--master can only be supplied at waiting_for_finalize. "
+                                        "To resume previously completed steps, run continue without --master.")
+                if step.action == "done" or (step.action == "master" and master is None):
+                    break
+                if step.action in {"blocked", "verify"}:
+                    _show_next_step(paths, session, config, loaded)
+                    raise typer.Exit(code=1)
+
+                typer.echo(step.reason)
+                context = dict(config=loaded, runtime_paths=paths, db_file=paths.db_file, session=session)
+                if step.action == "preedit":
+                    advance_pre_edit(config=loaded, runtime_paths=paths, session=session, logger=logger)
+                elif step.action == "master":
+                    resolved = _resolve_finalize_master(loaded, master, workspace_dir=workspace_path_for(paths, uid))
+                    finalize_session(**context, master_path=resolved)
+                    master = None
+                elif step.action == "refresh":
+                    refresh_transcript_with_auphonic(**context, logger=logger)
+                elif step.action == "metadata":
+                    generate_episode_metadata(**context)
+                elif step.action == "draft":
+                    create_podbean_draft(**context)
+                else:
+                    raise RuntimeError(f"Unknown workflow action: {step.action}")
+    except typer.Exit:
+        raise
+    except KeyboardInterrupt:
+        typer.echo(f"Interrupted. Check the saved session with {_command(['status', uid], config)}.")
+        raise typer.Exit(code=130)
+    except Exception as exc:
+        logger.error("Continue stopped for %s: %s", uid, exc)
+        typer.echo(f"Stopped: {exc}")
+        session = get_session(paths.db_file, uid)
+        if session:
+            if isinstance(exc, MasterSelectionError) and master and session.status == "waiting_for_finalize":
+                remember_unresolved_export(paths.db_file, uid, str(master))
+            _show_next_step(paths, session, config, loaded)
+        raise typer.Exit(code=1)
+
+    _show_next_step(paths, session, config, loaded)
 
 
 @app.command()
@@ -829,28 +989,22 @@ def finalize_command(
     """Attach the final edited master and generate draft metadata."""
     config_path = _resolve_config_path(config)
     _loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
-    session = _resolve_session_arg(runtime_paths, session_uid)
-    if session is None:
-        typer.secho(
-            f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
-        )
-        raise typer.Exit(code=1)
-
-    try:
-        resolved_master = _resolve_finalize_master(
-            _loaded_config, master, workspace_dir=workspace_path_for(runtime_paths, session.session_uid)
-        )
-        updated = finalize_session(
-            config=_loaded_config,
-            runtime_paths=runtime_paths,
-            db_file=runtime_paths.db_file,
-            session=session,
-            master_path=resolved_master,
-        )
-    except FinalizeError as exc:
-        logger.error("Finalize failed for %s: %s", session_uid, exc)
-        typer.echo(f"Finalize error: {exc}")
-        raise typer.Exit(code=1)
+    with _locked_session(runtime_paths, session_uid) as session:
+        try:
+            resolved_master = _resolve_finalize_master(
+                _loaded_config, master, workspace_dir=workspace_path_for(runtime_paths, session.session_uid)
+            )
+            updated = finalize_session(
+                config=_loaded_config,
+                runtime_paths=runtime_paths,
+                db_file=runtime_paths.db_file,
+                session=session,
+                master_path=resolved_master,
+            )
+        except FinalizeError as exc:
+            logger.error("Finalize failed for %s: %s", session_uid, exc)
+            typer.echo(f"Finalize error: {exc}")
+            raise typer.Exit(code=1)
 
     episode = get_episode_metadata(runtime_paths.db_file, updated.session_uid)
     final_master_uri = _artifact_uri(runtime_paths, updated.session_uid, "final_master")
@@ -985,6 +1139,8 @@ def transcript_refresh_command(
 @app.command("podbean-draft")
 def podbean_draft_command(
     session_uid: str,
+    existing_id: Optional[str] = typer.Option(None, "--existing-id", help="Verify and attach an existing Podbean draft."),
+    confirm_absent: bool = typer.Option(False, "--confirm-absent", help="Confirm a pending submission is absent in Podbean."),
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging."),
     config: Optional[Path] = typer.Option(
         None, "--config", help="Path to config.yaml, or personal for ~/podline-personal/config.yaml."
@@ -1001,12 +1157,20 @@ def podbean_draft_command(
         raise typer.Exit(code=1)
 
     try:
-        episode = create_podbean_draft(
-            config=loaded_config,
-            runtime_paths=runtime_paths,
-            db_file=runtime_paths.db_file,
-            session=session,
-        )
+        if existing_id is not None or confirm_absent:
+            episode = recover_podbean_draft(
+                config=loaded_config, db_file=runtime_paths.db_file, session=session,
+                existing_id=existing_id, confirm_absent=confirm_absent,
+            )
+            if episode is None:
+                typer.echo("Cleared the unconfirmed draft submission.")
+                _show_next_step(runtime_paths, session, config, loaded_config)
+                return
+        else:
+            episode = create_podbean_draft(
+                config=loaded_config, runtime_paths=runtime_paths,
+                db_file=runtime_paths.db_file, session=session,
+            )
     except PodbeanError as exc:
         logger.error(
             "Podbean draft creation failed for %s: %s", session.session_uid, exc
@@ -1039,25 +1203,19 @@ def auphonic_command(
     """Upload one queued session to Auphonic and download outputs."""
     config_path = _resolve_config_path(config)
     loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
-    session = _resolve_session_arg(runtime_paths, session_uid)
-    if session is None:
-        typer.secho(
-            f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
-        )
-        raise typer.Exit(code=1)
-
-    try:
-        updated = process_session_with_auphonic(
-            config=loaded_config,
-            runtime_paths=runtime_paths,
-            db_file=runtime_paths.db_file,
-            session=session,
-            logger=logger,
-        )
-    except (AuphonicError, ArtifactError) as exc:
-        logger.error("Auphonic processing failed for %s: %s", session_uid, exc)
-        typer.echo(f"Auphonic error: {exc}")
-        raise typer.Exit(code=1)
+    with _locked_session(runtime_paths, session_uid) as session:
+        try:
+            updated = process_session_with_auphonic(
+                config=loaded_config,
+                runtime_paths=runtime_paths,
+                db_file=runtime_paths.db_file,
+                session=session,
+                logger=logger,
+            )
+        except (AuphonicError, ArtifactError) as exc:
+            logger.error("Auphonic processing failed for %s: %s", session_uid, exc)
+            typer.echo(f"Auphonic error: {exc}")
+            raise typer.Exit(code=1)
 
     _print_header("Auphonic Complete")
     _print_key_values(
@@ -1083,24 +1241,18 @@ def auphonic_prepare_command(
     """Create an Auphonic production and upload files without starting it."""
     config_path = _resolve_config_path(config)
     loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
-    session = _resolve_session_arg(runtime_paths, session_uid)
-    if session is None:
-        typer.secho(
-            f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
-        )
-        raise typer.Exit(code=1)
-
-    try:
-        updated = prepare_session_with_auphonic(
-            config=loaded_config,
-            db_file=runtime_paths.db_file,
-            session=session,
-            logger=logger,
-        )
-    except (AuphonicError, ArtifactError) as exc:
-        logger.error("Auphonic prepare failed for %s: %s", session_uid, exc)
-        typer.echo(f"Auphonic error: {exc}")
-        raise typer.Exit(code=1)
+    with _locked_session(runtime_paths, session_uid) as session:
+        try:
+            updated = prepare_session_with_auphonic(
+                config=loaded_config,
+                db_file=runtime_paths.db_file,
+                session=session,
+                logger=logger,
+            )
+        except (AuphonicError, ArtifactError) as exc:
+            logger.error("Auphonic prepare failed for %s: %s", session_uid, exc)
+            typer.echo(f"Auphonic error: {exc}")
+            raise typer.Exit(code=1)
 
     _print_header("Auphonic Prepared")
     _print_key_values(
@@ -1150,24 +1302,18 @@ def auphonic_preview_command(
     """Open the prepared Auphonic production for preview before starting."""
     config_path = _resolve_config_path(config)
     loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
-    session = _resolve_session_arg(runtime_paths, session_uid)
-    if session is None:
-        typer.secho(
-            f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
-        )
-        raise typer.Exit(code=1)
-
-    try:
-        preview = preview_prepared_session_with_auphonic(
-            config=loaded_config,
-            db_file=runtime_paths.db_file,
-            session=session,
-            logger=logger,
-        )
-    except AuphonicError as exc:
-        logger.error("Auphonic preview failed for %s: %s", session_uid, exc)
-        typer.echo(f"Auphonic error: {exc}")
-        raise typer.Exit(code=1)
+    with _locked_session(runtime_paths, session_uid) as session:
+        try:
+            preview = preview_prepared_session_with_auphonic(
+                config=loaded_config,
+                db_file=runtime_paths.db_file,
+                session=session,
+                logger=logger,
+            )
+        except AuphonicError as exc:
+            logger.error("Auphonic preview failed for %s: %s", session_uid, exc)
+            typer.echo(f"Auphonic error: {exc}")
+            raise typer.Exit(code=1)
 
     details = preview.details
     edit_page = details["edit_page"] or ""
@@ -1209,24 +1355,18 @@ def auphonic_reset_command(
     """
     config_path = _resolve_config_path(config)
     _loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
-    session = _resolve_session_arg(runtime_paths, session_uid)
-    if session is None:
-        typer.secho(
-            f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
-        )
-        raise typer.Exit(code=1)
-
-    abandoned_production_id = session.auphonic_production_id or "none"
-    try:
-        refreshed = reset_session_auphonic_production(
-            db_file=runtime_paths.db_file,
-            session=session,
-            logger=logger,
-        )
-    except AuphonicError as exc:
-        logger.error("Auphonic reset failed for %s: %s", session_uid, exc)
-        typer.echo(f"Auphonic error: {exc}")
-        raise typer.Exit(code=1)
+    with _locked_session(runtime_paths, session_uid) as session:
+        abandoned_production_id = session.auphonic_production_id or "none"
+        try:
+            refreshed = reset_session_auphonic_production(
+                db_file=runtime_paths.db_file,
+                session=session,
+                logger=logger,
+            )
+        except AuphonicError as exc:
+            logger.error("Auphonic reset failed for %s: %s", session_uid, exc)
+            typer.echo(f"Auphonic error: {exc}")
+            raise typer.Exit(code=1)
 
     _print_header("Auphonic Reset")
     _print_key_values(
@@ -1250,25 +1390,19 @@ def auphonic_start_command(
     """Start an already-uploaded Auphonic production and fetch outputs."""
     config_path = _resolve_config_path(config)
     loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
-    session = _resolve_session_arg(runtime_paths, session_uid)
-    if session is None:
-        typer.secho(
-            f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
-        )
-        raise typer.Exit(code=1)
-
-    try:
-        updated = start_prepared_session_with_auphonic(
-            config=loaded_config,
-            runtime_paths=runtime_paths,
-            db_file=runtime_paths.db_file,
-            session=session,
-            logger=logger,
-        )
-    except (AuphonicError, ArtifactError) as exc:
-        logger.error("Auphonic start failed for %s: %s", session_uid, exc)
-        typer.echo(f"Auphonic error: {exc}")
-        raise typer.Exit(code=1)
+    with _locked_session(runtime_paths, session_uid) as session:
+        try:
+            updated = start_prepared_session_with_auphonic(
+                config=loaded_config,
+                runtime_paths=runtime_paths,
+                db_file=runtime_paths.db_file,
+                session=session,
+                logger=logger,
+            )
+        except (AuphonicError, ArtifactError) as exc:
+            logger.error("Auphonic start failed for %s: %s", session_uid, exc)
+            typer.echo(f"Auphonic error: {exc}")
+            raise typer.Exit(code=1)
 
     _print_header("Auphonic Started")
     _print_key_values(
@@ -1387,25 +1521,19 @@ def auphonic_offset_command(
     """Compute and optionally apply a duration-based Auphonic track offset."""
     config_path = _resolve_config_path(config)
     loaded_config, runtime_paths, logger = _bootstrap(config_path, debug=debug)
-    session = _resolve_session_arg(runtime_paths, session_uid)
-    if session is None:
-        typer.secho(
-            f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
-        )
-        raise typer.Exit(code=1)
-
-    try:
-        result = offset_session_auphonic_production(
-            config=loaded_config,
-            runtime_paths=runtime_paths,
-            db_file=runtime_paths.db_file,
-            session=session,
-            apply=apply,
-        )
-    except AuphonicError as exc:
-        logger.error("Auphonic offset failed for %s: %s", session_uid, exc)
-        typer.echo(f"Auphonic error: {exc}")
-        raise typer.Exit(code=1)
+    with _locked_session(runtime_paths, session_uid) as session:
+        try:
+            result = offset_session_auphonic_production(
+                config=loaded_config,
+                runtime_paths=runtime_paths,
+                db_file=runtime_paths.db_file,
+                session=session,
+                apply=apply,
+            )
+        except AuphonicError as exc:
+            logger.error("Auphonic offset failed for %s: %s", session_uid, exc)
+            typer.echo(f"Auphonic error: {exc}")
+            raise typer.Exit(code=1)
 
     plan = result.plan
     _print_header("Auphonic Offset Applied" if result.applied else "Auphonic Offset Plan")
@@ -1617,31 +1745,25 @@ def auphonic_sync_command(
         typer.echo("Use --session <session_uid> to choose the local session.")
         raise typer.Exit(code=1)
 
-    session = _resolve_session_arg(runtime_paths, session_uid)
-    if session is None:
-        typer.secho(
-            f"✖ Session not found: {session_uid}", fg=typer.colors.RED, bold=True
-        )
-        raise typer.Exit(code=1)
+    with _locked_session(runtime_paths, session_uid) as session:
+        resolved_production_id = production_id or session.auphonic_production_id
+        if not resolved_production_id:
+            typer.echo("Provide a production id or sync a session that already stores one.")
+            raise typer.Exit(code=1)
 
-    resolved_production_id = production_id or session.auphonic_production_id
-    if not resolved_production_id:
-        typer.echo("Provide a production id or sync a session that already stores one.")
-        raise typer.Exit(code=1)
-
-    try:
-        updated = reconcile_production_to_session(
-            config=loaded_config,
-            runtime_paths=runtime_paths,
-            db_file=runtime_paths.db_file,
-            session=session,
-            production_id=resolved_production_id,
-            logger=logger,
-        )
-    except (AuphonicError, ArtifactError) as exc:
-        logger.error("Auphonic sync failed for %s: %s", session_uid, exc)
-        typer.echo(f"Auphonic error: {exc}")
-        raise typer.Exit(code=1)
+        try:
+            updated = reconcile_production_to_session(
+                config=loaded_config,
+                runtime_paths=runtime_paths,
+                db_file=runtime_paths.db_file,
+                session=session,
+                production_id=resolved_production_id,
+                logger=logger,
+            )
+        except (AuphonicError, ArtifactError) as exc:
+            logger.error("Auphonic sync failed for %s: %s", session_uid, exc)
+            typer.echo(f"Auphonic error: {exc}")
+            raise typer.Exit(code=1)
 
     _print_header("Auphonic Synced")
     _print_key_values(

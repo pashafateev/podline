@@ -57,12 +57,29 @@ Local config
   - `request_timeout_seconds` — HTTP request/download timeout (default `600`).
 
 Planned next steps
-- combine the post-edit steps into a smoother single command once the pieces stay stable
 - add cleanup/retention rules for staging and generated artifacts
 - improve release verification after Podbean draft creation
 - evaluate whether external-service inputs are worth formalizing into the workflow; see `docs/open-issues.md`
 
-Current workflow
+## Guided production
+
+Ingest the recording with `pod import` or `pod ct-ingest`, then choose the session with `pod list`. A routine edit takes two commands after ingest:
+
+```bash
+pod continue @1
+# Edit in Cubase and export the finished mix.
+pod continue @1 --master ep52
+```
+
+The first command prepares Auphonic, checks track alignment, applies verified offsets, renders the audio and gives you the workspace path. To review the tracks before rendering, use the manual prepare, offset and preview commands below, then resume with `pod continue`.
+
+The second command selects the finished export. With `paths.cubase_projects_root` configured, `ep52` selects `ep52/Mixdown/ep52.mp3` inside that folder. If that file is missing, Podline lists the audio files it found in the episode's Mixdown folder and prints commands to select one explicitly. A full export path also works.
+
+After selection, Podline uploads the master, refreshes its transcript, generates the title and description and creates an unpublished Podbean draft. Open the draft to review and publish it yourself.
+
+Run `pod status @1` at any point for the next manual action. You can switch between manual commands and `continue`. After an interruption, run `pod continue` with the session ID shown in the handoff. The ID stays valid when the order of `pod list` changes. The command resumes from saved work. If a Podbean submission has an unknown outcome, it shows how to verify and attach the existing draft, or explicitly confirm its absence before retrying.
+
+## Manual production
 1. Ingest the session
 
 For Cozytrack (remote stems):
@@ -149,7 +166,7 @@ pod finalize @1 --master ep16
 ```
 
 Notes:
-- `--master ep16` resolves against the session workspace first, then `04_deliverables/masters/` when the drive is mounted. Full paths and bare filenames also work.
+- With a configured Cubase project root, `--master ep16` selects `ep16/Mixdown/ep16.mp3`. Configurations without that root retain the `sexdrunks_ep16_master` shortcut in the workspace and deliverables masters directory. Full paths and bare filenames also work.
 - Finalize uploads the edited master to S3 as the session's `final_master` artifact.
 
 5. Refresh the transcript from the edited final master
@@ -169,7 +186,7 @@ pod episode-meta @1
 pod status @1
 ```
 
-`pod episode-meta` remains a manual step. It sends the current registered VTT
+The manual command `pod episode-meta` sends the current registered VTT
 transcript to the Responses API and saves the structured title and description.
 Before generation, it reads recent published titles from the configured RSS feed
 and supplies them as style-only references; the transcript remains the only factual

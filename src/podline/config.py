@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import yaml
 
@@ -9,6 +9,7 @@ import yaml
 class PathsConfig:
     raw_root: Path
     deliverables_root: Path
+    cubase_projects_root: Optional[Path] = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +103,11 @@ def load_config(config_path: Path) -> AppConfig:
         paths=PathsConfig(
             raw_root=Path(_require_nested(data, "paths", "raw_root")),
             deliverables_root=Path(_require_nested(data, "paths", "deliverables_root")),
+            cubase_projects_root=(
+                Path(data["paths"]["cubase_projects_root"]).expanduser()
+                if data["paths"].get("cubase_projects_root")
+                else None
+            ),
         ),
         polling=PollingConfig(
             interval_seconds=int(_require_nested(data, "polling", "interval_seconds")),

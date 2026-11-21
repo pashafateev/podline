@@ -369,3 +369,55 @@ def test_full_s3_pipeline_without_any_drive_paths(
         "transcript",
         "final_master",
     }
+
+
+def test_two_command_production_resumes_after_metadata_interruption(
+    tmp_path, app_config_factory, runtime_factory, moto_s3, monkeypatch
+):
+    from dataclasses import replace
+    import logging
+    from typer.testing import CliRunner
+    from podline import cli
+    from podline.episode_meta import EpisodeMetaError
+
+    config = app_config_factory(tmp_path, podbean_enabled=True)
+    projects = tmp_path / "Cubase Projects"
+    config = replace(config, paths=replace(config.paths, cubase_projects_root=projects))
+    paths = runtime_factory(config)
+    folder = tmp_path / "010124_013143"
+    folder.mkdir()
+    for n in (1, 2):
+        (folder / f"010124_013143_Tr{n}.WAV").write_bytes(bytes([n]))
+    session, _ = import_local_folder(config=config, runtime_paths=paths, db_file=paths.db_file,
+                                     folder=folder, duration_probe=lambda _: 30.0)
+    auphonic = WorkflowAuphonicClient()
+    podbean = WorkflowPodbeanClient()
+    monkeypatch.setattr(cli, "_bootstrap", lambda *a, **kw: (config, paths, logging.getLogger("test")))
+    monkeypatch.setattr("podline.preedit.AuphonicClient", lambda _: auphonic)
+    monkeypatch.setattr("podline.auphonic.AuphonicClient", lambda _: auphonic)
+    monkeypatch.setattr("podline.podbean.PodbeanClient", lambda _: podbean)
+    runner = CliRunner()
+    result = runner.invoke(cli.app, ["continue", "@1"])
+    assert result.exit_code == 0, (result.output, result.exception)
+    assert str(workspace_path_for(paths, session.session_uid)) in result.output
+    assert auphonic.started == ["prod-flow"]
+    master = projects / "ep52" / "Mixdown" / "ep52.mp3"
+    master.parent.mkdir(parents=True)
+    master.write_bytes(b"finished export")
+    def unavailable(_):
+        raise EpisodeMetaError("metadata temporarily unavailable")
+    monkeypatch.setattr("podline.episode_meta._build_openai_client", unavailable)
+    result = runner.invoke(cli.app, ["continue", "@1", "--master", "ep52"])
+    assert result.exit_code == 1 and "metadata temporarily unavailable" in result.output
+    assert f"pod episode-meta {session.session_uid}" in result.output
+    assert not podbean.uploaded
+    monkeypatch.setattr("podline.episode_meta._build_openai_client", lambda _: WorkflowOpenAIClient())
+    # Retrying the same invocation after a downstream failure uses the registered export.
+    result = runner.invoke(cli.app, ["continue", "@1", "--master", "ep52"])
+    assert result.exit_code == 0, (result.output, result.exception)
+    assert "https://podbean.test/pb-flow" in result.output
+    assert auphonic.started == ["prod-flow", "prod-flow-refresh"]
+    assert len(podbean.uploaded) == 2
+    for _ in range(2):
+        assert runner.invoke(cli.app, ["continue", "@1"]).exit_code == 0
+    assert len(podbean.uploaded) == 2

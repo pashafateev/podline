@@ -23,6 +23,17 @@ CREATE TABLE IF NOT EXISTS sessions (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS auphonic_offset_applications (
+    session_uid TEXT NOT NULL REFERENCES sessions(session_uid),
+    production_id TEXT NOT NULL,
+    PRIMARY KEY (session_uid, production_id)
+);
+
+CREATE TABLE IF NOT EXISTS unresolved_exports (
+    session_uid TEXT PRIMARY KEY REFERENCES sessions(session_uid),
+    selector TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS assets (
     id INTEGER PRIMARY KEY,
     session_uid TEXT NOT NULL,
@@ -42,6 +53,13 @@ CREATE TABLE IF NOT EXISTS episodes (
     title TEXT,
     description TEXT,
     FOREIGN KEY(session_uid) REFERENCES sessions(session_uid)
+);
+
+CREATE TABLE IF NOT EXISTS pending_podbean_drafts (
+    session_uid TEXT PRIMARY KEY REFERENCES sessions(session_uid),
+    episode_number INTEGER NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    started_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS events (

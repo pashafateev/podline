@@ -34,7 +34,7 @@ def finalize_session(
                 f"Session {session.session_uid} has no {kind} artifact"
             )
 
-    resolved_master_path = _resolve_master_path(master_path)
+    resolved_master_path = resolve_master_path(master_path)
     if not resolved_master_path.exists():
         raise FinalizeError(f"Final master file not found: {resolved_master_path}")
     if resolved_master_path.suffix.lower() not in {
@@ -83,7 +83,7 @@ def get_episode_metadata(db_file: str, session_uid: str):
     return get_episode(db_file, session_uid)
 
 
-def _resolve_master_path(master_path: Path) -> Path:
+def resolve_master_path(master_path: Path) -> Path:
     resolved_master_path = master_path.expanduser().resolve()
     if resolved_master_path.exists():
         return resolved_master_path

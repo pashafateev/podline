@@ -49,6 +49,34 @@ def get_session(db_file: str, session_uid: str) -> Optional[SessionRecord]:
     return _row_to_session(row) if row else None
 
 
+def record_offsets_applied(db_file: str, session_uid: str, production_id: str) -> None:
+    with connect(db_file) as connection:
+        connection.execute(
+            """
+            INSERT INTO auphonic_offset_applications (session_uid, production_id)
+            VALUES (?, ?) ON CONFLICT(session_uid, production_id) DO NOTHING
+            """,
+            (session_uid, production_id),
+        )
+        connection.execute(
+            """UPDATE sessions SET failure_reason = NULL, failed_at_stage = NULL
+               WHERE session_uid = ? AND auphonic_production_id = ? AND failed_at_stage = 'alignment'""",
+            (session_uid, production_id),
+        )
+
+
+def offsets_applied(db_file: str, session_uid: str, production_id: Optional[str]) -> bool:
+    with connect(db_file) as connection:
+        row = connection.execute(
+            """
+            SELECT 1 FROM auphonic_offset_applications
+            WHERE session_uid = ? AND production_id = ?
+            """,
+            (session_uid, production_id),
+        ).fetchone()
+    return row is not None
+
+
 def count_sessions(db_file: str) -> int:
     with connect(db_file) as connection:
         row = connection.execute("SELECT COUNT(*) AS count FROM sessions").fetchone()
@@ -191,6 +219,22 @@ def list_assets_for_session(db_file: str, session_uid: str) -> List[AssetRecord]
     ]
 
 
+def remember_unresolved_export(db_file: str, session_uid: str, selector: str) -> None:
+    with connect(db_file) as connection:
+        connection.execute(
+            "INSERT OR REPLACE INTO unresolved_exports (session_uid, selector) VALUES (?, ?)",
+            (session_uid, selector),
+        )
+
+
+def unresolved_export(db_file: str, session_uid: str) -> Optional[str]:
+    with connect(db_file) as connection:
+        row = connection.execute(
+            "SELECT selector FROM unresolved_exports WHERE session_uid=?", (session_uid,)
+        ).fetchone()
+    return row["selector"] if row else None
+
+
 def update_session_status(
     db_file: str,
     *,
@@ -239,6 +283,8 @@ def update_session_status(
             """,
             (session_uid, from_state, to_state, timestamp, detail),
         )
+        if from_state == "waiting_for_finalize" and to_state != from_state:
+            connection.execute("DELETE FROM unresolved_exports WHERE session_uid=?", (session_uid,))
         connection.commit()
 
 
@@ -443,6 +489,23 @@ def discard_transcript_refresh_production(
         connection.commit()
 
 
+def _refresh_completed_detail(production_id: str) -> str:
+    return f"refreshed transcript from final master using Auphonic production {production_id}; episode metadata invalidated"
+
+
+def refresh_was_completed(db_file: str, session_uid: str, production_id: str) -> bool:
+    with connect(db_file) as connection:
+        return connection.execute(
+            """SELECT 1 FROM events
+               WHERE session_uid = ? AND detail = ? AND id > (
+                   SELECT COALESCE(MAX(id), 0) FROM events
+                   WHERE session_uid = ? AND to_state = 'ready_for_draft'
+                     AND from_state != to_state
+               ) LIMIT 1""",
+            (session_uid, _refresh_completed_detail(production_id), session_uid),
+        ).fetchone() is not None
+
+
 def complete_transcript_refresh(
     db_file: str,
     *,
@@ -481,7 +544,7 @@ def complete_transcript_refresh(
                 status,
                 status,
                 timestamp,
-                f"refreshed transcript from final master using Auphonic production {production_id}; episode metadata invalidated",
+                _refresh_completed_detail(production_id),
             ),
         )
         connection.commit()

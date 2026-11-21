@@ -1,5 +1,6 @@
 runtime_home: /Users/pasha/podline
 paths:
+  cubase_projects_root: ~/Documents/Documents - Pasha’s MacBook Pro (2)/Steinberg/Cubase/Projects/sexdrunks-podcast
   raw_root: /Volumes/Music/Podcast/Sex Drunks/02_recordings
   deliverables_root: /Volumes/Music/Podcast/Sex Drunks/04_deliverables
 polling:
