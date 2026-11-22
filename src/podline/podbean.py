@@ -485,8 +485,8 @@ def _record_remote_draft(
         raise PodbeanError("Podbean draft response did not include an episode id")
     expected = {"status": "draft", "title": pending.title, "episode_number": pending.episode_number}
     # Creation may return only the ID. Recovery must positively identify the draft.
-    if verified_id is not None:
-        expected["id"] = verified_id
+    if verified_id is not None and str(post_id) != verified_id:
+        raise PodbeanError("Podbean id does not match the pending submission.")
     for field, value in expected.items():
         if verified_id is None and field not in remote:
             continue

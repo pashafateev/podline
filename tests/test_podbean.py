@@ -259,8 +259,8 @@ def test_saved_draft_replay_returns_without_uploads_even_with_stale_session(draf
     assert retry_client.uploaded == []
 
 
-@pytest.mark.parametrize("found", [True, False])
-def test_lost_draft_response_requires_reconciliation_before_retry(draft_args, found):
+@pytest.mark.parametrize("id_field", ["id", "episode_id", "post_id", None])
+def test_lost_draft_response_requires_reconciliation_before_retry(draft_args, id_field):
     from podline import podbean
 
     recovery = {k: v for k, v in draft_args.items() if k != "runtime_paths"}
@@ -281,12 +281,14 @@ def test_lost_draft_response_requires_reconciliation_before_retry(draft_args, fo
     with pytest.raises(PodbeanError, match="confirm-absent"):
         create_podbean_draft(**draft_args, client=fresh_client)
     assert fresh_client.uploaded == []
-    if found:
-        result = {"id": "abc", "title": "Different", "episode_number": 16, "status": "draft"}
+    if id_field:
+        result = {id_field: "abc", "title": "Different", "episode_number": 16, "status": "draft"}
         fresh_client.get_remote_episode = lambda token, post_id: {"episode": result}
         with pytest.raises(PodbeanError, match="match"):
             podbean.recover_podbean_draft(**recovery, existing_id="abc", client=fresh_client)
         result["title"] = "Title"
+        with pytest.raises(PodbeanError, match="match"):
+            podbean.recover_podbean_draft(**recovery, existing_id="wrong", client=fresh_client)
         saved = podbean.recover_podbean_draft(**recovery, existing_id="abc", client=fresh_client)
         assert saved.podbean_post_id == "abc"
         assert get_session(draft_args["db_file"], "resume").status == "draft_created"
