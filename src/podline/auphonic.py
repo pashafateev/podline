@@ -653,6 +653,9 @@ def start_prepared_session_with_auphonic(
     client = client or AuphonicClient(config)
     production_id = session.auphonic_production_id
 
+    details = inspect_production(config, production_id, client=client)
+    _verify_session_inputs(config, db_file, session, details)
+
     try:
         _log(
             logger,
@@ -1434,6 +1437,13 @@ def _natural_role_key(role: str) -> Tuple[str, int, str]:
     return (role.lower(), -1, role.lower())
 
 
+def _verify_session_inputs(config, db_file, session, details):
+    remaining = list(details.get("multi_input_files") or [])
+    for asset in _spoken_raw_tracks(config, db_file, session.session_uid):
+        track = _find_multi_input_track_for_asset(remaining, asset)
+        remaining.remove(track)
+
+
 def _tracks_look_attached(
     multi_input_files: List[Dict], expected_track_ids: List[str]
 ) -> bool:
@@ -1966,6 +1976,7 @@ def reconcile_production_to_session(
             logger=logger,
         )
     elif details.get("start_allowed"):
+        _verify_session_inputs(config, db_file, session, details)
         # Auphonic has no notion of "previewed"; both prepared and previewed
         # productions report start_allowed=True. Preserve the local previewed
         # marker so sync doesn't silently force a re-preview before start.

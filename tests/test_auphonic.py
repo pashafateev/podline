@@ -35,6 +35,7 @@ from podline.auphonic import (
 )
 from podline.cozytrack.client import CozytrackSession, CozytrackTrack
 from podline.repository import (
+    update_session_status,
     get_episode,
     get_media_artifact,
     get_session,
@@ -2294,6 +2295,44 @@ def test_reconcile_done_production_persists_outputs(
     assert workspace_path_for(runtime_paths, session.session_uid).exists()
 
 
+def test_sync_after_interrupted_attachment_blocks_preview_and_start(
+    app_config_factory, runtime_factory, session_factory, artifact_registrar, tmp_path, monkeypatch
+):
+    config = app_config_factory(tmp_path)
+    paths = runtime_factory(config)
+    session = _queued_session_with_tracks(tmp_path, paths, session_factory, artifact_registrar)
+    client = FakeAuphonicClient()
+    attach = client.attach_service_input
+
+    def interrupt_second_track(*args):
+        if client.attached:
+            raise KeyboardInterrupt
+        return attach(*args)
+
+    monkeypatch.setattr(client, "attach_service_input", interrupt_second_track)
+    context = dict(config=config, db_file=paths.db_file, client=client)
+    with pytest.raises(KeyboardInterrupt):
+        prepare_session_with_auphonic(**context, session=session)
+    partial = get_session(paths.db_file, session.session_uid)
+    assert len(client.attached) == 1 and partial.auphonic_production_id == "prod-123"
+    with pytest.raises(AuphonicError, match="track"):
+        reconcile_production_to_session(**context, session=partial, runtime_paths=paths,
+                                        production_id=partial.auphonic_production_id)
+    stored = get_session(paths.db_file, session.session_uid)
+    assert stored.status == partial.status
+    with pytest.raises(AuphonicError, match="prepared"):
+        preview_prepared_session_with_auphonic(**context, session=stored)
+    with pytest.raises(AuphonicError, match="previewed"):
+        start_prepared_session_with_auphonic(**context, session=stored, runtime_paths=paths)
+    # A previous version could already have promoted this partial production.
+    update_session_status(paths.db_file, session_uid=stored.session_uid, from_state=stored.status,
+                          to_state="auphonic_previewed", timestamp="now", detail="legacy preview")
+    with pytest.raises(AuphonicError, match="track"):
+        start_prepared_session_with_auphonic(**context, session=get_session(paths.db_file, stored.session_uid),
+                                             runtime_paths=paths)
+    assert not client.started
+
+
 def test_reconcile_preserves_previewed_status(
     moto_s3,
     app_config_factory,
@@ -2599,6 +2638,7 @@ def test_start_failure_after_persist_recovers_via_reconcile_without_restart(
     app_config_factory,
     runtime_factory,
     session_factory,
+    artifact_registrar,
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -2617,12 +2657,11 @@ def test_start_failure_after_persist_recovers_via_reconcile_without_restart(
 
     config = app_config_factory(tmp_path)
     runtime_paths = runtime_factory(config)
-    session = session_factory(
-        runtime_paths.db_file,
-        status="auphonic_previewed",
-        auphonic_production_id="prod-123",
-    )
+    queued = _queued_session_with_tracks(tmp_path, runtime_paths, session_factory, artifact_registrar)
     client = FakeAuphonicClient()
+    context = dict(config=config, db_file=runtime_paths.db_file, client=client)
+    prepared = prepare_session_with_auphonic(**context, session=queued)
+    session = preview_prepared_session_with_auphonic(**context, session=prepared).session
 
     def _local_failure(**_kwargs):
         raise ArtifactError("simulated local failure after outputs persisted")
