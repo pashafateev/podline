@@ -262,6 +262,7 @@ def test_saved_draft_replay_returns_without_uploads_even_with_stale_session(draf
 @pytest.mark.parametrize("id_field", ["id", "episode_id", "post_id", None])
 def test_lost_draft_response_requires_reconciliation_before_retry(draft_args, id_field):
     from podline import podbean
+    from podline.auphonic import AuphonicError, reconcile_production_to_session
 
     recovery = {k: v for k, v in draft_args.items() if k != "runtime_paths"}
 
@@ -273,10 +274,14 @@ def test_lost_draft_response_requires_reconciliation_before_retry(draft_args, id
                 create_podbean_draft(**draft_args, client=self)
             with pytest.raises(PodbeanError, match="in progress"):
                 podbean.recover_podbean_draft(**recovery, confirm_absent=True)
+            with pytest.raises(AuphonicError, match="in progress"):
+                reconcile_production_to_session(**draft_args, production_id="pre-edit", client=object())
             raise httpx.ReadTimeout("lost reply")
 
     with pytest.raises(PodbeanError, match="Podbean"):
         create_podbean_draft(**draft_args, client=InterruptedClient())
+    with pytest.raises(AuphonicError, match="confirm-absent"):
+        reconcile_production_to_session(**draft_args, production_id="pre-edit", client=object())
     fresh_client = FakePodbeanClient()
     with pytest.raises(PodbeanError, match="confirm-absent"):
         create_podbean_draft(**draft_args, client=fresh_client)

@@ -1924,6 +1924,7 @@ def reset_session_auphonic_production(
     return refreshed
 
 
+@protect_draft_inputs(AuphonicError)
 def reconcile_production_to_session(
     *,
     config: AppConfig,
