@@ -67,6 +67,26 @@ def test_draft_link_is_terminal_for_status_and_continue(workflow):
         assert "pod podbean-draft" not in result.stdout
 
 
+def test_continue_repairs_saved_draft_without_submitting(workflow, monkeypatch):
+    from podline.db import connect
+    from podline.repository import get_session
+
+    paths, _, invoke, seed = workflow
+    session = seed("ready_for_draft")
+    uid = session.session_uid
+    upsert_episode_metadata(paths.db_file, session_uid=uid, title="Title", description="Notes")
+    with connect(paths.db_file) as conn:
+        conn.execute("UPDATE episodes SET podbean_post_id='123', draft_url='https://example.test/draft' WHERE session_uid=?", (uid,))
+    monkeypatch.setattr("podline.podbean.PodbeanClient", lambda *_: pytest.fail("Unexpected Podbean request"))
+    status = invoke("status")
+    assert status.exit_code == 0
+    assert get_session(paths.db_file, uid).status == "ready_for_draft"
+    result = invoke("continue")
+    assert result.exit_code == 0, result.exception
+    assert "https://example.test/draft" in result.stdout
+    assert get_session(paths.db_file, uid).status == "draft_created"
+
+
 def test_refreshed_transcript_resumes_at_metadata(workflow, tmp_path, artifact_registrar):
     paths, _, invoke, seed = workflow
     session = seed("ready_for_draft", auphonic_production_id="pre-edit", transcript_refresh_production_id="final-refresh")

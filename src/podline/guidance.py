@@ -20,6 +20,9 @@ def next_step(paths: RuntimePaths, session: SessionRecord) -> NextStep:
     db = paths.db_file
     state = session.status
     episode = get_episode(db, uid)
+    if state == "ready_for_draft" and episode and episode.podbean_post_id:
+        return NextStep("draft", "Record the existing Podbean draft as complete locally.",
+                        ("podbean-draft", uid))
     if state == "draft_created" or (episode and episode.podbean_post_id):
         link = episode.draft_url if episode else None
         destination = link or "your Podbean dashboard"
