@@ -153,4 +153,5 @@ def _align_multitrack(
     )
     if applied:
         # An operator may have edited a previously verified production in the browser.
-        verify_production_offsets(result.plan, details)
+        latest = inspect_production(config, result.plan.production_id, client=client)
+        verify_production_offsets(result.plan, latest)

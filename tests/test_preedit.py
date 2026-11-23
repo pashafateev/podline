@@ -106,7 +106,8 @@ def test_guided_retries_failed_prepare_with_no_production(guided_run):
     assert len(client.created) == 1
 
 
-def test_stale_manual_offsets_require_review(guided_run):
+@pytest.mark.parametrize("change_after_inspection", [False, True])
+def test_stale_manual_offsets_require_review(guided_run, monkeypatch, change_after_inspection):
     paths, session, client, run = guided_run
     # Exercise the same production-specific marker written by the manual command.
     from podline.repository import record_offsets_applied
@@ -116,6 +117,16 @@ def test_stale_manual_offsets_require_review(guided_run):
     record_offsets_applied(paths.db_file, session.session_uid, "prod-123")
     client.tracks = [{"id": "Jonathan", "input_file": "Tr1.webm", "offset": 0},
                      {"id": "Pasha", "input_file": "Tr2.webm", "offset": 7}]
+    if change_after_inspection:
+        client.tracks[1]["offset"] = 1.801
+        inspect = client.get_production
+
+        def inspect_then_edit(production_id):
+            snapshot = inspect(production_id)
+            client.tracks[1]["offset"] = 7
+            return snapshot
+
+        monkeypatch.setattr(client, "get_production", inspect_then_edit)
     with pytest.raises(AuphonicError, match="offset"):
         run()
     assert not client.offsets and not client.started
